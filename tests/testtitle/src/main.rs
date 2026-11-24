@@ -369,11 +369,11 @@ fn main() {
             let h = LoadLibraryW(wide(dll).as_ptr());
             if h == 0 { 0 } else { GetProcAddress(h, name.as_ptr()) }
         };
-        let (fw, fa) = (lookup("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"CreateWindowExW "), lookup("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA "));
+        let (fw, fa) = (lookup("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"CreateWindowExW\0"), lookup("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA\0"));
         ensure!(fw != 0 && fa != 0, "CreateWindowExW {fw:#x} / A {fa:#x} from the ntuser API sets");
         let (cw, ca): (CreateWindowExFn<u16>, CreateWindowExFn<u8>) = (std::mem::transmute(fw), std::mem::transmute(fa));
         let w = cw(0x4_0000, class.as_ptr(), title.as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
-        let a = ca(0, b"XclTestTitleWindow ".as_ptr(), b"test title ".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
+        let a = ca(0, b"XclTestTitleWindow\0".as_ptr(), b"test title\0".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
         ensure!(!w.is_null() && !a.is_null(), "CreateWindowExW {w:?} / A {a:?}");
         for (name, h) in [("W", w), ("A", a)] {
             let ex = GetWindowLongW(h, -20) as u32;
