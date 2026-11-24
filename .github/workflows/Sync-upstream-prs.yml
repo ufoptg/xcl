@@ -38,27 +38,31 @@ jobs:
           set -euo pipefail
           git config user.name "xcl-pr-sync"
           git config user.email "xcl-pr-sync@users.noreply.github.com"
-          git fetch --no-tags "https://github.com/${UPSTREAM}.git" "+refs/pull/*/head:refs/upstream-pulls/*"
-
           gh pr list -R "$UPSTREAM" --state open --limit 200 \
             --json number,title,body,isDraft,url > /tmp/upstream.json
           gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 \
             --json number,headRefName > /tmp/mirrors.json
 
           # 1. create or update mirrors
-          jq -c '.[]' /tmp/upstream.json | while read -r pr; do
+          while read -r pr; do
             n=$(jq -r .number <<<"$pr")
             title=$(jq -r .title <<<"$pr")
             url=$(jq -r .url <<<"$pr")
             draft=$(jq -r .isDraft <<<"$pr")
             branch="upstream-pr/$n"
-            sha=$(git rev-parse "refs/upstream-pulls/$n/head" 2>/dev/null || true)
+            # fetch only this PR's head; a bad ref skips this PR, not the run
+            if ! git fetch --no-tags "https://github.com/${UPSTREAM}.git" "+refs/pull/$n/head:refs/upstream-pulls/$n"; then
+              echo "skip #$n: fetch failed"; continue
+            fi
+            sha=$(git rev-parse --verify -q "refs/upstream-pulls/$n^{commit}" || true)
             if [ -z "$sha" ]; then echo "skip #$n: no head ref"; continue; fi
 
             remote_sha=$(git ls-remote origin "refs/heads/$branch" | cut -f1 || true)
             if [ "$remote_sha" != "$sha" ]; then
               echo "push #$n -> $branch"
-              git push --force origin "$sha:refs/heads/$branch"
+              if ! git push --force origin "$sha:refs/heads/$branch"; then
+                echo "skip #$n: push failed"; continue
+              fi
             fi
 
             if ! jq -e --arg b "$branch" 'any(.[]; .headRefName==$b)' /tmp/mirrors.json >/dev/null; then
@@ -71,7 +75,7 @@ jobs:
               num=$(jq -r --arg b "$branch" '.[]|select(.headRefName==$b).number' /tmp/mirrors.json)
               gh pr edit "$num" -R "$GITHUB_REPOSITORY" --title "[upstream #$n] $title" || true
             fi
-          done
+          done < <(jq -c '.[]' /tmp/upstream.json)
 
           # 2. close mirrors whose upstream PR is no longer open
           jq -r '.[]|select(.headRefName|startswith("upstream-pr/"))|"\(.number) \(.headRefName)"' /tmp/mirrors.json |
