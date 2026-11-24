@@ -130,13 +130,34 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+#[cfg(windows)]
+fn move_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    // Resolve normal Win32 path components before adding an extended-length prefix.
+    let absolute = std::path::absolute(path)?;
+    let (prefix, skip) = match absolute.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+            _ => ("", 0),
+        },
+        _ => ("", 0),
+    };
+    Ok(prefix
+        .encode_utf16()
+        .chain(absolute.as_os_str().encode_wide().skip(skip))
+        .chain(std::iter::once(0))
+        .collect())
+}
+
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let src = move_path(tmp)?;
+        let dst = move_path(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -924,6 +945,42 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_paths_preserve_windows_path_forms() {
+        for (path, expected) in [
+            (r"C:\saves/backup\..\slot.dat", r"\\?\C:\saves\slot.dat"),
+            (r"\\server\share\saves\slot.dat", r"\\?\UNC\server\share\saves\slot.dat"),
+            (r"\\?\UNC\server\share\saves\slot.dat", r"\\?\UNC\server\share\saves\slot.dat"),
+        ] {
+            let expected: Vec<_> = expected.encode_utf16().chain(std::iter::once(0)).collect();
+            assert_eq!(move_path(Path::new(path)).unwrap(), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_save_creates_and_replaces_a_blob_past_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}", std::process::id()));
+        let dir = root.join("a".repeat(96)).join("b".repeat(96)).join("c".repeat(96));
+        let blob = dir.join("b").join("save.dat");
+        assert!(blob.as_os_str().encode_wide().count() >= 260);
+        std::fs::create_dir(&root).unwrap();
+
+        let create = apply(&dir, None, &[("save.dat".to_string(), Some(b"original".to_vec()))]);
+        let original = std::fs::read(&blob);
+        let replace = apply(&dir, None, &[("save.dat".to_string(), Some(b"updated".to_vec()))]);
+        let updated = std::fs::read(&blob);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(create, S_OK);
+        assert_eq!(original.unwrap(), b"original");
+        assert_eq!(replace, S_OK);
+        assert_eq!(updated.unwrap(), b"updated");
     }
 
     #[test]
