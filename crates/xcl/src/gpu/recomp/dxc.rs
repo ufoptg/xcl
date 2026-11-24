@@ -871,14 +871,37 @@ thread_local! {
     static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+struct CachedOnlyGuard {
+    cached_only: bool,
+    missed: bool,
+}
+
+impl CachedOnlyGuard {
+    fn enter() -> Self {
+        let cached_only = CACHED_ONLY.with(|c| c.replace(true));
+        let missed = MISSED.with(|m| m.replace(false));
+        Self { cached_only, missed }
+    }
+}
+
+impl Drop for CachedOnlyGuard {
+    fn drop(&mut self) {
+        CACHED_ONLY.with(|c| c.set(self.cached_only));
+        let inner_missed = MISSED.with(|m| m.replace(self.missed));
+        if self.cached_only && inner_missed {
+            MISSED.with(|m| m.set(true));
+        }
+    }
+}
+
 /// Run `f` without compiling: a program missing from the disk cache fails at once instead
 /// (non-blocking pipeline creation). Returns `f`'s result and whether something was missing.
 pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
-    CACHED_ONLY.with(|c| c.set(true));
-    MISSED.with(|m| m.set(false));
+    let guard = CachedOnlyGuard::enter();
     let r = f();
-    CACHED_ONLY.with(|c| c.set(false));
-    (r, MISSED.with(|m| m.replace(false)))
+    let missed = MISSED.with(|m| m.get());
+    drop(guard);
+    (r, missed)
 }
 
 /// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
@@ -918,6 +941,31 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn cached_only_restores_tls_after_a_panic() {
+        assert!(!in_cached_only());
+        let panic = std::panic::catch_unwind(|| cached_only(|| -> () { panic!("synthetic cached-only panic") }));
+        assert!(panic.is_err());
+        assert!(!in_cached_only());
+        assert!(!defer(), "a caught panic left cached-only mode enabled");
+    }
+
+    #[test]
+    fn nested_cached_only_propagates_a_miss_and_restores_the_outer_scope() {
+        let ((), outer_missed) = cached_only(|| {
+            assert!(in_cached_only());
+            let ((), inner_missed) = cached_only(|| {
+                assert!(in_cached_only());
+                assert!(defer());
+            });
+            assert!(inner_missed);
+            assert!(in_cached_only());
+        });
+        assert!(outer_missed);
+        assert!(!in_cached_only());
+        assert!(!defer());
     }
 
     #[test]
