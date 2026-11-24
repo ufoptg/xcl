@@ -437,3 +437,35 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// A 16-byte `buffer_store_format_xyzw` (32_32_32_32_FLOAT) at an address that is not
+/// dword aligned writes all four components; the bytes around it stay intact.
+#[test]
+fn gpu_direct_unaligned_multi_dword_format_store() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    // V# s[12:15] (SRSRC 3): base 0x100, stride 0, 64 bytes, format 77; lane 0 stores at +2
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let dxil = runner::direct_kernel(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave64");
+        return;
+    }
+    let vals = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 64, (4 | 5 << 3 | 6 << 6 | 7 << 9) | 77 << 12]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 2;
+        r[10..14].copy_from_slice(&vals);
+    }
+    let fill = 0xDEAD_BEEFu32;
+    let r = runner::run(&dxil, &st, &vec![fill; 128]).expect("GPU run");
+    let mut want: Vec<u8> = std::iter::repeat_n(fill.to_le_bytes(), 128).flatten().collect();
+    want[0x102..0x112].copy_from_slice(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
+}

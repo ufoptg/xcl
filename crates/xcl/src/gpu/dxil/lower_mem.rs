@@ -439,37 +439,44 @@ impl Lw {
         })?;
         let part = self.lnot(whole);
         self.guarded(part, &mut |lw| {
-            let big = lw.cmpc(Pred::UGe, n, 4);
-            let n8 = lw.shlc(n, 3);
-            let n8 = lw.andc(n8, 31);
+            // dword k of `r` holds bytes 4k..min(4k + 4, n); each lands at b + 4k with shift s
+            // and spills into the next dword when s + its bit width passes 32
             let one = lw.c(1);
-            let m = lw.bin(BinOp::Shl, one, n8);
-            let m = lw.sub(m, one);
             let all = lw.c(u32::MAX);
-            let m = lw.sel(big, all, m);
-            let ms = lw.bin(BinOp::Shl, m, s);
-            let vs = lw.bin(BinOp::Shl, r[0], s);
-            lw.st_part(b, ms, vs);
+            let k4 = lw.c(4);
+            let k32 = lw.c(32);
             let snz = lw.cmpc(Pred::Ne, s, 0);
-            let top = lw.add(s, n8);
-            // s + 8n with n = 4 gives s + 32 (n8 above is masked to 31)
-            let is4 = lw.cmpc(Pred::UGe, n, 4);
-            let k = lw.c(32);
-            let z = lw.c(0);
-            let t = lw.sel(is4, k, z);
-            let top = lw.add(top, t);
-            let over = lw.cmpc(Pred::UGt, top, 32);
-            let spill = lw.land(snz, over);
-            lw.guarded(spill, &mut |lw| {
-                let b4 = lw.addc(b, 4);
-                let k32 = lw.c(32);
-                let inv = lw.sub(k32, s);
-                let inv = lw.andc(inv, 31);
-                let m2 = lw.bin(BinOp::LShr, m, inv);
-                let v2 = lw.bin(BinOp::LShr, r[0], inv);
-                lw.st_part(b4, m2, v2);
-                Ok(())
-            })
+            let inv = lw.sub(k32, s);
+            let inv = lw.andc(inv, 31);
+            for k in 0..4u32 {
+                let has = lw.cmpc(Pred::UGt, n, k * 4);
+                let rk = r[k as usize];
+                lw.guarded(has, &mut |lw| {
+                    let rem = lw.addc(n, (k * 4).wrapping_neg());
+                    let big = lw.cmpc(Pred::UGe, rem, 4);
+                    let chunk = lw.sel(big, k4, rem);
+                    let c8 = lw.shlc(chunk, 3);
+                    let c8m = lw.andc(c8, 31);
+                    let m = lw.bin(BinOp::Shl, one, c8m);
+                    let m = lw.sub(m, one);
+                    let m = lw.sel(big, all, m);
+                    let at = lw.addc(b, 4 * k);
+                    let ms = lw.bin(BinOp::Shl, m, s);
+                    let vs = lw.bin(BinOp::Shl, rk, s);
+                    lw.st_part(at, ms, vs);
+                    let top = lw.add(s, c8);
+                    let over = lw.cmpc(Pred::UGt, top, 32);
+                    let spill = lw.land(snz, over);
+                    lw.guarded(spill, &mut |lw| {
+                        let at4 = lw.addc(at, 4);
+                        let m2 = lw.bin(BinOp::LShr, m, inv);
+                        let v2 = lw.bin(BinOp::LShr, rk, inv);
+                        lw.st_part(at4, m2, v2);
+                        Ok(())
+                    })
+                })?;
+            }
+            Ok(())
         })
     }
 
