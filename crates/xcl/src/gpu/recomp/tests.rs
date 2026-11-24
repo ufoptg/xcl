@@ -1683,6 +1683,7 @@ fn gpu_graphics_vs_ps_draw() {
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
     let clear = [0.0, 0.0, 1.0, 1.0];
+    super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), 16, |vs, ps| runner::draw(vs, ps, &layout, &verts, 24, &[], &[], 16, clear)).unwrap();
     let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, clear).unwrap();
     for y in 0..16 {
         for x in 0..16 {
@@ -1853,6 +1854,7 @@ fn gpu_rect_list_corners() {
         attrs: None,
     };
     let outputs = vsi.outputs.clone();
+    let (vo, po) = (Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() });
     let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
@@ -1870,6 +1872,9 @@ fn gpu_rect_list_corners() {
     let ndc = |x: usize, y: usize| ((x as f32 + 0.5) / 8.0 - 1.0, 1.0 - (y as f32 + 0.5) / 8.0);
     let run = |v: &[f32], with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, v, 32, &[], &[], n as u32, clear).unwrap();
     let (x1, x2, y1, y2) = (-0.5f32, 0.5, -0.5, 0.5);
+    // `XCL_DXIL_DIFF=1`: the first corner order through the GS with the direct DXIL VS / PS, compared
+    let v0 = verts(&[[x1, y1, 1.0], [x1, y2, 1.0], [x2, y1, 1.0]]);
+    super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), n, |vs, ps| runner::draw_gs(vs, Some(gs.as_slice()), ps, &layout, &v0, 32, &[], &[], n as u32, clear)).unwrap();
     for (name, corners) in [
         ("corner v0 (radeonsi)", [[x1, y1], [x1, y2], [x2, y1]]),
         ("corner v1 (r600 EXA)", [[x1, y1], [x1, y2], [x2, y2]]),
@@ -1985,6 +1990,7 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
         vsi.outputs[1].component_type = component_type;
         let mut psi = draw_psi();
         psi.inputs[1].component_type = component_type;
+        let (vo, po) = (runner::options(Mode::Vertex(vsi.clone())), runner::options(Mode::Pixel(psi.clone())));
         let vs = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
         let ps = compile(&ps_code, Mode::Pixel(psi), "ps_6_6");
         let layout = [
@@ -1997,6 +2003,7 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
                 .into_iter()
                 .flat_map(|[x, y]| [x, y, f32::from_bits(selector), 0.0, 0.0, 0.0])
                 .collect();
+            super::diff_graphics::check(&vs, &ps, (&vs_code, &vo), (&ps_code, &po), 16, |vs, ps| runner::draw(vs, ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4])).unwrap();
             let pixels = runner::draw(&vs, &ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4]).unwrap();
             for (i, pixel) in pixels.iter().enumerate() {
                 assert_eq!(*pixel, expected, "{format:?} selector {selector:#010x}, pixel {i}");
@@ -2048,6 +2055,10 @@ fn draw_console_views(
         runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
+    // `XCL_DXIL_DIFF=1`: the same draw with the direct DXIL translations, compared
+    let (vo, po) = (runner::options(Mode::Vertex(draw_vsi())), runner::options(Mode::Pixel(draw_psi())));
+    let draw = |vs: &[u8], ps: &[u8]| runner::draw_views(vs, ps, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]);
+    super::diff_graphics::check(&vsb, &psb, (vs.unwrap_or(&pass_vs), &vo), (ps.unwrap_or(&pass_ps), &po), 16, draw).unwrap();
     runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
 }
 
@@ -2921,6 +2932,7 @@ fn gpu_mesh_mode_two_passes() {
     }
     let mut sg = vec![0u32; 128];
     sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    super::diff_graphics::check_mesh(&cs, (&code, &opt), 32, |cs| runner::mesh_draw(cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4])).unwrap();
     let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
     for g in 0..2usize {
@@ -3946,11 +3958,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 
@@ -7592,6 +7617,38 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
 }
 
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
