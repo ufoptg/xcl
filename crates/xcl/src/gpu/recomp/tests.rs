@@ -7419,6 +7419,82 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+#[test]
+fn direct_quad_swizzle_patterns() {
+    use super::emit::{dpp16_quad_intrinsic, swizzle_quad_intrinsic, QuadIntrinsic};
+
+    assert_eq!(dpp16_quad_intrinsic(0xB1), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(dpp16_quad_intrinsic(0x4E), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(dpp16_quad_intrinsic(0x1B), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(dpp16_quad_intrinsic(0x161), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(dpp16_quad_intrinsic(0x162), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(dpp16_quad_intrinsic(0x163), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(dpp16_quad_intrinsic(0x111), None);
+    assert_eq!(dpp16_quad_intrinsic(0x140), None);
+    assert_eq!(dpp16_quad_intrinsic(0x000), None);
+
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0xB1), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0x4E), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0x1B), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(swizzle_quad_intrinsic(0x041F), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(swizzle_quad_intrinsic(0x081F), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(swizzle_quad_intrinsic(0x0C1F), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(swizzle_quad_intrinsic(0x401F), None);
+    assert_eq!(swizzle_quad_intrinsic(0xC000), None);
+    assert_eq!(swizzle_quad_intrinsic(0xE000), None);
+}
+
+#[test]
+fn gpu_direct_quad_swizzles() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 10), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 11), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 12), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x1B), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 13), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x161), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 14), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x162), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 15), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x163), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 16), ("ADDR", 0), ("OFFSET0", 0xB1), ("OFFSET1", 0x80)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 17), ("ADDR", 0), ("OFFSET0", 0x4E), ("OFFSET1", 0x80)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 18), ("ADDR", 0), ("OFFSET0", 0x1B), ("OFFSET1", 0x80)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 19), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 1 << 2)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 20), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 2 << 2)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 21), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 3 << 2)], None),
+    ]);
+    let t = super::translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.contains("QuadReadAcrossX"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossY"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossDiagonal"), "{}", t.hlsl);
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 100 + l as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let q_x = 100 + ((l & !3) | ((l & 3) ^ 1)) as u32;
+        let q_y = 100 + ((l & !3) | ((l & 3) ^ 2)) as u32;
+        let q_diag = 100 + ((l & !3) | ((l & 3) ^ 3)) as u32;
+
+        assert_eq!(v[10], q_x, "lane {l} DPP 0xB1");
+        assert_eq!(v[11], q_y, "lane {l} DPP 0x4E");
+        assert_eq!(v[12], q_diag, "lane {l} DPP 0x1B");
+        assert_eq!(v[13], q_x, "lane {l} DPP 0x161");
+        assert_eq!(v[14], q_y, "lane {l} DPP 0x162");
+        assert_eq!(v[15], q_diag, "lane {l} DPP 0x163");
+        assert_eq!(v[16], q_x, "lane {l} DS_SWIZZLE quad 0xB1");
+        assert_eq!(v[17], q_y, "lane {l} DS_SWIZZLE quad 0x4E");
+        assert_eq!(v[18], q_diag, "lane {l} DS_SWIZZLE quad 0x1B");
+        assert_eq!(v[19], q_x, "lane {l} DS_SWIZZLE bit 0x041F");
+        assert_eq!(v[20], q_y, "lane {l} DS_SWIZZLE bit 0x081F");
+        assert_eq!(v[21], q_diag, "lane {l} DS_SWIZZLE bit 0x0C1F");
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]

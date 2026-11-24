@@ -186,6 +186,9 @@ pub(super) fn ext_encoding(d: &Decoded) -> Option<&'static Encoding> {
 fn dpp16_src(ctrl: u64) -> Option<String> {
     let n = ctrl & 15;
     Some(match ctrl {
+        0xB1 => "(int)(lane_id ^ 1u)".into(),
+        0x4E => "(int)(lane_id ^ 2u)".into(),
+        0x1B => "(int)(lane_id ^ 3u)".into(),
         0x000..=0x0FF => format!("(int)((lane_id & ~3u) | (({ctrl}u >> (2u * (lane_id & 3u))) & 3u))"),
         0x101..=0x10F => format!("select((lane_id & 15u) + {n}u < 16u, (int)(lane_id + {n}u), -1)"),
         0x111..=0x11F => format!("select((lane_id & 15u) >= {n}u, (int)(lane_id - {n}u), -1)"),
@@ -196,6 +199,50 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
         0x160..=0x16F => format!("(int)(lane_id ^ {n}u)"),
         _ => return None,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum QuadIntrinsic {
+    AcrossX,
+    AcrossY,
+    AcrossDiagonal,
+}
+
+impl QuadIntrinsic {
+    pub(crate) fn fn_name(self) -> &'static str {
+        match self {
+            Self::AcrossX => "QuadReadAcrossX",
+            Self::AcrossY => "QuadReadAcrossY",
+            Self::AcrossDiagonal => "QuadReadAcrossDiagonal",
+        }
+    }
+
+    pub(crate) fn xor_mask(self) -> u32 {
+        match self {
+            Self::AcrossX => 1,
+            Self::AcrossY => 2,
+            Self::AcrossDiagonal => 3,
+        }
+    }
+}
+
+pub(crate) fn dpp16_quad_intrinsic(ctrl: u64) -> Option<QuadIntrinsic> {
+    match ctrl {
+        0xB1 | 0x161 => Some(QuadIntrinsic::AcrossX),
+        0x4E | 0x162 => Some(QuadIntrinsic::AcrossY),
+        0x1B | 0x163 => Some(QuadIntrinsic::AcrossDiagonal),
+        _ => None,
+    }
+}
+
+pub(crate) fn swizzle_quad_intrinsic(offset: u64) -> Option<QuadIntrinsic> {
+    for &op in &[QuadIntrinsic::AcrossX, QuadIntrinsic::AcrossY, QuadIntrinsic::AcrossDiagonal] {
+        let xor = op.xor_mask();
+        if (0..32u32).all(|lane| swizzle_lane(offset, lane) == (lane ^ xor)) {
+            return Some(op);
+        }
+    }
+    None
 }
 
 /// The lane `lane` of a 32-lane half reads with `ds_swizzle_b32` (the RDNA ISA's DS_SWIZZLE_B32):
@@ -241,6 +288,9 @@ pub(crate) fn swizzle_lane(offset: u64, lane: u32) -> u32 {
 /// upper 32 lanes of a wave64 swizzle among themselves), and the declaration it needs first:
 /// FFT and rotate (rare) read the permutation from a constant table named `table`.
 fn swizzle_source(offset: u64, table: &str) -> (Option<String>, String) {
+    if let Some(quad_op) = swizzle_quad_intrinsic(offset) {
+        return (None, format!("lane_id ^ {}u", quad_op.xor_mask()));
+    }
     if offset >= 0xC000 {
         let lanes: Vec<String> = (0..32).map(|i| format!("{}u", swizzle_lane(offset, i))).collect();
         let decl = format!("static const uint {table}[32] = {{ {} }};", lanes.join(", "));
@@ -2635,22 +2685,40 @@ impl Em {
                 if d.variant == Variant::Dpp16 {
                     let ctrl = fv("DPP_CTRL");
                     let (fi, bound) = (fv("FI") == 1, fv("BOUND_CTRL") == 1);
-                    let src = dpp16_src(ctrl).ok_or("DPP_CTRL")?;
-                    self.line(&format!("int {t}_l = {src};"));
-                    self.line(&format!(
-                        "bool {t}_ok = and({t}_l >= 0, or({fi}, lanebit_at({el}, {eh}, (uint){t}_l)));"
-                    ));
-                    let rla = self.rla_half_fn();
-                    self.line(&format!("uint {t} = {rla}({v}, (uint)max({t}_l, 0));"));
-                    let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
-                    // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
-                    let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
-                    if bound {
-                        self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
+                    if let Some(quad_op) = dpp16_quad_intrinsic(ctrl) {
+                        let intr = quad_op.fn_name();
+                        let xor = quad_op.xor_mask();
+                        self.line(&format!("int {t}_l = (int)(lane_id ^ {xor}u);"));
+                        self.line(&format!(
+                            "bool {t}_ok = or({fi}, lanebit_at({el}, {eh}, (uint){t}_l));"
+                        ));
+                        self.line(&format!("uint {t} = {intr}({v});"));
+                        let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
+                        let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
+                        if bound {
+                            self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
+                        } else {
+                            en = format!("({en} && {t}_ok)");
+                        }
+                        self.dpp_enable = Some(en);
                     } else {
-                        en = format!("({en} && {t}_ok)");
+                        let src = dpp16_src(ctrl).ok_or("DPP_CTRL")?;
+                        self.line(&format!("int {t}_l = {src};"));
+                        self.line(&format!(
+                            "bool {t}_ok = and({t}_l >= 0, or({fi}, lanebit_at({el}, {eh}, (uint){t}_l)));"
+                        ));
+                        let rla = self.rla_half_fn();
+                        self.line(&format!("uint {t} = {rla}({v}, (uint)max({t}_l, 0));"));
+                        let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
+                        // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
+                        let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
+                        if bound {
+                            self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
+                        } else {
+                            en = format!("({en} && {t}_ok)");
+                        }
+                        self.dpp_enable = Some(en);
                     }
-                    self.dpp_enable = Some(en);
                 } else {
                     let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
@@ -3942,16 +4010,24 @@ impl Em {
         match name {
             "ds_swizzle_b32" => {
                 let a = self.vreg(f("ADDR"));
-                let (decl, src) = swizzle_source(off16, &format!("{t}_lanes"));
-                if let Some(decl) = decl {
-                    self.line(&decl);
-                }
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
-                self.line(&format!("uint {t}_l = {src};"));
-                let rla = self.rla_half_fn();
-                self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
-                self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
+                if let Some(quad_op) = swizzle_quad_intrinsic(off16) {
+                    let intr = quad_op.fn_name();
+                    let xor = quad_op.xor_mask();
+                    self.line(&format!("uint {t}_l = lane_id ^ {xor}u;"));
+                    self.line(&format!("uint {t} = {intr}({a});"));
+                    self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
+                } else {
+                    let (decl, src) = swizzle_source(off16, &format!("{t}_lanes"));
+                    if let Some(decl) = decl {
+                        self.line(&decl);
+                    }
+                    self.line(&format!("uint {t}_l = {src};"));
+                    let rla = self.rla_half_fn();
+                    self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
+                    self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
+                }
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
@@ -5556,9 +5632,6 @@ uint2 ballot(bool b) {
 uint rla(uint v, uint l) {
     uint w = WaveReadLaneAt(v, l + 32u * xcl_half);
 #ifdef XCL_PIXEL
-    // A lane of the reader's own quad through a quad read: those see helper lanes (wave reads
-    // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
-    // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
     uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
     // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
