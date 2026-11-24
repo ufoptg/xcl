@@ -140,26 +140,30 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
                             "with the same title and time as the PR's")
         if clean:
-            pr = clean[-1]
-            problems += field_problems(pr, "the PR's")
-            for key in ("device removals", "crashes"):
-                if (number(pr.get(key)) or 0) > 0:
-                    problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
-            if pr.get("exit", "").startswith("killed"):
-                problems.append("the PR's regression run did not end by itself (killed)")
-            if main:
-                m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
-                for b in [m] if m else main:
+            matched_main = []
+            for pr in clean:
+                problems += field_problems(pr, "the PR's")
+                for key in ("device removals", "crashes"):
+                    if (number(pr.get(key)) or 0) > 0:
+                        problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
+                if pr.get("exit", "").startswith("killed"):
+                    problems.append("the PR's regression run did not end by itself (killed)")
+                if main:
+                    m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
+                    if m is not None:
+                        if m not in matched_main:
+                            matched_main.append(m)
+                            problems += field_problems(m, "the main")
+                        pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
+                        if mf and (pf is None or pf < FRAMES_KEPT * mf):
+                            problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
+                        pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
+                        if pc and mc and pc > COMMIT_GROWTH * mc:
+                            problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+            if main and not matched_main:
+                for b in main:
                     problems += field_problems(b, "the main")
-                if m is None:
-                    problems.append("the main and PR regression runs are not of the same title for the same time")
-                else:
-                    pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
-                    if mf and (pf is None or pf < FRAMES_KEPT * mf):
-                        problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
-                    pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
-                    if pc and mc and pc > COMMIT_GROWTH * mc:
-                        problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                problems.append("the main and PR regression runs are not of the same title for the same time")
     return problems
 
 
