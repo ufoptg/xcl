@@ -67,6 +67,7 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
     let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    super::diff_kernel::pair(&dxil, code, wave64, || runner::direct_kernel_full(code, wave64));
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
@@ -75,7 +76,10 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
     let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
-    if !runner::direct_dxil() || !windows {
+    // `XCL_DXIL_DIFF=1`: a kernel or compute program is paired with its direct translation
+    // (`diff_kernel::pair`)
+    let diff = super::diff_kernel::enabled() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_)) && !hlsl.is_empty();
+    if !(runner::direct_dxil() || diff) || !windows {
         return hlsl;
     }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
@@ -83,6 +87,14 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     let mem_windows = if opt.heap_windows && opt.mem_windows > 1 { opt.mem_windows | super::HEAP_WINDOWS } else { opt.mem_windows };
     let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
+        Mode::Kernel if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || crate::gpu::dxil::kernel::translate_full(code, o));
+            hlsl
+        }
+        Mode::Compute(cs) if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || translate_compute(code, o, cs));
+            hlsl
+        }
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
         Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
@@ -96,6 +108,13 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
 /// through the direct DXIL translator (and its validator check).
 fn direct_check(code: &[u8], opt: &Options) {
     let _ = direct_or(code, opt, Vec::new());
+}
+
+/// `XCL_DXIL_DIFF=1`: a container the test compiled itself is paired as `direct_or` pairs it.
+fn diff_pair(code: &[u8], opt: &Options, hlsl: &[u8]) {
+    if super::diff_kernel::enabled() {
+        let _ = direct_or(code, opt, hlsl.to_vec());
+    }
 }
 
 /// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
@@ -6299,9 +6318,11 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
         let lanes = if wave64 { 64 } else { 32 };
         let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        diff_pair(&p, &opt, &dxil);
         let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
@@ -7524,12 +7545,14 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
     for wave64 in [true, false] {
-        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() });
+        let t = translate(&p_all, &opt).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
         if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        diff_pair(&p_all, &opt, &dxil);
         let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
         for tid in 0..128usize {
             let want = ((tid ^ 96) + 0x101) as u32;

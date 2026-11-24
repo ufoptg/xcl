@@ -641,6 +641,9 @@ pub fn run_with_statics(
     samplers: &[TestSampler],
     statics: &[super::pso::StaticSampler],
 ) -> Result<KernelResult, String> {
+    if let Some(r) = super::diff_kernel::run_if_paired(dxil, state, mem, textures, samplers, statics) {
+        return r;
+    }
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let rs: ID3D12RootSignature = if statics.is_empty() { gpu.rs.clone() } else { super::pso::abi_root_signature_with(&gpu.dev, false, statics)? };
@@ -793,6 +796,9 @@ pub fn direct_kernel_full(code: &[u8], wave64: bool) -> Result<crate::gpu::dxil:
 
 /// Translate + compile + run RDNA2 code as a kernel, with test textures and samplers.
 pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
+    if super::diff_kernel::enabled() {
+        return super::diff_kernel::run_code_with(code, state, mem, textures, samplers);
+    }
     if direct_dxil() {
         let k = direct_kernel_full(code, true)?;
         return run_with_statics(&k.dxil, state, mem, textures, samplers, &k.static_samplers);
@@ -807,6 +813,9 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
 
 /// Translate + compile + run RDNA2 code as a kernel.
 pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
+    if super::diff_kernel::enabled() {
+        return super::diff_kernel::run_code_with(code, state, mem, &[], &[]);
+    }
     if direct_dxil() {
         let k = direct_kernel_full(code, true)?;
         return run_with_statics(&k.dxil, state, mem, &[], &[], &k.static_samplers);
@@ -1594,6 +1603,9 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    if let Some(r) = super::diff_kernel::dispatch_if_paired(dxil, groups, sgprs, mem) {
+        return r;
+    }
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let pso: ID3D12PipelineState = unsafe {
