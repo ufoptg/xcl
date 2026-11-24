@@ -117,8 +117,22 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
+xcl shaders D:\data\shaders.rpf --explain --sample 20 --json > a.json  # compile-cost report per program (HLSL+DXC and direct DXIL)
+xcl shaders a.json --explain-diff b.json                           # what changed between two reports
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
+
+- `--explain` reports, per console program (picked with `--hash H[,H]` or a seeded `--sample N
+  --seed S`), the guest program's instruction classes and control flow, the HLSL size by the
+  instruction that wrote it, DXC's time per pass (with the SDK's `dxc.exe`, run with the
+  arguments a title's compile uses), and the DXIL's structure (blocks, phis, values, calls) for
+  the HLSL path and the direct translator. Counts are *portable*: equal on any machine with the
+  same commit, DXC and options (the `portable digest` line). Times and memory are *local*:
+  `--explain-diff` compares them only between reports from the same machine. Programs are named
+  by hash only, so a report holds no game data. Each `dxc.exe` and XCL itself are capped at
+  `--mem-gb` of commit (default 8), and DXC is stopped after `--dxc-timeout` seconds (default
+  600): a program past a limit is reported as unfinished instead of growing the page file.
+  `--json` writes one line per program as it finishes.
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the

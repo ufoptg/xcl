@@ -479,22 +479,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
-    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
-        }
-    }
-    args.extend(extra.iter().map(|a| crate::util::wide(a)));
+    let args: Vec<Vec<u16>> = arguments(src.len(), entry, profile, extra).iter().map(|a| crate::util::wide(a)).collect();
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
@@ -514,6 +499,28 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
         Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
     }
+}
+
+/// The DXC arguments of a compile of `src_len` bytes of HLSL; `extra` goes last. Public so
+/// `xcl shaders --explain` runs `dxc.exe` with exactly what [`compile`] gives DXC.
+pub fn arguments(src_len: usize, entry: &str, profile: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| a.to_string()).collect();
+    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+    // compile). -O0 only as a safety net for enormous sources.
+    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    if !extra.iter().any(|a| a.starts_with("-O")) {
+        if src_len > 8 * 1024 * 1024 {
+            args.push("-O0".into());
+        } else if src_len > 1024 * 1024 {
+            args.push("-O1".into());
+        }
+    }
+    args.extend(extra.iter().map(|a| a.to_string()));
+    args
 }
 
 pub(super) fn toolchain_identity() -> &'static str {
@@ -905,6 +912,16 @@ mod cache_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn arguments_pick_the_level_by_size_and_the_callers_go_last() {
+        let a = |len: usize, extra: &[&str]| arguments(len, "main", "cs_6_6", extra);
+        assert_eq!(a(1000, &[]), ["-E", "main", "-T", "cs_6_6", "-HV", "2021"]);
+        assert_eq!(a(2 << 20, &[]).last().unwrap(), "-O1");
+        assert_eq!(a(9 << 20, &[]).last().unwrap(), "-O0");
+        let o3 = a(9 << 20, &["-O3"]);
+        assert!(!o3.contains(&"-O0".to_string()) && o3.last().unwrap() == "-O3");
+    }
 
     fn synthetic_dxil(marker: u8) -> Vec<u8> {
         let mut b = vec![0u8; 68];

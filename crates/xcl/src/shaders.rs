@@ -3,8 +3,9 @@
 //! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
 //! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
-//! `--compile N` also compiles N of the complete translations with DXC. `--export-hlsl`
-//! writes deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
+//! `--compile N` also compiles N of the complete translations with DXC. `--size-by-op`
+//! splits the HLSL bytes by the instruction that produced them. `--export-hlsl` writes
+//! deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
+
+mod explain;
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -282,6 +285,41 @@ static HEADER_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `xcl shaders --example MNEMONIC`
 static EXAMPLE_FOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// `xcl shaders --recomp --size-by-op`
+static SIZE_BY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// HLSL bytes of a translation by the console instruction that produced them: the emitter
+/// writes a `// <pc>: <listing>` line before each instruction, and the lines after it at its
+/// indentation or deeper are its code. Other buckets: `(prologue)` (declarations and helper
+/// functions before the first instruction), `(listing)` (the `// <pc>:` lines themselves) and
+/// `(structure)` (lines less indented than the instruction before them: `}`, `else`, skip-flag
+/// `if`s, the dispatcher, the end of `main`). Structure written at the instruction's own
+/// indentation (a branch's `if`, a loop head) counts for the instruction before it, which is
+/// the branch itself in most cases. Value: (bytes, instructions).
+fn hlsl_bytes_by_op(hlsl: &str, out: &mut HashMap<String, (usize, usize)>) {
+    let mut cur: Option<(&str, usize)> = None;
+    for line in hlsl.split_inclusive('\n') {
+        let body = line.trim_start_matches(' ');
+        let indent = line.len() - body.len();
+        let listing = body.strip_prefix("// ").and_then(|r| r.split_once(": ")).filter(|(pc, _)| {
+            pc.len() >= 4 && pc.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        let key = if let Some((_, text)) = listing {
+            let m = text.split_whitespace().next().unwrap_or("");
+            cur = Some((m, indent));
+            out.entry(m.to_string()).or_default().1 += 1;
+            "(listing)"
+        } else {
+            match cur {
+                None => "(prologue)",
+                Some((m, i)) if indent >= i && !body.trim_end().is_empty() => m,
+                Some(_) => "(structure)",
+            }
+        };
+        out.entry(key.to_string()).or_default().0 += line.len();
+    }
+}
+
 #[derive(Default)]
 struct RecompAgg {
     programs: usize,
@@ -300,6 +338,8 @@ struct RecompAgg {
     /// programs translated in a graphics mode (VS / PS interface from the container)
     by_mode: BTreeMap<String, (usize, usize)>,
     hlsl_bytes: usize,
+    /// `--size-by-op`: [`hlsl_bytes_by_op`] over every translation
+    size_by_op: HashMap<String, (usize, usize)>,
     /// VS / PS (the driver picks the wave size): wave32 programs (run split in 64-lane waves)
     /// and wave64 programs whose cross-lane reads break in 32-lane waves (kind → programs)
     graphics_wave32: usize,
@@ -309,6 +349,24 @@ struct RecompAgg {
     wave_resolved: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
+    /// `lane_masks` (direct DXIL): programs analysed, those with no guard left, vector
+    /// instructions, those still guarded, lane branches, uniform branches; failures by reason
+    lanes: [usize; 6],
+    lanes_failed: BTreeMap<String, usize>,
+    /// compute programs, per-lane DXIL (`lower_dxil`) vs #1426's per-instruction form: tried,
+    /// per-lane ok, per-instruction ok, both ok, per-lane bytes and per-instruction bytes where
+    /// both are ok; why the per-lane form refused (first words of the reason)
+    cs_forms: [usize; 6],
+    cs_lane_why: BTreeMap<String, usize>,
+    /// survey of every refusal, per stage (CS, MS): tried, wave64, per-lane ok, per-instruction
+    /// ok, both ok, per-lane refused only for instructions (no structural reason), the same with
+    /// the per-instruction form ok, refused by the lane-mask analysis
+    forms: BTreeMap<String, [usize; 8]>,
+    /// "stage | reason" → programs (each reason once per program): every per-lane reason, the
+    /// structural ones that are a program's only structural reason, the per-instruction reasons
+    lane_every: BTreeMap<String, usize>,
+    lane_sole: BTreeMap<String, usize>,
+    inst_why: BTreeMap<String, usize>,
 }
 
 impl RecompAgg {
@@ -349,12 +407,53 @@ impl RecompAgg {
             e.1 += b;
         }
         self.hlsl_bytes += o.hlsl_bytes;
+        for (a, b) in self.lanes.iter_mut().zip(o.lanes) {
+            *a += b;
+        }
+        for (k, v) in o.lanes_failed {
+            *self.lanes_failed.entry(k).or_default() += v;
+        }
+        for (a, b) in self.cs_forms.iter_mut().zip(o.cs_forms) {
+            *a += b;
+        }
+        for (k, v) in o.cs_lane_why {
+            *self.cs_lane_why.entry(k).or_default() += v;
+        }
+        for (k, v) in o.forms {
+            for (a, b) in self.forms.entry(k).or_default().iter_mut().zip(v) {
+                *a += b;
+            }
+        }
+        for (m, o) in [(&mut self.lane_every, o.lane_every), (&mut self.lane_sole, o.lane_sole), (&mut self.inst_why, o.inst_why)] {
+            for (k, v) in o {
+                *m.entry(k).or_default() += v;
+            }
+        }
+        for (k, (b, n)) in o.size_by_op {
+            let e = self.size_by_op.entry(k).or_default();
+            e.0 += b;
+            e.1 += n;
+        }
     }
 
     fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
         // `XCL_RECOMP_ONLY=<hash>` (the hex prefix of an `XCL_DUMP_HLSL` file): that program alone
         if let Ok(only) = std::env::var("XCL_RECOMP_ONLY") {
             if format!("{:016x}", name_hash(name)) != only {
+                return;
+            }
+        }
+        // `XCL_RECOMP_STAGES=CS,MS`: only programs of these stages
+        if let Ok(st) = std::env::var("XCL_RECOMP_STAGES") {
+            let l = match &mode {
+                recomp::Mode::Vertex(_) => "VS",
+                recomp::Mode::Pixel(_) => "PS",
+                recomp::Mode::Kernel => "kernel",
+                recomp::Mode::Mesh(_) => "MS",
+                recomp::Mode::Geometry(_) => "GS",
+                recomp::Mode::Compute(_) => "CS",
+            };
+            if !st.split(',').any(|x| x == l) {
                 return;
             }
         }
@@ -389,6 +488,69 @@ impl RecompAgg {
                 self.graphics_wave32 += 1;
             }
         }
+        if let recomp::Mode::Compute(cs) = &mode {
+            let lane = recomp::lower_dxil::compute_code(code, cs, wave64);
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let inst = crate::gpu::dxil::kernel::translate_compute(code, o, cs).map(|k| k.dxil);
+            self.cs_forms[0] += 1;
+            self.cs_forms[1] += lane.is_ok() as usize;
+            self.cs_forms[2] += inst.is_ok() as usize;
+            if let (Ok(a), Ok(b)) = (&lane, &inst) {
+                self.cs_forms[3] += 1;
+                self.cs_forms[4] += a.len();
+                self.cs_forms[5] += b.len();
+            }
+            if let Err(e) = &lane {
+                let key: String = e.split([':', '(']).next().unwrap_or("").split_whitespace().take(5).collect::<Vec<_>>().join(" ");
+                *self.cs_lane_why.entry(key).or_default() += 1;
+            }
+        }
+        let survey_cs = match &mode {
+            recomp::Mode::Compute(cs) => Some(("CS", cs.clone())),
+            // the mesh pass is a compute pass of the NGG program: its threads in a 1-D group
+            recomp::Mode::Mesh(ms) => Some(("MS", recomp::CsInterface { threads: [ms.threads, 1, 1], tid_components: 1, ..Default::default() })),
+            _ => None,
+        };
+        if let Some((st, cs)) = survey_cs {
+            let lane = recomp::lower_dxil::survey_compute_code(code, &cs, wave64);
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let inst = match &mode {
+                recomp::Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).map(|_| ()),
+                _ => crate::gpu::dxil::kernel::translate_compute(code, o, &cs).map(|_| ()),
+            };
+            let mut keys: Vec<(String, bool)> = lane.iter().map(|r| (survey_key(r), survey_structural(r))).collect();
+            keys.sort();
+            keys.dedup();
+            let structural: Vec<&String> = keys.iter().filter(|k| k.1).map(|k| &k.0).collect();
+            let lm = lane.len() == 1 && ["lane conditions", "indirect jump", "branch to the entry", "irreducible", "no fixpoint", "cannot decode"].iter().any(|w| lane[0].starts_with(w));
+            let f = self.forms.entry(st.to_string()).or_default();
+            let bridge = !lane.is_empty() && structural.is_empty();
+            for (i, c) in [true, wave64, lane.is_empty(), inst.is_ok(), lane.is_empty() && inst.is_ok(), bridge, bridge && inst.is_ok(), lm].into_iter().enumerate() {
+                f[i] += c as usize;
+            }
+            for (k, _) in &keys {
+                *self.lane_every.entry(format!("{st} | {k}")).or_default() += 1;
+            }
+            if let [k] = structural[..] {
+                *self.lane_sole.entry(format!("{st} | {k}")).or_default() += 1;
+            }
+            if let Err(e) = &inst {
+                *self.inst_why.entry(format!("{st} | {}", survey_key(e.lines().next().unwrap_or("")))).or_default() += 1;
+            }
+        }
+        match recomp::lane_masks::analyze_code(code, wave64) {
+            Ok(s) => {
+                let counts = [1, s.guarded.is_empty() as usize, s.vector, s.guarded.len(), s.lane_branches, s.uniform_branches];
+                for (a, b) in self.lanes.iter_mut().zip(counts) {
+                    *a += b;
+                }
+            }
+            Err(why) => *self.lanes_failed.entry(why.to_string()).or_default() += 1,
+        }
+        // `XCL_RECOMP_NO_HLSL=1`: the direct DXIL survey alone
+        if std::env::var("XCL_RECOMP_NO_HLSL").is_ok() {
+            return;
+        }
         // `XCL_RECOMP_WINDOWS=4`: as a title with unified memory translates (`pso::mem_windows`)
         let mem_windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         match recomp::translate(code, &recomp::Options { mode, wave64, mem_windows, ..Default::default() }) {
@@ -397,6 +559,9 @@ impl RecompAgg {
                 e.0 += 1;
                 e.1 += t.complete() as usize;
                 self.hlsl_bytes += t.hlsl.len();
+                if SIZE_BY_OP.load(Ordering::Relaxed) {
+                    hlsl_bytes_by_op(&t.hlsl, &mut self.size_by_op);
+                }
                 for (m, n) in &t.unsupported {
                     let e = self.missing.entry(m.clone()).or_default();
                     e.0 += n;
@@ -711,7 +876,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
+    SIZE_BY_OP.store(args.iter().any(|a| a == "--size-by-op"), Ordering::Relaxed);
     let t0 = std::time::Instant::now();
+    let explaining = args.iter().any(|a| a == "--explain");
+    if let Some(other) = args.iter().position(|a| a == "--explain-diff").and_then(|i| args.get(i + 1)) {
+        return explain::diff(path, Path::new(other));
+    }
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -730,8 +900,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
-            // one shader file: the record to export or measure
+        } else if export_dir.is_some() || measure.is_some() || explaining {
+            // one shader file: the record to export, measure or explain
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
@@ -739,6 +909,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if explaining {
+        return explain::run(&input, args, json);
+    }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),
@@ -1493,6 +1666,55 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
             rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
         );
+        let c = &rc.cs_forms;
+        let mut why: Vec<_> = rc.cs_lane_why.iter().collect();
+        why.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "compute programs, direct DXIL: {} tried; per-lane form {} ok, per-instruction form (#1426) {} ok; where both are ok ({}): per-lane {} KB, per-instruction {} KB of DXIL; per-lane refused for: {:?}",
+            c[0], c[1], c[2], c[3], c[4] / 1024, c[5] / 1024, &why[..why.len().min(15)]
+        );
+        for (st, f) in &rc.forms {
+            println!(
+                "{st} programs, every refusal: {} tried ({} wave64); per-lane ok {}, per-instruction ok {}, both {}; per-lane refused for instructions only {} (per-instruction ok on {} of them); lane-mask analysis refused {}",
+                f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]
+            );
+        }
+        for (title, m) in [
+            ("per-lane reasons (stage | reason → programs; [S] structural)", &rc.lane_every),
+            ("the only structural reason of a program (stage | reason → programs)", &rc.lane_sole),
+            ("per-instruction form (#1426) refused (stage | first line → programs)", &rc.inst_why),
+        ] {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            println!("{title}:");
+            for (k, n) in v.iter().take(top.max(40)) {
+                let tag = if survey_structural(k.split(" | ").nth(1).unwrap_or("")) { "[S] " } else { "" };
+                println!("  {n:>6}  {tag}{k}");
+            }
+        }
+        let l = &rc.lanes;
+        println!(
+            "lane masks (direct DXIL, no EXEC emulation): analysed {} of {} programs, {} with no guard left; vector instructions {}, still guarded {} ({:.1}%); branches per lane {}, uniform {}; not analysed: {:?}",
+            l[0],
+            rc.programs,
+            l[1],
+            l[2],
+            l[3],
+            l[3] as f64 * 100.0 / l[2].max(1) as f64,
+            l[4],
+            l[5],
+            rc.lanes_failed
+        );
+        if !rc.size_by_op.is_empty() {
+            let total = rc.size_by_op.values().map(|v| v.0).sum::<usize>().max(1);
+            let mut by: Vec<(&String, &(usize, usize))> = rc.size_by_op.iter().collect();
+            by.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
+            println!("HLSL bytes by instruction (MB; share; instructions; bytes per instruction):");
+            for (m, (b, n)) in by.iter().take(top) {
+                let per = if *n > 0 { format!("{:.0}", *b as f64 / *n as f64) } else { "-".into() };
+                println!("  {m:<34} {:>9.1} {:>5.1}% {n:>10} {per:>7}", *b as f64 / 1048576.0, *b as f64 * 100.0 / total as f64);
+            }
+        }
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
 {x}");
@@ -1627,6 +1849,21 @@ mod tests {
     }
 
     #[test]
+    fn hlsl_bytes_go_to_the_instruction_that_wrote_them() {
+        let hlsl = "uint f() { return 1u; }\nvoid main() {\n    // 0000: s_mov_b32 s0, 0\n    s0 = 0u;\n    if (!(xcl_skip_8)) {\n        // 0004: v_mov_b32 v0, s0\n        v0 = select(b, (s0), v0);\n\n    }\n    // 0008: s_endpgm\n}\n";
+        let mut by = HashMap::new();
+        hlsl_bytes_by_op(hlsl, &mut by);
+        assert_eq!(by["(prologue)"], ("uint f() { return 1u; }\nvoid main() {\n".len(), 0));
+        assert_eq!(by["s_mov_b32"], ("    s0 = 0u;\n".len() + "    if (!(xcl_skip_8)) {\n".len(), 1));
+        assert_eq!(by["v_mov_b32"], ("        v0 = select(b, (s0), v0);\n".len(), 1));
+        assert_eq!(by["(structure)"], ("\n".len() + "    }\n".len() + "}\n".len(), 0));
+        assert_eq!(by["s_endpgm"], (0, 1));
+        let listing = "    // 0000: s_mov_b32 s0, 0\n".len() + "        // 0004: v_mov_b32 v0, s0\n".len() + "    // 0008: s_endpgm\n".len();
+        assert_eq!(by["(listing)"], (listing, 0));
+        assert_eq!(by.values().map(|v| v.0).sum::<usize>(), hlsl.len());
+    }
+
+    #[test]
     fn aggregates_console_shaders() {
         let mut a = Agg::default();
         a.add("PS_a", &sample(0, &[fssm(&CODE, &[(5, 1)])]));
@@ -1713,6 +1950,14 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
     let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
     let skipped = AtomicUsize::new(0);
+    // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
+    // translates, its DXIL size against the per-instruction form's, and the refusals ranked
+    let lanes = args.iter().any(|a| a == "--lanes");
+    let lanes_tried = AtomicUsize::new(0);
+    let lanes_ok = AtomicUsize::new(0);
+    let lanes_bytes = AtomicUsize::new(0);
+    let lanes_vs = AtomicUsize::new(0);
+    let lanes_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
@@ -1767,6 +2012,26 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
                         let time = t.elapsed();
+                        if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
+                            lanes_tried.fetch_add(1, Ordering::Relaxed);
+                            // under the sweep's timeout too (the thread is left to finish)
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (c, csc) = (code.to_vec(), cs.clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
+                            });
+                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
+                                Ok(k) => {
+                                    lanes_ok.fetch_add(1, Ordering::Relaxed);
+                                    lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
+                                    lanes_vs.fetch_add(r.as_ref().map_or(0, |d| d.len()), Ordering::Relaxed);
+                                    if trace {
+                                        eprintln!("per-lane: {name} FSSM#{fi}: {} B, per-instruction {:?} B", k.dxil.len(), r.as_ref().map(|d| d.len()));
+                                    }
+                                }
+                                Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
+                            }
+                        }
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
                                 let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
@@ -1809,8 +2074,62 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
         println!("{}", rep.json(top));
     } else {
         println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
+        if lanes {
+            let mut why: Vec<(String, usize)> = lanes_why.into_inner().unwrap().into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            why.truncate(top);
+            println!("per-lane form: {} of {} compute programs; where it translates, {} B against {} B per instruction; refused for: {why:?}", lanes_ok.load(Ordering::Relaxed), lanes_tried.load(Ordering::Relaxed), lanes_bytes.load(Ordering::Relaxed), lanes_vs.load(Ordering::Relaxed));
+        }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
     0
+}
+
+/// A survey reason without its program's numbers: registers as `sN`, other numbers as `N`
+/// (an `s_setreg`'s hardware register is kept), at most eight words.
+fn survey_key(r: &str) -> String {
+    let r = r.split(" (").next().unwrap_or(r);
+    let words: Vec<&str> = r.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, raw) in words.iter().enumerate() {
+        let w = raw.trim_end_matches([':', ',']);
+        let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+        let w = if w.strip_prefix('s').is_some_and(digits) {
+            "sN".to_string()
+        } else if digits(w) && !(i > 0 && words[i - 1] == "hwreg") {
+            "N".to_string()
+        } else {
+            w.to_string()
+        };
+        out.push(if raw.ends_with(':') { format!("{w}:") } else { w });
+        if out.len() == 8 {
+            break;
+        }
+    }
+    out.join(" ")
+}
+
+/// A per-lane refusal no instruction lowering removes (the CFG, masks across joins, lanes
+/// elsewhere, the group shape), as opposed to an instruction the per-lane form lacks.
+fn survey_structural(r: &str) -> bool {
+    [
+        "2-D / 3-D",
+        "elsewhere",
+        "read as a number",
+        "read as a mask",
+        "across two masks",
+        "successors",
+        "unsupported branch",
+        "neither a number nor a mask",
+        "empty program",
+        "lane conditions",
+        "indirect jump",
+        "branch to the entry",
+        "irreducible",
+        "no fixpoint",
+        "cannot decode",
+    ]
+    .iter()
+    .any(|w| r.contains(w))
 }
