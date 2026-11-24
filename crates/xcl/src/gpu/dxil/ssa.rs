@@ -48,6 +48,14 @@ struct SBlock {
     region: Option<(Block, Vec<u32>)>,
 }
 
+/// A sealed join waiting for the values from its predecessors.
+struct ReadJoin {
+    block: Block,
+    preds: Vec<Block>,
+    values: Vec<Value>,
+    chain_start: usize,
+}
+
 pub struct Ssa {
     blocks: Vec<SBlock>,
     ty: Ty,
@@ -155,73 +163,81 @@ impl Ssa {
 
     /// The definition of `var` reaching the current end of block `b`.
     pub fn read(&mut self, s: &mut Shader, b: Block, var: u32, init: &mut dyn FnMut(&mut Shader, u32) -> Value) -> Value {
-        if let Some(&v) = self.at(b).defs.get(&var) {
-            return v;
-        }
-        // chains of sealed single-predecessor blocks (guarded memory accesses make long ones)
-        // are walked iteratively, not recursively
+        let mut block = b;
         let mut chain = Vec::new();
-        let mut b = b;
-        loop {
-            let sb = self.at(b);
-            if !sb.sealed || sb.preds.len() != 1 || sb.region.as_ref().is_some_and(|(_, w)| w.binary_search(&var).is_ok()) {
-                break;
-            }
-            chain.push(b);
-            b = sb.preds[0];
-            if let Some(&v) = self.at(b).defs.get(&var) {
-                    for c in chain {
-                    self.cache(c, var, v);
+        let mut joins: Vec<ReadJoin> = Vec::new();
+        let mut chain_start = 0;
+
+        'read: loop {
+            let mut value = loop {
+                let sb = self.at(block);
+                if let Some(&value) = sb.defs.get(&var) {
+                    break value;
                 }
-                return v;
+                if !sb.sealed {
+                    let phi = s.m.phi_at(block, self.ty);
+                    self.at(block).incomplete.push((var, phi));
+                    self.cache(block, var, phi);
+                    break phi;
+                }
+                if sb.preds.len() == 1 && !sb.region.as_ref().is_some_and(|(_, w)| w.binary_search(&var).is_ok()) {
+                    chain.push(block);
+                    block = sb.preds[0];
+                    continue;
+                }
+                if sb.preds.is_empty() {
+                    let value = init(s, var);
+                    self.cache(block, var, value);
+                    break value;
+                }
+
+                let key = (block.0, var);
+                if let Some(slot) = self.visiting.get(&key).copied() {
+                    let phi = slot.unwrap_or_else(|| s.m.detached_phi(self.ty));
+                    self.visiting.insert(key, Some(phi));
+                    break phi;
+                }
+                self.visiting.insert(key, None);
+                let preds = self.preds_of(block, var);
+                let next = preds[0];
+                let values = Vec::with_capacity(preds.len());
+                joins.push(ReadJoin { block, preds, values, chain_start });
+                // Each operand owns the chain suffix it traverses.
+                chain_start = chain.len();
+                block = next;
+                continue 'read;
+            };
+
+            loop {
+                for traversed in chain.drain(chain_start..) {
+                    self.cache(traversed, var, value);
+                }
+                let Some(join) = joins.last_mut() else {
+                    return value;
+                };
+                join.values.push(value);
+                if let Some(&next) = join.preds.get(join.values.len()) {
+                    block = next;
+                    continue 'read;
+                }
+
+                let join = joins.pop().unwrap();
+                let marker = self.visiting.remove(&(join.block.0, var)).flatten();
+                // Identical operands need no phi unless a loop has already used it.
+                value = if marker.is_none() && join.values.iter().all(|&v| v == join.values[0]) {
+                    join.values[0]
+                } else {
+                    let phi = marker.unwrap_or_else(|| s.m.detached_phi(self.ty));
+                    for (&v, &p) in join.values.iter().zip(&join.preds) {
+                        s.m.add_incoming(phi, v, p);
+                    }
+                    s.m.place_phi(join.block, phi);
+                    phi
+                };
+                self.cache(join.block, var, value);
+                chain_start = join.chain_start;
             }
         }
-        if !chain.is_empty() {
-            let v = self.read(s, b, var, init);
-            for c in chain {
-                self.cache(c, var, v);
-            }
-            return v;
-        }
-        let v = if !self.at(b).sealed {
-            let ty = self.ty;
-            let phi = s.m.phi_at(b, ty);
-            self.at(b).incomplete.push((var, phi));
-            phi
-        } else {
-            let preds = self.preds_of(b, var);
-            match preds.len() {
-                0 => init(s, var),
-                1 => self.read(s, preds[0], var, init),
-                _ => {
-                    // the operands first, without a phi: most joins a read walks through
-                    // (guarded accesses make thousands) see one value from every edge
-                    // (Braun et al.'s trivial phi) and need none. A read that comes back
-                    // here around a loop gets a phi, which then stays.
-                    let key = (b.0, var);
-                    if let Some(slot) = self.visiting.get(&key).copied() {
-                        let phi = slot.unwrap_or_else(|| s.m.detached_phi(self.ty));
-                        self.visiting.insert(key, Some(phi));
-                        return phi;
-                    }
-                    self.visiting.insert(key, None);
-                    let vals: Vec<Value> = preds.iter().map(|&p| self.read(s, p, var, init)).collect();
-                    let marker = self.visiting.remove(&key).flatten();
-                    if marker.is_none() && vals.iter().all(|&v| v == vals[0]) {
-                        vals[0]
-                    } else {
-                        let phi = marker.unwrap_or_else(|| s.m.detached_phi(self.ty));
-                        for (&v, &p) in vals.iter().zip(&preds) {
-                            s.m.add_incoming(phi, v, p);
-                        }
-                        s.m.place_phi(b, phi);
-                        phi
-                    }
-                }
-            }
-        };
-        self.cache(b, var, v);
-        v
     }
 
     fn add_operands(&mut self, s: &mut Shader, phi: Value, preds: &[Block], var: u32, init: &mut dyn FnMut(&mut Shader, u32) -> Value) {
@@ -241,5 +257,42 @@ impl Ssa {
             self.add_operands(s, phi, &preds, var, init);
         }
         self.at(b).sealed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::dxil::container::Stage;
+
+    #[test]
+    fn deep_joins_read_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut shader = Shader::new(Stage::Compute, (6, 6));
+                let mut ssa = Ssa::new(shader.m.i32());
+                let mut init = |shader: &mut Shader, _| shader.m.i32c(42);
+                let mut previous = shader.m.new_block();
+                ssa.seal(&mut shader, previous, &mut init);
+                for _ in 0..8192 {
+                    let branches = [shader.m.new_block(), shader.m.new_block()];
+                    let join = shader.m.new_block();
+                    for branch in branches {
+                        ssa.add_pred(&mut shader, branch, previous, &mut init);
+                        ssa.seal(&mut shader, branch, &mut init);
+                        ssa.add_pred(&mut shader, join, branch, &mut init);
+                    }
+                    ssa.seal(&mut shader, join, &mut init);
+                    previous = join;
+                }
+
+                let value = ssa.read(&mut shader, previous, 0, &mut init);
+                assert_eq!(value, shader.m.i32c(42));
+                assert!(shader.m.block_insts(previous).is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
