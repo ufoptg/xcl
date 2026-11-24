@@ -117,8 +117,16 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
+xcl shaders D:\data\shaders.rpf --explain --sample 20          # compile-cost report per program
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
+
+- `--explain` reports, per console program (picked with `--hash H[,H]` or a seeded `--sample N
+  --seed S`), the guest program's instruction classes and control flow and the structure of the
+  direct translator's DXIL (blocks, phis, values, calls). Counts are *portable*: equal on any
+  machine with the same commit and options (the `portable digest` line). Times and memory are
+  *local*. Programs are named by hash only, so a report holds no game data. XCL caps its own
+  commit at `--mem-gb` (default 8) during the run.
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the

@@ -41,6 +41,10 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+      --explain [--hash H[,H] | --sample N --seed S] [--windows W] [--split 0|1] [--heap]
+          [--timeout S] [--mem-gb N]: compile-cost report per console program: the guest
+          program and the direct translator's DXIL; this process is capped at N GB of commit
+          (default 8).
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
