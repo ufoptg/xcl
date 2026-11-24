@@ -1,5 +1,6 @@
 //! Cheap cleanup of the entry function before it is written: unreachable
-//! blocks emptied, trivial phis replaced by their single value, common
+//! blocks emptied, trivial phis (and groups of phis that only pass one value
+//! around) replaced by their single value, common
 //! subexpressions merged (pure instructions along the dominator tree, wave
 //! intrinsics within a block), dead instructions removed.
 //!
@@ -344,10 +345,139 @@ impl Module {
         idom
     }
 
+    /// The phis of the blocks in `order` that are not replaced yet.
+    fn live_phis(&self, order: &[u32], repl: &[Option<Value>]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if !matches!(self.insts[i as usize].op, Op::Phi(_)) {
+                    break;
+                }
+                if repl[i as usize].is_none() {
+                    out.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// Strongly connected components of the phis in `set` (instruction ids) over their
+    /// operands in `set`, by Tarjan's algorithm (iterative): a component comes after the
+    /// components it names.
+    fn phi_sccs(&self, set: &[u32], repl: &mut [Option<Value>]) -> Vec<Vec<u32>> {
+        let at: HashMap<u32, usize> = set.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let succ: Vec<Vec<usize>> = set
+            .iter()
+            .map(|&i| {
+                let mut s = Vec::new();
+                self.insts[i as usize].op.for_each_operand(|v| {
+                    if let Value::Inst(j) = resolve(repl, v) {
+                        s.extend(at.get(&j));
+                    }
+                });
+                s
+            })
+            .collect();
+        let n = set.len();
+        let (mut index, mut low, mut on) = (vec![usize::MAX; n], vec![0; n], vec![false; n]);
+        let (mut next, mut stack, mut out) = (0, Vec::new(), Vec::new());
+        for root in 0..n {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            index[root] = next;
+            low[root] = next;
+            next += 1;
+            stack.push(root);
+            on[root] = true;
+            // (node, next operand edge to follow)
+            let mut path = vec![(root, 0)];
+            while let Some(&(v, e)) = path.last() {
+                if let Some(&w) = succ[v].get(e) {
+                    path.last_mut().unwrap().1 += 1;
+                    if index[w] == usize::MAX {
+                        index[w] = next;
+                        low[w] = next;
+                        next += 1;
+                        stack.push(w);
+                        on[w] = true;
+                        path.push((w, 0));
+                    } else if on[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                    continue;
+                }
+                path.pop();
+                if let Some(&(u, _)) = path.last() {
+                    low[u] = low[u].min(low[v]);
+                }
+                if low[v] == index[v] {
+                    let mut c = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        c.push(set[w]);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Redundant phi groups (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau: "Simple and
+    /// Efficient Construction of Static Single Assignment Form", CC 2013, removal of
+    /// redundant phi SCCs): a strongly connected set of phis whose operands outside the set
+    /// are all one value is that value (e.g. a loop's phis for a register its body only sets
+    /// to the value it had before the loop). A set with several outside values is a real
+    /// merge; the phis in it that name only its members can still form such a group among
+    /// themselves. Operands are read through `repl`, replaced phis go into it. Returns
+    /// whether any phi went.
+    fn redundant_phi_sccs(&self, set: &[u32], repl: &mut [Option<Value>]) -> bool {
+        let mut changed = false;
+        for scc in self.phi_sccs(set, repl) {
+            let members: std::collections::HashSet<u32> = scc.iter().copied().collect();
+            let mut outer: Option<Value> = None;
+            let mut several = false;
+            let mut inner = Vec::new();
+            for &p in &scc {
+                let mut only_members = true;
+                self.insts[p as usize].op.for_each_operand(|v| {
+                    let v = resolve(repl, v);
+                    if matches!(v, Value::Inst(j) if members.contains(&j)) {
+                        return;
+                    }
+                    only_members = false;
+                    match outer {
+                        None => outer = Some(v),
+                        Some(o) => several |= o != v,
+                    }
+                });
+                if only_members {
+                    inner.push(p);
+                }
+            }
+            match outer {
+                Some(v) if !several => {
+                    for &p in &scc {
+                        repl[p as usize] = Some(v);
+                    }
+                    changed = true;
+                }
+                Some(_) if !inner.is_empty() => changed |= self.redundant_phi_sccs(&inner, repl),
+                _ => {}
+            }
+        }
+        changed
+    }
+
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,scc,cse,dce` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -411,6 +541,11 @@ impl Module {
             if !changed {
                 break;
             }
+        }
+        // groups of phis that only pass one value around (none of them trivial alone)
+        if !skip("scc") {
+            let phis = self.live_phis(&order, &repl);
+            self.redundant_phi_sccs(&phis, &mut repl);
         }
 
         // CSE along the dominator tree (preorder walk with a scoped table)
@@ -520,6 +655,18 @@ impl Module {
                 self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
             }
         }
+        // and the groups CSE made (definitions it merged into one value)
+        if !skip("scc") {
+            let phis = self.live_phis(&order, &repl);
+            if self.redundant_phi_sccs(&phis, &mut repl) {
+                for &b in &order {
+                    for k in 0..self.blocks[b as usize].len() {
+                        let i = self.blocks[b as usize][k] as usize;
+                        self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
+                    }
+                }
+            }
+        }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
         let (i64t, f64t) = self.existing_i64_f64();
@@ -570,4 +717,184 @@ fn resolve(repl: &mut [Option<Value>], v: Value) -> Value {
         }
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{BinOp, Module, Op, Pred, Value};
+
+    /// An entry function with `x` loaded from a groupshared word (`p`) and `c = x != 0`.
+    fn start() -> (Module, Value, Value, Value) {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let i32 = m.i32();
+        let arr = m.array(4, i32);
+        let g = m.global("g", arr, 3, None, false, 4);
+        let zero = m.i32c(0);
+        let p = m.gep(g, &[zero, zero]);
+        let x = m.load(p, 4);
+        let c = m.cmp(Pred::Ne, x, zero);
+        (m, p, x, c)
+    }
+
+    fn phis(m: &Module) -> usize {
+        m.blocks.iter().flatten().filter(|&&i| matches!(m.insts[i as usize].op, Op::Phi(_))).count()
+    }
+
+    /// The values the stores write, in block order.
+    fn stored(m: &Module) -> Vec<Value> {
+        m.blocks
+            .iter()
+            .flatten()
+            .filter_map(|&i| match m.insts[i as usize].op {
+                Op::Store(_, v, _) => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `h: a = phi [x, entry] [b, j]; j: b = phi [a, h] [x, then]`: a loop whose body
+    /// sets the register back to the value it had before the loop. Neither phi is trivial
+    /// alone; together they are `x`.
+    #[test]
+    fn redundant_phi_cycle_becomes_its_value() {
+        let (mut m, p, x, c) = start();
+        let entry = m.current_block();
+        let (h, then, j, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.br(h);
+        m.set_block(h);
+        let i32 = m.i32();
+        let a = m.phi(i32);
+        m.cond_br(c, then, j);
+        m.set_block(then);
+        m.br(j);
+        m.set_block(j);
+        let b = m.phi(i32);
+        m.cond_br(c, h, exit);
+        m.set_block(exit);
+        m.store(p, b, 4);
+        m.ret();
+        m.add_incoming(a, x, entry);
+        m.add_incoming(a, b, j);
+        m.add_incoming(b, a, h);
+        m.add_incoming(b, x, then);
+        m.optimize();
+        assert_eq!(phis(&m), 0);
+        assert_eq!(stored(&m), vec![x]);
+        m.to_bitcode("dxil-ms-dx", "");
+    }
+
+    /// The same loop with the body writing a new value (`x + 1`): a real merge, kept.
+    #[test]
+    fn phi_cycle_with_two_values_stays() {
+        let (mut m, p, x, c) = start();
+        let entry = m.current_block();
+        let (h, then, j, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.br(h);
+        m.set_block(h);
+        let i32 = m.i32();
+        let a = m.phi(i32);
+        m.cond_br(c, then, j);
+        m.set_block(then);
+        let one = m.i32c(1);
+        let y = m.bin(BinOp::Add, a, one);
+        m.br(j);
+        m.set_block(j);
+        let b = m.phi(i32);
+        m.cond_br(c, h, exit);
+        m.set_block(exit);
+        m.store(p, b, 4);
+        m.ret();
+        m.add_incoming(a, x, entry);
+        m.add_incoming(a, b, j);
+        m.add_incoming(b, a, h);
+        m.add_incoming(b, y, then);
+        m.optimize();
+        assert_eq!(phis(&m), 2);
+        assert_eq!(stored(&m), vec![b]);
+        m.to_bitcode("dxil-ms-dx", "");
+    }
+
+    /// Nested loops: the outer phi `a` merges `x` and `y = r + 1` (a real merge), the inner
+    /// loop's phis `q` and `r` only pass `a` around. They become `a`; `a` stays, now
+    /// naming itself and `y = a + 1`.
+    #[test]
+    fn redundant_inner_group_of_a_real_merge_goes() {
+        let (mut m, p, x, c) = start();
+        let entry = m.current_block();
+        let [h1, h2, a2, j2, k, l1, l2, exit] = [(); 8].map(|_| m.new_block());
+        let i32 = m.i32();
+        m.br(h1);
+        m.set_block(h1);
+        let a = m.phi(i32);
+        m.br(h2);
+        m.set_block(h2);
+        let q = m.phi(i32);
+        m.cond_br(c, a2, j2);
+        m.set_block(a2);
+        m.br(j2);
+        m.set_block(j2);
+        let r = m.phi(i32);
+        m.cond_br(c, h2, k);
+        m.set_block(k);
+        m.cond_br(c, l1, l2);
+        m.set_block(l1);
+        m.br(h1);
+        m.set_block(l2);
+        let one = m.i32c(1);
+        let y = m.bin(BinOp::Add, r, one);
+        m.cond_br(c, h1, exit);
+        m.set_block(exit);
+        m.store(p, r, 4);
+        m.ret();
+        m.add_incoming(a, x, entry);
+        m.add_incoming(a, r, l1);
+        m.add_incoming(a, y, l2);
+        m.add_incoming(q, a, h1);
+        m.add_incoming(q, r, j2);
+        m.add_incoming(r, q, h2);
+        m.add_incoming(r, a, a2);
+        m.optimize();
+        assert_eq!(phis(&m), 1);
+        assert_eq!(stored(&m), vec![a]);
+        let Value::Inst(ai) = a else { unreachable!() };
+        let Op::Phi(inc) = &m.insts[ai as usize].op else { panic!("a is not a phi") };
+        assert_eq!(inc.iter().map(|p| p.0).collect::<Vec<_>>(), vec![x, a, y]);
+        let Value::Inst(yi) = y else { unreachable!() };
+        assert_eq!(m.insts[yi as usize].op, Op::Bin(BinOp::Add, a, one, 0));
+        m.to_bitcode("dxil-ms-dx", "");
+    }
+
+    /// Two copies of `x + 1` (before the loop and in its body) are one value only after
+    /// CSE; the loop's phis then pass that one value around and go too.
+    #[test]
+    fn phi_cycle_made_redundant_by_cse_goes() {
+        let (mut m, p, x, c) = start();
+        let entry = m.current_block();
+        let one = m.i32c(1);
+        let e1 = m.bin(BinOp::Add, x, one);
+        let (h, then, j, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.br(h);
+        m.set_block(h);
+        let i32 = m.i32();
+        let a = m.phi(i32);
+        m.cond_br(c, then, j);
+        m.set_block(then);
+        let e2 = m.bin(BinOp::Add, x, one);
+        m.br(j);
+        m.set_block(j);
+        let b = m.phi(i32);
+        m.cond_br(c, h, exit);
+        m.set_block(exit);
+        m.store(p, b, 4);
+        m.ret();
+        m.add_incoming(a, e1, entry);
+        m.add_incoming(a, b, j);
+        m.add_incoming(b, a, h);
+        m.add_incoming(b, e2, then);
+        m.optimize();
+        assert_eq!(phis(&m), 0);
+        assert_eq!(stored(&m), vec![e1]);
+        m.to_bitcode("dxil-ms-dx", "");
+    }
 }
