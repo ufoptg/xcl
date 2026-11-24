@@ -1645,8 +1645,11 @@ impl Decoder {
         if cfg.stream_channels.is_empty() || cfg.stream_channels.len() > MAX_STREAMS {
             return Err(format!("invalid stream count {}", cfg.stream_channels.len()));
         }
+        if let Some((i, &channels)) = cfg.stream_channels.iter().enumerate().find(|(_, &c)| c == 0 || c as usize > MAX_CHANNELS_PER_STREAM) {
+            return Err(format!("invalid stream {i} channel count {channels}"));
+        }
         let sum: usize = cfg.stream_channels.iter().map(|&c| c as usize).sum();
-        if sum == 0 || sum != cfg.channels as usize {
+        if sum != cfg.channels as usize {
             return Err(format!("channel sum {sum} != {}", cfg.channels));
         }
         // Ensure static tables are initialized once.
@@ -2199,6 +2202,19 @@ pub(crate) mod tests {
 
         assert!(StreamConfig::from_xma2_wfx(0, 48_000, &extra).is_err());
         assert!(StreamConfig::from_xma2_wfx(17, 48_000, &extra).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_streams_outside_the_one_or_two_channel_xma_limit() {
+        let cfg = |channels, stream_channels| StreamConfig {
+            version: Version::Xma2,
+            sample_rate: 48_000,
+            channels,
+            stream_channels,
+        };
+        assert_eq!(Decoder::new(cfg(1, vec![0, 1])).err().as_deref(), Some("invalid stream 0 channel count 0"));
+        assert_eq!(Decoder::new(cfg(3, vec![3])).err().as_deref(), Some("invalid stream 0 channel count 3"));
+        assert!(Decoder::new(cfg(3, vec![2, 1])).is_ok());
     }
 
     #[test]
