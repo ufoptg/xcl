@@ -461,6 +461,8 @@ impl Shader {
         let (i64, f64) = self.m.existing_i64_f64();
         if i64.is_some_and(|t| self.m.insts_use_type(t)) {
             self.require(Feature::Int64Ops);
+        } else {
+            self.features.remove(&Feature::Int64Ops);
         }
         if f64.is_some_and(|t| self.m.insts_use_type(t)) {
             self.require(Feature::Doubles);

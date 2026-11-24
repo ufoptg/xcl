@@ -1112,3 +1112,51 @@ fn dx_op_attrs_match_dxc() {
     }
     assert!(n > 50, "only {n} declarations found");
 }
+
+#[test]
+fn float_constant_compares_fold_away() {
+    // a legacy multiply by a float literal (held in an i32 register, so it arrives as a
+    // bitcast) tests both factors against zero: the literal's test is decided at build time
+    let mut k = kernel();
+    let f32 = k.s.m.f32();
+    let zero = k.s.m.f32c(0);
+    let lit = k.s.m.i32c(1.5f32.to_bits());
+    let lit = k.s.m.bitcast(lit, f32);
+    let x = k.input_f(0);
+    let x_zero = k.s.m.cmp(Pred::FOEq, x, zero);
+    let lit_zero = k.s.m.cmp(Pred::FOEq, lit, zero);
+    let either = k.s.m.bin(BinOp::Or, x_zero, lit_zero);
+    let p = k.s.m.fbin(BinOp::Mul, x, lit, 0);
+    let r = k.s.m.select(either, zero, p);
+    k.out(0, r);
+    // ordered and unordered predicates on two constants, -0 against +0 among them
+    let neg_zero = k.s.m.f32c((-0.0f32).to_bits());
+    let two = k.s.m.f32c(2.0f32.to_bits());
+    let preds = [(Pred::FOEq, neg_zero, zero, true), (Pred::FOLt, lit, two, true), (Pred::FUGt, lit, two, false), (Pred::FONe, two, two, false), (Pred::FOrd, lit, two, true)];
+    for (i, &(p, a, b, _)) in preds.iter().enumerate() {
+        let c = k.s.m.cmp(p, a, b);
+        k.out(1 + i as u32, c);
+    }
+    // a denormal literal is not compared at build time: a driver may flush it to zero
+    let den = k.s.m.i32c(1);
+    let den = k.s.m.bitcast(den, f32);
+    let den_zero = k.s.m.cmp(Pred::FOEq, den, zero);
+    k.out(6, den_zero);
+    let c = k.finish([32, 1, 1]);
+    let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
+    let body = &dis[dis.find("define void @main").expect("entry")..];
+    let body = &body[..body.find("\n}").expect("end of the entry")];
+    assert_eq!(body.matches("fcmp").count(), 2, "only the x == 0 and the denormal compares stay:\n{body}");
+    let xs: Vec<u32> = FVALS.iter().map(|f| f.to_bits()).collect();
+    let Some(r) = gpu(&c, &mem_of(&[xs]), &[], &[]) else { return };
+    for l in 0..32 {
+        let x = FVALS[l];
+        let want = if x == 0.0 { 0.0f32 } else { x * 1.5 };
+        let got = f32::from_bits(outv(&r, 0)[l]);
+        assert!(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()), "lane {l}: legacy 1.5 * {x} = {got}");
+        for (i, &(.., want)) in preds.iter().enumerate() {
+            assert_eq!(outv(&r, 1 + i)[l], want as u32, "lane {l}: predicate {i}");
+        }
+        assert!(outv(&r, 6)[l] <= 1, "lane {l}");
+    }
+}
