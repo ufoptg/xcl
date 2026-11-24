@@ -1819,6 +1819,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    super::sparse::note_queue_wait(q_raw, fence.clone(), w.value);
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
