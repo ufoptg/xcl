@@ -12,6 +12,7 @@ use crate::util::glob_match;
 
 pub mod acphal;
 pub mod bcpack;
+pub mod bink;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;

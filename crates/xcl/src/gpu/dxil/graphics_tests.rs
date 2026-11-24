@@ -1097,8 +1097,11 @@ fn groupshared_bytes_follow_the_16bit_layout() {
     let mut s = Shader::new(Stage::Mesh, (6, 6));
     let (i16, f16) = (s.m.int(16), s.m.f16());
     let (a, b) = (s.m.array(6, i16), s.m.array(3, f16));
-    s.m.global("g", a, 3, None, false, 2);
-    s.m.global("h", b, 3, None, false, 2);
+    let (g, h) = (s.m.global("g", a, 3, None, false, 2), s.m.global("h", b, 3, None, false, 2));
+    let unused = s.m.array(100, i16);
+    s.m.global("unused", unused, 3, None, false, 2);
+    s.m.load(g, 2);
+    s.m.load(h, 2);
     assert_eq!(s.m.global_bytes_layout(3, true), 18);
     assert_eq!(s.m.global_bytes(3), 36);
 }
