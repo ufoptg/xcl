@@ -3276,6 +3276,14 @@ const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
     if views.is_null() || n == 0 {
+        if views.is_null() && n != 0 {
+            with_bindings(this, |b| {
+                for slot in start..start + n {
+                    b.vertex_buffers.remove(&slot);
+                    b.vertex_titles.remove(&slot);
+                }
+            });
+        }
         return f(this, start, n, views);
     }
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
@@ -3310,8 +3318,14 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
     let titles: Vec<(u64, u32, u32)> = (0..n as usize).map(|k| { let t = views.add(k).read_unaligned(); (t.BufferLocation, t.SizeInBytes, t.StrideInBytes) }).collect();
     with_bindings(this, |b| {
         for (k, view) in kept.into_iter().enumerate() {
-            b.vertex_buffers.insert(start + k as u32, view);
-            b.vertex_titles.insert(start + k as u32, titles[k]);
+            let slot = start + k as u32;
+            if view.BufferLocation == 0 || view.SizeInBytes == 0 {
+                b.vertex_buffers.remove(&slot);
+                b.vertex_titles.remove(&slot);
+            } else {
+                b.vertex_buffers.insert(slot, view);
+                b.vertex_titles.insert(slot, titles[k]);
+            }
         }
     });
     f(this, start, n, v.as_ptr())
@@ -4675,6 +4689,110 @@ mod tests {
         );
 
         on_release(list_ptr as usize);
+    }
+
+    #[test]
+    fn null_vertex_buffer_unbinds_slots_and_does_not_restore_them() {
+        #[derive(Debug, PartialEq, Eq, Clone)]
+        struct VbCall {
+            start: u32,
+            n: u32,
+            views: Vec<(u64, u32, u32)>,
+            is_null: bool,
+        }
+
+        #[repr(C)]
+        struct FakeVbList {
+            vt: *const usize,
+            calls: Mutex<Vec<VbCall>>,
+        }
+
+        unsafe extern "system" fn fake_ia_set_vertex_buffers(
+            this: *mut c_void,
+            start: u32,
+            n: u32,
+            views: *const D3D12_VERTEX_BUFFER_VIEW,
+        ) {
+            let (is_null, views_vec) = if views.is_null() || n == 0 {
+                (views.is_null(), Vec::new())
+            } else {
+                (
+                    false,
+                    (0..n as usize)
+                        .map(|k| {
+                            let v = views.add(k).read_unaligned();
+                            (v.BufferLocation, v.SizeInBytes, v.StrideInBytes)
+                        })
+                        .collect(),
+                )
+            };
+            (*(this as *const FakeVbList)).calls.lock().unwrap().push(VbCall {
+                start,
+                n,
+                views: views_vec,
+                is_null,
+            });
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_IA_SET_VERTEX_BUFFERS] = fake_ia_set_vertex_buffers as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let fake = Box::new(FakeVbList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            calls: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakeVbList as *mut c_void;
+
+        unsafe {
+            on_create(list_ptr, 0x111, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            let initial_views = [
+                D3D12_VERTEX_BUFFER_VIEW { BufferLocation: 0x1000, SizeInBytes: 64, StrideInBytes: 16 },
+                D3D12_VERTEX_BUFFER_VIEW { BufferLocation: 0x2000, SizeInBytes: 128, StrideInBytes: 32 },
+            ];
+            // Bind slots 0 and 1
+            ia_set_vertex_buffers_x(list_ptr, 0, 2, initial_views.as_ptr());
+            with_bindings(list_ptr, |b| {
+                assert_eq!(b.vertex_buffers.len(), 2);
+                assert!(b.vertex_buffers.contains_key(&0));
+                assert!(b.vertex_buffers.contains_key(&1));
+                assert!(b.vertex_titles.contains_key(&0));
+                assert!(b.vertex_titles.contains_key(&1));
+            });
+
+            // Unbind slot 0 by passing views == NULL with n == 1
+            ia_set_vertex_buffers_x(list_ptr, 0, 1, std::ptr::null());
+            with_bindings(list_ptr, |b| {
+                assert_eq!(b.vertex_buffers.len(), 1);
+                assert!(!b.vertex_buffers.contains_key(&0));
+                assert!(b.vertex_buffers.contains_key(&1));
+                assert!(!b.vertex_titles.contains_key(&0));
+                assert!(b.vertex_titles.contains_key(&1));
+            });
+
+            // Restoring bindings must only re-issue slot 1, not slot 0
+            fake.calls.lock().unwrap().clear();
+            let b = LISTS.lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
+            restore_bindings(list_ptr, &b, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            let calls = fake.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].start, 1);
+            assert_eq!(calls[0].n, 1);
+            assert_eq!(calls[0].views[0].1, 128);
+
+            // Unbind remaining slot 1 via a null view in an array
+            let null_view = [D3D12_VERTEX_BUFFER_VIEW { BufferLocation: 0, SizeInBytes: 0, StrideInBytes: 0 }];
+            ia_set_vertex_buffers_x(list_ptr, 1, 1, null_view.as_ptr());
+            with_bindings(list_ptr, |b| {
+                assert!(b.vertex_buffers.is_empty());
+                assert!(b.vertex_titles.is_empty());
+            });
+
+            on_release(list_ptr as usize);
+        }
     }
 
     #[test]
