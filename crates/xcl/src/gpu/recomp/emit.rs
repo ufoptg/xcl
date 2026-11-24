@@ -64,6 +64,12 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// seed pc → the `WaveActive*` intrinsic suffix ("Min"/"Max"/"BitOr") for a recognised
+    /// whole-wave reduction (`recognize_whole_wave_reductions`)
+    pub reductions: BTreeMap<u64, &'static str>,
+    /// pcs of the reduction's DPP / permlane / readlane steps, suppressed in favour of the
+    /// wave intrinsic (their `WaveReadLaneAt` reads unlaunched lanes as 0, not the identity)
+    pub skip: BTreeSet<u64>,
 }
 
 /// Instructions without an effect in this execution model.
@@ -490,6 +496,8 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            reductions: BTreeMap::new(),
+            skip: BTreeSet::new(),
         }
     }
 
@@ -3589,6 +3597,13 @@ impl Em {
         // the value straight into the write (a named temporary is one more local per
         // instruction – tens of thousands on big programs at -O0)
         self.vwrite(d, &dst, &format!("({res})"));
+        // recognised whole-wave reduction: reduce the seed over the launched lanes with the
+        // wave intrinsic (the DPP / permlane / readlane steps are skipped; they read lanes the
+        // rasterizer did not launch as 0 instead of the identity, which breaks `min`).
+        if let (Some(op), Dst::V(n)) = (self.reductions.get(&d.pc).copied(), &dst) {
+            let v = self.vreg(*n);
+            self.line(&format!("{v} = WaveActive{op}({v});"));
+        }
         Ok(())
     }
 

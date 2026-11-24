@@ -2219,6 +2219,72 @@ fn gpu_wave64_ps_whole_wave_reductions() {
     }
 }
 
+/// The whole-wave reduction the wave64 PS reduction tests use: the identity for the lanes
+/// outside the mask, then DPP8 xor 1/2/4, DPP16 row_mirror, `v_permlanex16`, and the two
+/// `v_readlane` steps that join the 32-lane halves and read the total.
+fn whole_wave_reduce(op: &str, identity: u64, out: u64) -> Vec<u8> {
+    let mut c = vec![
+        ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
+        ins("S_AND_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 18), ("SSRC1", 30)], None),
+        ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None),
+    ];
+    let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+    for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]] {
+        let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
+        f.extend(names.iter().copied().zip(sel));
+        c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
+    }
+    c.extend([
+        ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", 128)], None),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+    ]);
+    c.concat()
+}
+
+/// A wave64 PS that runs the `min` reduction over the odd pixels of a PARTIAL wave: the
+/// rasterizer leaves most lanes of the wave unlaunched, and the reduction's DPP / permlane /
+/// readlane steps read those lanes as 0 instead of the min identity (-1), so the min comes
+/// back 0 instead of the true minimum. Drawn as a small triangle (three quads) that leaves
+/// lanes 12..31 and the whole upper half unlaunched.
+#[test]
+fn gpu_wave64_ps_partial_wave_min() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = program_of(&[
+        // v12 = pixel number y·16 + x, v13 = v12 + 1, s[18:19] = the odd pixels.
+        ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+        ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+        ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None),
+        ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 129), ("VSRC1", 12)], None),
+        ins("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 14)], None),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 18), ("SSRC0", 106)], None),
+        whole_wave_reduce("V_MIN_U32", 193, 40),
+        // v20 = the min as float, v23 = 1.0f (a covered-pixel marker).
+        ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 20), ("SRC0", 40)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", 242)], None),
+        ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 20), ("VSRC1", 20), ("VSRC2", 20), ("VSRC3", 23), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    // A small triangle: pixels (0,0),(1,0),(2,0),(0,1),(1,1),(0,2) – three quads. The odd
+    // pixels are (1,0) and (1,1) with v13 = 2 and 18, so the true minimum is 2.
+    let px = draw_console(None, Some(&code), &[[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]);
+    let covered: Vec<(usize, &[f32; 4])> = px.iter().enumerate().filter(|(_, p)| p[3] == 1.0).collect();
+    println!("gpu_wave64_ps_partial_wave_min: {} covered pixels", covered.len());
+    for (i, p) in &covered {
+        println!("  pixel {i}: min={} (want 2.0)", p[0]);
+    }
+    assert!(!covered.is_empty(), "the small triangle should cover pixels");
+    for (i, p) in covered {
+        assert_eq!(p[0], 2.0, "pixel {i}: min over the odd pixels of a partial wave");
+    }
+}
+
 /// SGPR spill slots in lanes 0..47 of a VGPR (`spill_slots`) in a wave64 PS: slots ≥ 32 do
 /// not exist in a 32-lane wave, and a slot in a lane that was not launched is lost in a
 /// partial wave (a primitive's edge). Drawn over the whole target and as a 6-pixel triangle.

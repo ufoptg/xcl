@@ -940,6 +940,9 @@ fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u6
     let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
     for (k, d) in block.iter().enumerate() {
         let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
+        if em.skip.contains(&d.pc) {
+            continue;
+        }
         flow = em.inst(d, next);
         if !matches!(flow, emit::Flow::Next) {
             break;
@@ -1153,6 +1156,9 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
         for (k, d) in block.iter().enumerate() {
             let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
+            if em.skip.contains(&d.pc) {
+                continue;
+            }
             flow = em.inst(d, next);
             if !matches!(flow, emit::Flow::Next) {
                 break;
@@ -1377,6 +1383,155 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// The `WaveActive*` suffix for a reduction op, or None if the instruction is not one.
+fn reduction_op(name: &str) -> Option<&'static str> {
+    match name {
+        "V_MIN_U32" => Some("Min"),
+        "V_MAX_U32" => Some("Max"),
+        "V_OR_B32" => Some("BitOr"),
+        _ => None,
+    }
+}
+
+/// Recognise the whole-wave reduction idiom a `v_min_u32` / `v_max_u32` / `v_or_b32` reduction
+/// lowers to — seed `v_cndmask_b32` (identity for the lanes outside the mask), three DPP8 xor
+/// steps, a DPP16 row_mirror, `v_permlanex16`, a `v_readlane` of lane 32 and a final
+/// `v_readlane` of lane 0. Returns `(seed pc → WaveActive suffix, pcs to suppress)`. Those
+/// steps read lanes the rasterizer did not launch as 0 instead of the identity, so a `min`
+/// (identity -1) would come back 0 in a partial wave; emitting `WaveActive*` over the seed's
+/// launched lanes is exact.
+fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static str>, BTreeSet<u64>) {
+    let mut reductions = BTreeMap::new();
+    let mut skip = BTreeSet::new();
+    let n = insts.len();
+    'outer: for i in 0..n {
+        let seed = &insts[i];
+        if seed.inst.name != "V_CNDMASK_B32" {
+            continue;
+        }
+        let (_sr, sw) = rdna2::vgpr_uses(seed);
+        if sw.len() != 1 {
+            continue;
+        }
+        let s = sw[0];
+        if i + 9 >= n {
+            continue;
+        }
+        let mut op: Option<&'static str> = None;
+        // 3 × DPP8 op, each an xor step (1, 2, 4)
+        const XOR: [[u64; 8]; 3] = [[1, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]];
+        for k in 1..=3 {
+            let d = &insts[i + k];
+            let o = reduction_op(d.inst.name);
+            if o.is_none() || d.variant != rdna2::Variant::Dpp8 {
+                continue 'outer;
+            }
+            if let Some(prev) = op {
+                if prev != o.unwrap() {
+                    continue 'outer;
+                }
+            }
+            op = o;
+            let Some(e) = emit::ext_encoding(d) else { continue 'outer };
+            for (idx, want) in XOR[k - 1].iter().enumerate() {
+                if rdna2::field_value(e, &d.words, &format!("LANE_SEL_{idx}")) != Some(*want) {
+                    continue 'outer;
+                }
+            }
+            let (r, w) = rdna2::vgpr_uses(d);
+            if w != vec![s] || !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // DPP16 op
+        {
+            let d = &insts[i + 4];
+            let o = reduction_op(d.inst.name);
+            if o.is_none() || o.unwrap() != op.unwrap() || d.variant != rdna2::Variant::Dpp16 {
+                continue 'outer;
+            }
+            if emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, "DPP_CTRL")) != Some(0x140) {
+                continue 'outer;
+            }
+            let (r, w) = rdna2::vgpr_uses(d);
+            if w != vec![s] || !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // v_permlanex16
+        {
+            let d = &insts[i + 5];
+            if d.inst.name != "V_PERMLANEX16_B32" {
+                continue 'outer;
+            }
+            let (r, _w) = rdna2::vgpr_uses(d);
+            if !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // op: s = op(s, permlane result)
+        {
+            let d = &insts[i + 6];
+            let o = reduction_op(d.inst.name);
+            if o.is_none() || o.unwrap() != op.unwrap() {
+                continue 'outer;
+            }
+            let (r, w) = rdna2::vgpr_uses(d);
+            if w != vec![s] || !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // v_readlane lane 32 (its VDST is not a tracked VGPR write, so only check the read)
+        {
+            let d = &insts[i + 7];
+            if d.inst.name != "V_READLANE_B32" {
+                continue 'outer;
+            }
+            if rdna2::field_value(d.enc, &d.words, "SRC1").map(|v| v & 63) != Some(32) {
+                continue 'outer;
+            }
+            let (r, _w) = rdna2::vgpr_uses(d);
+            if !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // op: s = op(s, lane32)
+        {
+            let d = &insts[i + 8];
+            let o = reduction_op(d.inst.name);
+            if o.is_none() || o.unwrap() != op.unwrap() {
+                continue 'outer;
+            }
+            let (r, w) = rdna2::vgpr_uses(d);
+            if w != vec![s] || !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        // final v_readlane lane 0 (kept: reads the already-reduced seed)
+        {
+            let d = &insts[i + 9];
+            if d.inst.name != "V_READLANE_B32" {
+                continue 'outer;
+            }
+            if rdna2::field_value(d.enc, &d.words, "SRC1").map(|v| v & 63) != Some(0) {
+                continue 'outer;
+            }
+            let (r, _w) = rdna2::vgpr_uses(d);
+            if !r.contains(&s) {
+                continue 'outer;
+            }
+        }
+        reductions.insert(seed.pc, op.unwrap());
+        // Suppress only the within-half reduction (3 × DPP8 + DPP16 + v_permlanex16 + op);
+        // the `v_readlane` lane 32 + op + `v_readlane` lane 0 that combine the two 32-lane
+        // halves of a wave64 are kept (they use the upper-lane / exchange handling).
+        for k in 1..=6 {
+            skip.insert(insts[i + k].pc);
+        }
+    }
+    (reductions, skip)
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1423,6 +1578,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    let (reductions, skip) = recognize_whole_wave_reductions(&insts);
+    em.reductions = reductions;
+    em.skip = skip;
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
@@ -1457,6 +1615,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         em.indent = 1;
         for (i, d) in insts.iter().enumerate() {
             let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
+            if em.skip.contains(&d.pc) {
+                continue;
+            }
             if let emit::Flow::End = em.inst(d, next) {
                 break;
             }
