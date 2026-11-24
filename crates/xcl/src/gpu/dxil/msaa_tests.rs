@@ -42,7 +42,7 @@ fn ms_rgba() -> TestTexture {
             }
         }
     }
-    TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data, uav: false }
+    TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data, uav: false, mips: 1 }
 }
 
 /// 4×4×3 R32_UINT array, 2 samples: 1000z + 100s + x + 4y.
@@ -57,7 +57,7 @@ fn ms_array_u32() -> TestTexture {
             }
         }
     }
-    TestTexture { dim: TexDim::D2MsArray(2), format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 3, texel_bytes: 4, data, uav: false }
+    TestTexture { dim: TexDim::D2MsArray(2), format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 3, texel_bytes: 4, data, uav: false, mips: 1 }
 }
 
 /// The ops: heap `Texture2DMS<float4>` / `Texture2DMSArray<uint>` loads per sample,

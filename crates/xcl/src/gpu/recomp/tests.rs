@@ -2346,7 +2346,7 @@ fn gpu_cube_array_slices() {
             }
         }
     }
-    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false }];
+    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false, mips: 1 }];
     let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -2418,10 +2418,10 @@ fn gpu_images_sample_load_store_atomic() {
         }
     }
     let tex = vec![
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true, mips: 1 },
     ];
     let samp = vec![
         TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
@@ -2444,6 +2444,104 @@ fn gpu_images_sample_load_store_atomic() {
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
+}
+
+/// `image_gather4_l` / `_l_o` read the 2x2 footprint of the mip the LOD names (rounded, clamped to
+/// the view's mips), not mip 0: every mip and texel holds its own value, the samples sit at the
+/// clamp edges and the offsets are negative / far out (clamped). Both the HLSL and the direct
+/// DXIL backend run it, whatever `XCL_DIRECT_DXIL` says.
+#[test]
+fn gpu_gather4_explicit_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // T# 2D in s[16:23] (SRSRC 4), T# 2D array in s[24:31] (SRSRC 6), S# linear clamp in s[32:35] (SSAMP 8)
+    code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_L_O", &[("VDATA", 30), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 40), ("VADDR", 8), ("SRSRC", 6), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 5)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    // 8 x 8, 4 mips; the red channel of texel (x, y) of mip m of layer a = 5000 a + 1000 m + 10 y + x
+    let data = |layers: u32| {
+        let mut d = Vec::new();
+        for a in 0..layers {
+            for m in 0..4u32 {
+                let size = 8 >> m;
+                for y in 0..size {
+                    for x in 0..size {
+                        for v in [(5000 * a + 1000 * m + 10 * y + x) as f32, 0.0, 0.0, 1.0] {
+                            d.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        d
+    };
+    let tex = [
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 8, height: 8, depth: 1, texel_bytes: 16, data: data(1), uav: false, mips: 4 },
+        TestTexture { dim: TexDim::D2Array, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 8, height: 8, depth: 2, texel_bytes: 16, data: data(2), uav: false, mips: 4 },
+    ];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 77, 13));
+    st.sgpr[32..36].copy_from_slice(&[0, 0, 0, 0]);
+    // none of these lands on a texel boundary (coord * size - 0.5 is never an integer at 8, 4 or 2 texels)
+    let us = [0.0f32, 0.3, 0.7, 1.0, 0.99, 0.02, 0.45, 0.83];
+    let vs = [1.0f32, 0.0, 0.7, 0.3, 0.02, 0.99, 0.45, 0.83];
+    let offs = [(-1i32, 0i32), (0, -1), (1, 1), (-2, -3), (3, 2), (0, 0), (-1, -1), (7, -5)];
+    // rounds to 0, 1, 2; 1, 1, 2; past the last mip (3); negative (0)
+    let lods = [0.0f32, 1.0, 2.0, 0.6, 1.4, 2.4, 5.0, -1.0];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (c, lod) = (l % 8, lods[l / 8 % 8]);
+        r[0] = f(us[c]);
+        r[1] = f(vs[c]);
+        r[2] = f(lod);
+        r[4] = ((offs[c].0 & 0x3F) | ((offs[c].1 & 0x3F) << 8)) as u32;
+        r[5] = f(us[c]);
+        r[6] = f(vs[c]);
+        r[7] = f(lod);
+        r[8] = f(us[c]);
+        r[9] = f(vs[c]);
+        r[10] = f((l % 2) as f32);
+        r[11] = f(lod);
+    }
+    // Gather order (x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y) of the footprint at the rounded LOD, clamped
+    let gather = |layer: u32, u: f32, v: f32, lod: f32, off: (i32, i32)| -> [f32; 4] {
+        let m = (lod.round_ties_even().max(0.0) as u32).min(3);
+        let size = 8 >> m;
+        let (px, py) = ((u * size as f32 - 0.5).floor() as i32 + off.0, (v * size as f32 - 0.5).floor() as i32 + off.1);
+        let at = |x: i32, y: i32| (5000 * layer + 1000 * m) as f32 + (10 * y.clamp(0, size - 1) + x.clamp(0, size - 1)) as f32;
+        [at(px, py + 1), at(px + 1, py + 1), at(px + 1, py), at(px, py)]
+    };
+    let run_hlsl = || {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        runner::run_with_statics(&dxil, &st, &[], &tex, &samp, &t.static_samplers).unwrap()
+    };
+    let run_direct = || {
+        let k = runner::direct_kernel_full(&code, true).unwrap();
+        runner::run_with_statics(&k.dxil, &st, &[], &tex, &samp, &k.static_samplers).unwrap()
+    };
+    for (backend, r) in [("hlsl", run_hlsl()), ("direct dxil", run_direct())] {
+        for l in 0..64 {
+            let (c, lod) = (l % 8, lods[l / 8 % 8]);
+            let v = &r.vgpr[l];
+            let got = |b: usize| [0, 1, 2, 3].map(|i| f32::from_bits(v[b + i]));
+            let what = format!("{backend} lane {l} (uv {}, {}; lod {lod}; offset {:?})", us[c], vs[c], offs[c]);
+            assert_eq!(got(20), gather(0, us[c], vs[c], lod, (0, 0)), "gather4_l {what}");
+            assert_eq!(got(30), gather(0, us[c], vs[c], lod, offs[c]), "gather4_l_o {what}");
+            assert_eq!(got(40), gather((l % 2) as u32, us[c], vs[c], lod, (0, 0)), "gather4_l 2D array {what}");
+        }
+    }
 }
 
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
@@ -2495,7 +2593,7 @@ fn gpu_static_samplers_from_constants_in_code() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
     for l in 0..64 {
         let v = &r.vgpr[l];
@@ -2536,7 +2634,7 @@ fn gpu_images_a16_d16() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -3123,7 +3221,7 @@ fn gpu_image_sample_offset() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {

@@ -2293,7 +2293,14 @@ impl Em {
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
-            if let Some(o) = &offset {
+            // gather4_l / _l_o: the 2x2 footprint of the (rounded, clamped) mip `lod` names. HLSL's
+            // Gather has no level, so each texel is read at its centre with SampleLevel (compare
+            // forms keep the mip-0 GatherCmp: SampleCmpLevel needs SM 6.7)
+            let glod = base.starts_with("gather4") && lod.is_some() && !has_c;
+            if glod && !matches!(dim, 1 | 5) {
+                return Err("gather4 explicit LOD (not 2D)");
+            }
+            if let (Some(o), false) = (&offset, glod) {
                 let level = match (&lod, has_lz || base.starts_with("gather4"), ps && grads.is_none() && !has_c) {
                     (_, true, _) => "0u".to_string(),
                     (Some(l), _, _) => format!("(uint)max(round({l}), 0.0f)"),
@@ -2309,6 +2316,23 @@ impl Em {
                 }
                 let ch = ["Red", "Green", "Blue", "Alpha"][comps[0] as usize];
                 match &cmp {
+                    _ if glod => {
+                        let l = lod.clone().unwrap_or_default();
+                        let dims = |lv: &str| if dim == 5 { format!("{t}_T.GetDimensions({lv}, {t}_gw, {t}_gh, {t}_gz, {t}_gn);") } else { format!("{t}_T.GetDimensions({lv}, {t}_gw, {t}_gh, {t}_gn);") };
+                        self.line(&format!("uint {t}_gw = 1u, {t}_gh = 1u, {t}_gz = 1u, {t}_gn = 1u; {}", dims("0u")));
+                        self.line(&format!("uint {t}_gl = min((uint)max(round({l}), 0.0f), max({t}_gn, 1u) - 1u); {}", dims(&format!("{t}_gl"))));
+                        self.line(&format!("float2 {t}_gs = float2((float){t}_gw, (float){t}_gh);"));
+                        let o = offset.as_ref().map(|o| format!(" + float2((float)(((int)({o} << 26)) >> 26), (float)(((int)({o} << 18)) >> 26))")).unwrap_or_default();
+                        self.line(&format!("float2 {t}_gp = floor(float2({}, {}) * {t}_gs - 0.5f){o};", coords_unmoved[0], coords_unmoved[1]));
+                        let c = ["r", "g", "b", "a"][comps[0] as usize];
+                        // D3D Gather order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)
+                        let tap = |dx: &str, dy: &str| {
+                            let uv = format!("({t}_gp + float2({dx}, {dy})) / {t}_gs");
+                            let at = if dim == 5 { format!("float3({uv}, round({}))", coords_unmoved[2]) } else { uv };
+                            format!("{t}_T.SampleLevel({t}_S, {at}, {t}_gl).{c}")
+                        };
+                        format!("float4({}, {}, {}, {})", tap("0.5f", "1.5f"), tap("1.5f", "1.5f"), tap("1.5f", "0.5f"), tap("0.5f", "0.5f"))
+                    }
                     Some(z) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
                     None => format!("{t}_T.Gather{ch}({t}_S, {coord})"),
                 }

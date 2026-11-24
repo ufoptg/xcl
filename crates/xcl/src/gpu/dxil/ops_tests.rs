@@ -533,6 +533,7 @@ fn typed_buffer_ops_run() {
         texel_bytes: 4,
         data: data.iter().flat_map(|x| x.to_le_bytes()).collect(),
         uav,
+        mips: 1,
     };
     let Some(r) = gpu(&c, &[], &[buf(&srv_data, false), buf(&uav_data, true)], &[]) else { return };
     let want: Vec<u32> = (0..32).map(|l| srv_data[31 - l]).collect();
@@ -573,6 +574,7 @@ fn ftex(dim: runner::TexDim, w: u32, h: u32, d: u32) -> runner::TestTexture {
         texel_bytes: 4,
         data: tex_data(w, h, d).iter().flat_map(|f| f.to_le_bytes()).collect(),
         uav: false,
+        mips: 1,
     }
 }
 
@@ -1015,7 +1017,7 @@ fn uav_array_3d_stores_loads_and_texture_atomics_run() {
     k.out(1, before);
     k.out(2, cx);
     let c = k.finish([32, 1, 1]);
-    let mk = |dim, format, data: Vec<u8>| runner::TestTexture { dim, format, width: 4, height: 4, depth: 2, texel_bytes: 4, data, uav: true };
+    let mk = |dim, format, data: Vec<u8>| runner::TestTexture { dim, format, width: 4, height: 4, depth: 2, texel_bytes: 4, data, uav: true, mips: 1 };
     let init: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
     let tex = [
         ftex(runner::TexDim::D2, 1, 1, 1),

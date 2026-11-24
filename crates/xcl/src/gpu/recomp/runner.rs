@@ -162,9 +162,11 @@ pub struct TestTexture {
     /// array slices (cube: 6 per cube) or depth
     pub depth: u32,
     pub texel_bytes: u32,
-    /// tightly packed texels, slice after slice
+    /// tightly packed texels, slice after slice (each slice: its `mips` levels one after the other)
     pub data: Vec<u8>,
     pub uav: bool,
+    /// mip levels (1: none below the top); more only for SRV-only 2D and array textures
+    pub mips: u32,
 }
 
 /// A sampler for kernel tests at sampler heap index j.
@@ -267,13 +269,13 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             Width: t.width as u64,
             Height: t.height,
             DepthOrArraySize: depth_or_array as u16,
-            MipLevels: 1,
+            MipLevels: t.mips as u16,
             Format: t.format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
             ..Default::default()
         } };
-        let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
+        let subs = if t.dim == TexDim::D3 { 1 } else { t.depth * t.mips };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
         dev.GetCopyableFootprints(&rd, 0, subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
@@ -292,17 +294,20 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             mk += 1;
         }
         for (t, fps) in textures.iter().zip(&plans).filter(|(t, _)| t.dim.samples().is_none()) {
-            let row = (t.width * t.texel_bytes) as usize;
-            let slices = t.depth as usize;
+            let mut at = 0usize;
+            let slices = if t.dim == TexDim::D3 { t.depth } else { t.depth * t.mips } as usize;
             for z in 0..slices {
+                let (w, h) = if t.dim == TexDim::D3 { (t.width, t.height) } else { ((t.width >> (z as u32 % t.mips)).max(1), (t.height >> (z as u32 % t.mips)).max(1)) };
+                let row = (w * t.texel_bytes) as usize;
                 let fp = if t.dim == TexDim::D3 { &fps[0] } else { &fps[z] };
-                let slice_pitch = fp.Footprint.RowPitch as usize * t.height as usize;
+                let slice_pitch = fp.Footprint.RowPitch as usize * h as usize;
                 let zoff = if t.dim == TexDim::D3 { z * slice_pitch } else { 0 };
-                for y in 0..t.height as usize {
-                    let src = &t.data[(z * t.height as usize + y) * row..][..row];
+                for y in 0..h as usize {
+                    let src = &t.data[at + y * row..][..row];
                     let dst = (p as *mut u8).add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize);
                     std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row);
                 }
+                at += row * h as usize;
             }
         }
         up.Unmap(0, None);
@@ -349,12 +354,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         match t.dim {
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: t.mips, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             }
             TexDim::D2Array => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
+                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: t.mips, ArraySize: t.depth, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
                 uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }

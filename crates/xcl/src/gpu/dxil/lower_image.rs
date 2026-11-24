@@ -504,7 +504,14 @@ impl Lw {
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
             let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
-            if let Some(o) = ovgpr {
+            // gather4_l / _l_o: the 2x2 footprint of the (rounded, clamped) mip `lod` names, read as
+            // four SampleLevel taps at the texel centres (as the HLSL path; compare forms keep the
+            // mip-0 gather)
+            let glod = gather && lod.is_some() && !has_c;
+            if glod && !matches!(dim, 1 | 5) {
+                return err(d, "gather4 explicit LOD (not 2D)");
+            }
+            if let (Some(o), false) = (ovgpr, glod) {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
                     (_, true) => self.c(0),
@@ -568,6 +575,48 @@ impl Lw {
                     return err(d, "gather4 dmask");
                 }
                 match cmp {
+                    _ if glod => {
+                        let z = self.c(0);
+                        let levels = self.s.get_dimensions(tex.handle, Some(z));
+                        let n = self.s.m.extract(levels, 3);
+                        let l = lod.unwrap_or(z);
+                        let r = self.un(op::ROUND_NE, l);
+                        let zf = self.fc(0.0);
+                        let r = self.fmax(r, zf);
+                        let lv = self.ftoui(r);
+                        let one = self.c(1);
+                        let last = self.umax(n, one);
+                        let last = self.sub(last, one);
+                        let lv = self.umin(lv, last);
+                        let dims = self.s.get_dimensions(tex.handle, Some(lv));
+                        let (w, hh) = (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1));
+                        let (wf, hf) = (self.uitof(w), self.uitof(hh));
+                        let half = self.fc(0.5);
+                        let mut p = [wf, hf];
+                        for k in 0..2 {
+                            let x = self.fmul(coords[k], p[k]);
+                            let x = self.fsub(x, half);
+                            p[k] = self.un(op::ROUND_NI, x);
+                            if let Some(o) = ovgpr {
+                                let x = self.shlc(o, [26, 18][k]);
+                                let x = self.ashrc(x, 26);
+                                let xf = self.sitof(x);
+                                p[k] = self.fadd(p[k], xf);
+                            }
+                        }
+                        let layer = (dim == 5).then(|| self.un(op::ROUND_NE, coords[2]));
+                        let fl = self.uitof(lv);
+                        let mut out = [fl; 4];
+                        // D3D Gather order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)
+                        for (k, (dx, dy)) in [(0.5f32, 1.5f32), (1.5, 1.5), (1.5, 0.5), (0.5, 0.5)].into_iter().enumerate() {
+                            let (cx, cy) = (self.fc(dx), self.fc(dy));
+                            let (u, v) = (self.fadd(p[0], cx), self.fadd(p[1], cy));
+                            let mut c = vec![self.fdiv(u, wf), self.fdiv(v, hf)];
+                            c.extend(layer);
+                            out[k] = self.s.sample_level(tex, smp, &c, &[], fl)[comps[0] as usize];
+                        }
+                        out
+                    }
                     Some(z) => self.s.gather_cmp(tex, smp, &coord, &[], comps[0] as u32, z),
                     None => self.s.gather(tex, smp, &coord, &[], comps[0] as u32),
                 }
