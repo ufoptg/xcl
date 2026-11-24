@@ -235,12 +235,18 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_with(
+            let id =             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
                 Backend::current(),
                 crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
-            )
+            );
+            // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
+            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            }
         })
     }
 
@@ -605,6 +611,20 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
+    if super::lower_dxil::enabled() {
+        match super::lower_dxil::compute_with(code, &cs, o) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("CS per-lane");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers });
+            }
+            Err(e) => {
+                let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
+                crate::xlog_info!("[SHADER] per-lane fallback reason=\"{reason}\" detail=\"{}\" – per-instruction form", e.lines().next().unwrap_or(""));
+            }
+        }
+    }
     let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
@@ -791,6 +811,20 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
+            Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("GS");
+                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+            }
+            Err(e) => direct_fallback("GS", &e),
+        }
+    }
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
     finish_two_pass(translation, record, ps)
 }
