@@ -5,7 +5,7 @@
 
 use super::lower::{err, Dst, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, RmwOp, Value};
-use super::ops::AtomicOp;
+use super::ops::{AtomicOp, WaveBit};
 use super::lower_window::Ea;
 use super::shader::RawUav;
 use crate::gpu::rdna2::{self, Decoded};
@@ -1445,7 +1445,16 @@ impl Lw {
         let z = self.c(0);
         Ok(match op {
             "add" | "add_u32" => direct(self, AtomicOp::Add, RmwOp::Add, v),
-            "sub" | "sub_u32" => {
+            // LDS: NVIDIA's Blackwell drivers refuse a pipeline (E_OUTOFMEMORY) with a group-shared
+            // subtract or add of a negated value. The wave op is always 0; it hides the negation
+            // from the driver
+            "sub_u32" => {
+                let n = self.sub(z, v);
+                let o = self.s.wave_active_bit(z, WaveBit::Or);
+                let n = self.or(n, o);
+                direct(self, AtomicOp::Add, RmwOp::Add, n)
+            }
+            "sub" => {
                 let n = self.sub(z, v);
                 direct(self, AtomicOp::Add, RmwOp::Add, n)
             }

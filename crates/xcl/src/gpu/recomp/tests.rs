@@ -4661,6 +4661,51 @@ fn gpu_global_atomics_and_sub_dword_access() {
     }
 }
 
+/// LDS subtracts of a register: one slot per lane without and with the old value returned, and
+/// one slot all lanes subtract from. NVIDIA's Blackwell drivers refuse a pipeline (E_OUTOFMEMORY)
+/// with a group-shared subtract or an add of a negated value.
+#[test]
+fn gpu_ds_sub_u32_of_a_register() {
+    if !gpu_ready() {
+        return;
+    }
+    let ds = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_DS", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let barrier = encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap();
+    let mut code = Vec::new();
+    for (a, d) in [(1, 2), (3, 4), (5, 6)] {
+        code.extend(ds("DS_WRITE_B32", &[("ADDR", a), ("DATA0", d)]));
+    }
+    code.extend(&barrier);
+    code.extend(ds("DS_SUB_U32", &[("ADDR", 1), ("DATA0", 7)]));
+    code.extend(ds("DS_SUB_RTN_U32", &[("VDST", 10), ("ADDR", 3), ("DATA0", 7)]));
+    code.extend(ds("DS_SUB_U32", &[("ADDR", 5), ("DATA0", 7)]));
+    code.extend(&barrier);
+    for (d, a) in [(11, 1), (12, 3), (13, 5)] {
+        code.extend(ds("DS_READ_B32", &[("VDST", d), ("ADDR", a)]));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[1] = 4 * l;
+        r[2] = 10 * l; // below the subtrahend of some lanes: wraps
+        r[3] = 512 + 4 * l;
+        r[4] = 5000 + l;
+        r[5] = 1024;
+        r[6] = 1_000_000;
+        r[7] = 3 * l + 100;
+    }
+    let total: u32 = (0..64).map(|l| 3 * l + 100).sum();
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let l = l as u32;
+        let x = 3 * l + 100;
+        assert_eq!(v[11], (10 * l).wrapping_sub(x), "lane {l}: ds_sub_u32");
+        assert_eq!((v[10], v[12]), (5000 + l, 5000 + l - x), "lane {l}: ds_sub_rtn_u32 (old, new)");
+        assert_eq!(v[13], 1_000_000 - total, "lane {l}: the shared slot");
+    }
+}
+
 /// The instructions added for code outside the retail pack: global inc / dec / csub /
 /// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
 /// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.

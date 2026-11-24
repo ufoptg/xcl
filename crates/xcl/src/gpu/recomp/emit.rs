@@ -4998,7 +4998,10 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
     };
     Some(match op {
         "add" | "add_u32" => direct("InterlockedAdd", v),
-        "sub" | "sub_u32" => direct("InterlockedAdd", &format!("(0u - {v})")),
+        "sub" => direct("InterlockedAdd", &format!("(0u - {v})")),
+        // LDS: NVIDIA's Blackwell drivers refuse a pipeline (E_OUTOFMEMORY) with a group-shared
+        // add of a negated value. The wave op is always 0; it hides the negation from the driver
+        "sub_u32" => direct("InterlockedAdd", &format!("((0u - {v}) | WaveActiveBitOr(0u))")),
         "and" | "and_b32" => direct("InterlockedAnd", v),
         "or" | "or_b32" => direct("InterlockedOr", v),
         "xor" | "xor_b32" => direct("InterlockedXor", v),

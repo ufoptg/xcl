@@ -16,7 +16,7 @@
 
 use super::container::Stage;
 use super::module::{fmf, BinOp, CastOp, Pred, RmwOp, Value};
-use super::ops::{barrier, BitCount, Binary, GroupShared};
+use super::ops::{barrier, BitCount, Binary, GroupShared, WaveBit};
 use super::shader::{RawUav, Shader};
 use super::validate;
 use crate::gpu::recomp::runner;
@@ -733,12 +733,14 @@ impl Emit<'_> {
                 let init = self.s.m.bin(BinOp::Xor, init, kc);
                 self.s.gs_store(g, idx, init);
                 self.s.barrier(barrier::GROUP_SYNC);
-                // `atomicrmw sub` as an add of the negation, the form DXC and the translator
-                // emit: NVIDIA Blackwell drivers refuse pipelines with a groupshared
-                // `atomicrmw sub` (CreateComputePipelineState E_OUTOFMEMORY).
+                // `atomicrmw sub` as the translator emits it: NVIDIA Blackwell drivers refuse pipelines
+                // (E_OUTOFMEMORY) with a groupshared `atomicrmw sub`, and newer ones also with an add
+                // of a negation they can see. The wave op is always 0 and hides it.
                 let (op, v) = if *op == RmwOp::Sub {
                     let zero = self.s.m.i32c(0);
-                    (RmwOp::Add, self.s.m.bin(BinOp::Sub, zero, v))
+                    let n = self.s.m.bin(BinOp::Sub, zero, v);
+                    let o = self.s.wave_active_bit(zero, WaveBit::Or);
+                    (RmwOp::Add, self.s.m.bin(BinOp::Or, n, o))
                 } else {
                     (*op, v)
                 };
