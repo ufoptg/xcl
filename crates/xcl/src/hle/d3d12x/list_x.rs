@@ -607,6 +607,7 @@ impl ListState {
             last.1 = last.1.max(end);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+            unsafe { super::sparse::ensure_lazy_mapped(va as usize, size as usize) };
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
