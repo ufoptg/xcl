@@ -1065,7 +1065,7 @@ impl Em {
             let k_u = simm() as u32;
             let sd = Self::field(d, "SDST");
             let cur = self.code32(sd, None, false).ok_or("register")?;
-            let dst = Dst::S(sd);
+            let dst = if sd == 125 { Dst::Null } else { Dst::S(sd) };
             match name {
                 "s_movk_i32" => self.write32(&dst, &hex(k_s)),
                 "s_cmovk_i32" => self.write32(&dst, &format!("select(scc != 0u, {}, {cur})", hex(k_s))),

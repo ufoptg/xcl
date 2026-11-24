@@ -7307,6 +7307,24 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_sopk_null_sdst_emits_valid_hlsl() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // set SCC = 1 first via s_cmp_eq_u32 0, 0
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+            // s_addk_i32 null, 1: reads 0, adds 1 -> no signed overflow (SCC = 0), discards destination
+            ("S_ADDK_I32", "ENC_SOPK", &[("SDST", 125), ("SIMM16", 1)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 253)], None), // capture SCC
+            ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 125), ("SIMM16", 42)], None),
+            ("S_CMOVK_I32", "ENC_SOPK", &[("SDST", 125), ("SIMM16", 9)], None),
+            ("S_MULK_I32", "ENC_SOPK", &[("SDST", 125), ("SIMM16", 7)], None),
+        ]);
+        let (r, lanes) = run_wave(&p, &KernelState::default(), wave64);
+        assert_eq!(r.sgpr[0], 0, "wave{lanes} s_addk_i32 null, 1 clears SCC");
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
