@@ -559,3 +559,34 @@ fn entry_exec(lw: &mut Lw, total: u32, tid: Value) -> (Value, Value) {
     };
     (lo, hi)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    #[test]
+    fn deep_branch_chain_compiles_on_bounded_stack() {
+        let mut code = Vec::new();
+        // Define v1 before a 4,000-diamond chain of conditional branches, then read v1 after.
+        code.extend(encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None).unwrap());
+        code.extend(encode("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None).unwrap());
+        let br = encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap();
+        let body = encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 130)], None).unwrap();
+        for _ in 0..4000 {
+            code.extend_from_slice(&br);
+            code.extend_from_slice(&body);
+        }
+        code.extend(encode("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 257), ("VSRC1", 2)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let handle = std::thread::Builder::new()
+            .name("dxil-deep-branch-test".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || translate_on_this_thread(&code, o, Entry::Kernel))
+            .expect("spawn bounded-stack thread");
+        let k = handle.join().expect("translator thread panicked").expect("translation failed");
+        assert!(!k.dxil.is_empty());
+    }
+}

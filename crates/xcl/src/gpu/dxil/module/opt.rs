@@ -84,15 +84,14 @@ impl Module {
         n.starts_with("dx.op.wave") || n.starts_with("dx.op.quad")
     }
 
-    fn is_const_global_ptr(&self, v: Value) -> bool {
-        match v {
-            Value::Global(g) => self.globals[g as usize].constant,
-            Value::Inst(i) => match &self.insts[i as usize].op {
-                Op::Gep(base, _) => self.is_const_global_ptr(*base),
-                _ => false,
-            },
-            _ => false,
+    fn is_const_global_ptr(&self, mut v: Value) -> bool {
+        while let Value::Inst(i) = v {
+            match &self.insts[i as usize].op {
+                Op::Gep(base, _) => v = *base,
+                _ => return false,
+            }
         }
+        matches!(v, Value::Global(g) if self.globals[g as usize].constant)
     }
 
     fn cse_kind(&self, op: &Op) -> Cse {
