@@ -129,9 +129,14 @@ impl<H: Clone> SmallPools<H> {
         Some((heap, offset))
     }
 
-    /// Register a newly created pool heap and acquire `(va, units)` (re-checking whether another
-    /// thread raced and already created the same slot while the heap was being made).
+    /// Register a newly created pool heap and acquire `(va, units)`.
+    /// Re-checks `try_acquire` first under the lock so two threads racing to create a new 16 MiB
+    /// pool do not push a redundant empty heap (the extra `heap` drops cleanly if another thread
+    /// already added room or created the same slot).
     fn add_pool_and_acquire(&mut self, heap: H, key: SlotKey, now: Instant) -> (H, u32) {
+        if let Some(got) = self.try_acquire(key, now) {
+            return got;
+        }
         let pool_idx = self.pools.len() as u32;
         self.pools.push(Pool { heap, next_unit: 0 });
         if let Some(got) = self.try_acquire(key, now) {
@@ -356,6 +361,13 @@ mod tests {
         p.release_key((0x30_0000, 4), at(5400), true);
         let (h_next, off_next) = alloc(&mut p, 0x30_4000, 4, 204, at(5400));
         assert_eq!((h_next, off_next), (0, 17));
+
+        // Concurrent CreateHeap race: if room already exists in pool 0, `add_pool_and_acquire`
+        // must reuse existing room instead of pushing a redundant empty 16 MiB pool.
+        let pools_before = p.pools.len();
+        let (h_raced, _) = p.add_pool_and_acquire(999, (0x40_0000, 1), at(5500));
+        assert_eq!(h_raced, 0);
+        assert_eq!(p.pools.len(), pools_before, "must not push redundant pool when room already exists");
     }
 
     #[test]
@@ -397,13 +409,14 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
-            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                return;
-            }
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
             let mut dev: Option<ID3D12Device> = None;
-            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            for (adapter, _) in crate::gpu::adapter::candidates(&factory, &sel) {
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() {
+                    break;
+                }
+            }
             let Some(dev) = dev else { return };
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let dev_key = dev.as_raw() as usize;
