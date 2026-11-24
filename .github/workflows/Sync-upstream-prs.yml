@@ -1,0 +1,85 @@
+name: Sync upstream PRs
+
+# Mirrors open PRs from ivall/xcl into ufoptg/xcl.
+# One-way: upstream -> this repo. Each upstream PR #N becomes branch
+# upstream-pr/N and a PR here titled "[upstream #N] ...".
+# Closed or merged upstream PRs get their mirror closed.
+# Save as .github/workflows/sync-upstream-prs.yml
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-prs
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: ivall/xcl
+  BASE: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # SYNC_TOKEN: classic PAT with "repo" + "workflow" scopes.
+          # GITHUB_TOKEN can't push commits that touch .github/workflows,
+          # and PRs it opens don't trigger other workflows.
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Sync PRs
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "xcl-pr-sync"
+          git config user.email "xcl-pr-sync@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/${UPSTREAM}.git" "+refs/pull/*/head:refs/upstream-pulls/*"
+
+          gh pr list -R "$UPSTREAM" --state open --limit 200 \
+            --json number,title,body,isDraft,url > /tmp/upstream.json
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --limit 500 \
+            --json number,headRefName > /tmp/mirrors.json
+
+          # 1. create or update mirrors
+          jq -c '.[]' /tmp/upstream.json | while read -r pr; do
+            n=$(jq -r .number <<<"$pr")
+            title=$(jq -r .title <<<"$pr")
+            url=$(jq -r .url <<<"$pr")
+            draft=$(jq -r .isDraft <<<"$pr")
+            branch="upstream-pr/$n"
+            sha=$(git rev-parse "refs/upstream-pulls/$n/head" 2>/dev/null || true)
+            if [ -z "$sha" ]; then echo "skip #$n: no head ref"; continue; fi
+
+            remote_sha=$(git ls-remote origin "refs/heads/$branch" | cut -f1 || true)
+            if [ "$remote_sha" != "$sha" ]; then
+              echo "push #$n -> $branch"
+              git push --force origin "$sha:refs/heads/$branch"
+            fi
+
+            if ! jq -e --arg b "$branch" 'any(.[]; .headRefName==$b)' /tmp/mirrors.json >/dev/null; then
+              jq -r .body <<<"$pr" > /tmp/body.md
+              printf '\n\n---\nMirror of %s (auto-synced, do not edit).\n' "$url" >> /tmp/body.md
+              args=(-R "$GITHUB_REPOSITORY" --base "$BASE" --head "$branch" --title "[upstream #$n] $title" --body-file /tmp/body.md)
+              if [ "$draft" = "true" ]; then args+=(--draft); fi
+              gh pr create "${args[@]}" || echo "create failed for #$n"
+            else
+              num=$(jq -r --arg b "$branch" '.[]|select(.headRefName==$b).number' /tmp/mirrors.json)
+              gh pr edit "$num" -R "$GITHUB_REPOSITORY" --title "[upstream #$n] $title" || true
+            fi
+          done
+
+          # 2. close mirrors whose upstream PR is no longer open
+          jq -r '.[]|select(.headRefName|startswith("upstream-pr/"))|"\(.number) \(.headRefName)"' /tmp/mirrors.json |
+          while read -r num branch; do
+            n=${branch#upstream-pr/}
+            if ! jq -e --argjson n "$n" 'any(.[]; .number==$n)' /tmp/upstream.json >/dev/null; then
+              echo "closing mirror #$num (upstream #$n no longer open)"
+              gh pr close "$num" -R "$GITHUB_REPOSITORY" --delete-branch \
+                --comment "Upstream PR ${UPSTREAM}#$n was closed or merged." || true
+            fi
+          done
