@@ -138,6 +138,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
   `XCL_PSO_TRACE=1` logs every driver compile.
+- `XCL_ACTIVITY=1` logs process commit and GPU memory each sampling interval. Compare existing
+  logs with `.\scripts\activity-memory.ps1 -Log main.log,pr.log -AtSeconds 60 -Json`. The script
+  selects the latest sample at or before that time, flags missing or stale samples and omits log paths.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
