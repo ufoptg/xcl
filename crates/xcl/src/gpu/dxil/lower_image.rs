@@ -854,16 +854,23 @@ impl Lw {
             let tmps = tmps.clone();
             self.guarded(is, &mut |lw| {
                 let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // The sample count comes first, in its own block: an out-of-range `ld2dms`
+                // index is undefined and faults on RDNA4, so lanes at or past the count load
+                // sample 0 (the result is still zeroed below). The loads then start a new
+                // block so no TextureLoad follows GetDimensions in one basic block (#1900:
+                // AMD's DXIL compiler, amdxc64.dll, dereferences null when dx.op.getDimensions
+                // precedes dx.op.textureLoad on a dynamically indexed heap Texture2DMS(Array)
+                // in the same block).
                 let dims = lw.s.get_dimensions(tex.handle, None);
                 let count = lw.s.m.extract(dims, 3);
-                for (si, &sv) in samples.iter().enumerate() {
-                    // load only a sample the resource has (sample 0 in place of one at or
-                    // past its count: an out-of-range `ld2dms` index is undefined and faults
-                    // on RDNA4); the result is still zeroed below
-                    let inside = lw.cmp(Pred::ULt, sv, count);
-                    let first = lw.c(0);
-                    let loaded = lw.sel(inside, sv, first);
-                    let r = lw.s.texture_load_sample(tex, loaded, &coords);
+                let loads_block = lw.block(Some(1));
+                lw.br(loads_block);
+                lw.s.m.set_block(loads_block);
+                let inside: Vec<Value> = samples.iter().map(|&sv| lw.cmp(Pred::ULt, sv, count)).collect();
+                let first = lw.c(0);
+                let clamped: Vec<Value> = samples.iter().zip(&inside).map(|(&sv, &ok)| lw.sel(ok, sv, first)).collect();
+                let loads: Vec<[Value; 4]> = clamped.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
+                for (si, (&inside, r)) in inside.iter().zip(loads).enumerate() {
                     for k in 0..4 {
                         let b = lw.bits(r[k]);
                         let zz = lw.c(0);

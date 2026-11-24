@@ -252,3 +252,53 @@ fn direct_msaa_store_is_rejected() {
     let e = runner::direct_kernel(&code, true).unwrap_err();
     assert!(e.contains("MSAA"), "{e}");
 }
+
+/// Regression guard for an AMD DXIL compiler (`amdxc64.dll`) null-pointer dereference
+/// (`0xc0000005`): within any basic block, `dx.op.getDimensions` on a dynamically indexed
+/// heap `Texture2DMS` / `Texture2DMSArray` must not precede `dx.op.textureLoad`.
+#[test]
+fn direct_msaa_loads_precede_get_dimensions() {
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 6), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_MSAA_LOAD", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x8), ("DIM", 6), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 18), ("VADDR", 5), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 6)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 22), ("VADDR", 30), ("SRSRC", 6), ("DMASK", 0x1), ("DIM", 7), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_MSAA_LOAD", &[("VDATA", 24), ("VADDR", 30), ("SRSRC", 6), ("DMASK", 0x1), ("DIM", 7), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 40), ("VADDR", 5), ("SRSRC", 6), ("DMASK", 0xF), ("DIM", 7)]));
+    code.extend(mimg("IMAGE_MSAA_LOAD", &[("VDATA", 44), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x2), ("DIM", 6), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let k = runner::direct_kernel_full(&code, true).expect("direct translation");
+    check(&k.dxil);
+    let dis = validate::disassemble(&k.dxil).expect("disassemble");
+    let mut in_fn = false;
+    let mut seen_get_dims = false;
+    let mut load_blocks = 0usize;
+    let mut saw_load_in_block = false;
+    for line in dis.lines() {
+        let t = line.trim();
+        if t.starts_with("define ") {
+            in_fn = true;
+            seen_get_dims = false;
+            saw_load_in_block = false;
+        } else if in_fn && t == "}" {
+            if saw_load_in_block {
+                load_blocks += 1;
+            }
+            in_fn = false;
+        } else if !in_fn {
+            continue;
+        } else if t.starts_with("; <label>:") {
+            if saw_load_in_block {
+                load_blocks += 1;
+            }
+            seen_get_dims = false;
+            saw_load_in_block = false;
+        } else if t.contains("call ") && t.contains("@dx.op.getDimensions(") {
+            seen_get_dims = true;
+        } else if t.contains("call ") && t.contains("@dx.op.textureLoad.") {
+            assert!(!seen_get_dims, "dx.op.getDimensions preceded dx.op.textureLoad in the same basic block:\n{dis}");
+            saw_load_in_block = true;
+        }
+    }
+    assert!(load_blocks >= 15, "expected MSAA textureLoad blocks across all format branches, saw {load_blocks}");
+}
