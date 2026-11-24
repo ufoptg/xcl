@@ -279,3 +279,194 @@ fn graphics_stages_with_a_branch_before_their_exports() {
     assert_eq!(draw(&dvs, &dps, 0), cleared, "branch not taken");
     assert_eq!(draw(&dvs, &dps, 1), kept, "branch taken");
 }
+
+/// Geometry mode (ES+GS, the compute pass of `recomp::Mode::Geometry`): an ES that writes
+/// its vertex to the LDS ring, the GS that reads its triangle's vertices, writes them to
+/// its output area and emits a strip; split and native forms validate (also the ES or GS
+/// alone, as the coverage sweep translates them).
+#[test]
+fn geometry_mode_validates() {
+    use crate::gpu::recomp::GsInterface;
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut es = Vec::new();
+    // v20 = lane * ES item (16 B), ring[v20] = v9 (a fetched input)
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)]));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 256 + 20)]));
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 132), ("VSRC1", 20)]));
+    es.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 20), ("DATA0", 9)]));
+    es.extend(e("S_BARRIER", "ENC_SOPP", &[]));
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let mut gs = Vec::new();
+    // v0 = vertex 0's dword offset: read it, write 3 output vertices at s2 + lane * 48
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)]));
+    gs.extend(e("DS_READ_B32", "ENC_DS", &[("ADDR", 30), ("VDST", 31)]));
+    gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 32), ("SRC0", 193), ("SRC1", 128)]));
+    gs.extend(e("V_MUL_U32_U24", "ENC_VOP2", &[("VDST", 32), ("SRC0", 176), ("VSRC1", 32)]));
+    gs.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 2), ("VSRC1", 32)]));
+    for k in 0..3u64 {
+        gs.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 32), ("DATA0", 31), ("OFFSET0", 16 * k)]));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)]));
+    }
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)]));
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0)],
+        es_outputs: vec![sig("SV_Position", 1, 0)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es.clone();
+    code.extend_from_slice(&gs);
+    let mut es_end = es;
+    es_end.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let cases = [
+        ("ES+GS", code, g.clone()),
+        ("ES alone", es_end, GsInterface { gs_start: None, ..g.clone() }),
+        ("GS alone", gs, GsInterface { gs_start: Some(0), ..g }),
+    ];
+    for (name, code, g) in cases {
+        for split in [true, false] {
+            let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+        }
+    }
+}
+
+/// Exhaustive bit-exact check of the IEEE-754 bit-manipulation formula used by
+/// `lower_mem::uf_small_bits` for all 10-bit (mb=5) and 11-bit (mb=6) float inputs.
+#[test]
+fn uf_small_ieee_bit_math_matches_exact_formula() {
+    for mb in [5u32, 6u32] {
+        let p = 1u32 << mb;
+        let mmask = p - 1;
+        let mshift = 23 - mb;
+        let den_scale = f32::from_bits(if mb == 6 { 0x3580_0000 } else { 0x3600_0000 });
+        for v in 0..(1u32 << (mb + 5)) {
+            let e = v >> mb;
+            let m = v & mmask;
+            // Reference formula (matching HLSL `uf_small`)
+            let fm = (m as f32) / (p as f32);
+            let ref_f = if e == 31 {
+                f32::from_bits(if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 })
+            } else if e == 0 {
+                fm * (-14.0f32).exp2()
+            } else {
+                ((e as f32) - 15.0).exp2() * (1.0 + fm)
+            };
+            // Exact IEEE bit math
+            let got_bits = if e == 31 {
+                if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 }
+            } else if e == 0 {
+                ((m as f32) * den_scale).to_bits()
+            } else {
+                ((e + 112) << 23) | (m << mshift)
+            };
+            assert_eq!(got_bits, ref_f.to_bits(), "mb={mb} v={v:#x} (e={e} m={m})");
+        }
+    }
+}
+
+/// Multi-window switch dispatch, vector rawBufferLoad/Store, hoisted FormatLoad
+/// descriptors, single/multi-component FormatLoad, and hoisted BVH loads all pass
+/// DXIL validation across 1..=4 memory windows and wave configurations.
+#[test]
+fn multi_window_mem_format_and_bvh_validate() {
+    let code = prog(&[
+        // Load descriptor s[12:15] once, then reuse across repeated BUFFER_LOAD_FORMAT_X
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 12), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        // Divergent EXEC so lane guards are active (non-constant `act`)
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        // Repeated single-component format loads sharing s[12:15] (exercises hoisted FmtComp1 + Load2)
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Sub-4 and full-4 component format loads + D16 + static MTBUF + small byte load
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 28), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Vector MUBUF & FLAT loads/stores
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("DATA", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 24), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+        // BVH node intersection (box32 / box16 / tri hoisted vector loads)
+        ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 3), ("DMASK", 0xF)], None),
+    ]);
+    for windows in [1u32, 2, 3, 4] {
+        for (wave64, split) in [(true, false), (false, false)] {
+            translate(&code, KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 })
+                .unwrap_or_else(|e| panic!("w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            if windows > 1 {
+                translate(&code, KernelOptions { wave64, split, mem_windows: windows | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+                    .unwrap_or_else(|e| panic!("heap w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            }
+        }
+    }
+}
+
+/// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
+/// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
+/// the same S#, and validates.
+#[test]
+fn ps_get_lod_with_a_static_sampler() {
+    use crate::gpu::recomp::{Mode, PsInterface};
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 1 << 20 | 1 << 22, 0];
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for (k, &w) in linear.iter().enumerate() {
+        list.push(if w == 0 { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 128)], None) } else { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 255)], Some(w)) });
+    }
+    // uv = (I, J) of the first barycentric pair (v0, v1); T# s[16:23], S# s[24:27]
+    list.push(("IMAGE_GET_LOD", "ENC_MIMG", vec![("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("IMAGE_SAMPLE", "ENC_MIMG", vec![("VDATA", 6), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    }
+}
+
+/// `image_store` with D16 on a SINT texture sign-extends each half: -1 stays -1 instead of
+/// becoming 65535 (clamped to 32767 by the R16 SINT store).
+#[test]
+fn gpu_direct_image_store_d16_sint_sign_extends() {
+    use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_SINT;
+    // T# s[16:23] (SRSRC 4): 2D 16_16_16_16_SINT (format 70); lane 0 stores texel (0, 0)
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)], None),
+    ]);
+    let k = runner::direct_kernel_full(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&k.dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave64");
+        return;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&[0, 70 << 20, 0, 9 << 28, 0, 0, 0, 0]);
+    let h = |v: i16| v as u16 as u32;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 0;
+        r[10] = h(-1) | h(-100) << 16;
+        r[11] = h(42) | h(-32768) << 16;
+    }
+    let tex = TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R16G16B16A16_SINT, width: 4, height: 4, depth: 1, texel_bytes: 8, data: vec![0; 128], uav: true };
+    let res = runner::run_with_statics(&k.dxil, &st, &[], &[tex], &[], &k.static_samplers).expect("GPU run");
+    let t: Vec<i16> = res.textures[0].chunks(2).map(|c| i16::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(&t[..4], &[-1, -100, 42, -32768], "texel (0, 0) after a D16 IMAGE_STORE on a SINT texture");
+    assert!(t[4..].iter().all(|&v| v == 0), "only texel (0, 0) is written");
+}
