@@ -1227,7 +1227,7 @@ impl Module {
             Op::Alloca(t, n, align) => {
                 // [instty, opty, size (absolute value id), align record (log2 + 1 | explicit type)]
                 let i32t = self.value_ty(*n);
-                let a = align.trailing_zeros() as u64 + 1;
+                let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
                 w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
             }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
@@ -1499,6 +1499,33 @@ impl Module {
     }
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
-        self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+        let (order, _) = self.block_layout();
+        let mut used = vec![false; self.globals.len()];
+        let mut mark = |v: Value| {
+            if let Value::Global(g) = v {
+                used[g as usize] = true;
+            }
+        };
+        for &b in &order {
+            for &i in &self.blocks[b] {
+                self.insts[i as usize].op.for_each_operand(&mut mark);
+            }
+        }
+        for c in &self.consts {
+            if let ConstDef::Aggregate(_, e) = c {
+                e.iter().copied().for_each(&mut mark);
+            }
+        }
+        for m in &self.md {
+            if let MdDef::Val(_, v) = m {
+                mark(*v);
+            }
+        }
+        self.globals
+            .iter()
+            .zip(used)
+            .filter(|(g, used)| *used && g.addrspace == addrspace)
+            .map(|(g, _)| self.alloc_size_layout(g.ty, native16))
+            .sum()
     }
 }

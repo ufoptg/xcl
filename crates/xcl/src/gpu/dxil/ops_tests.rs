@@ -71,6 +71,34 @@ fn check(c: &[u8]) {
     }
 }
 
+#[test]
+fn default_aligned_alloca_validates_without_inalloca() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let out = s.raw_uav(1, 0);
+    let i32 = s.m.i32();
+    let p = s.m.alloca(i32, 0);
+    let seven = s.m.i32c(7);
+    s.m.store(p, seven, 0);
+    let v = s.m.load(p, 0);
+    let zero = s.m.i32c(0);
+    s.raw_store(out, zero, &[v]);
+    let c = s.finish([1, 1, 1], Some(32));
+    check(&c);
+}
+
+#[test]
+fn heap_raw_buffer_sets_the_required_shader_flags() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let i32 = s.m.i32();
+    let sink = s.groupshared("sink", i32, 1);
+    let zero = s.m.i32c(0);
+    let heap = s.heap_raw_buffer(zero, false, false);
+    let v = s.raw_load(heap, zero, 1)[0];
+    s.gs_store(sink, zero, v);
+    let c = s.finish([1, 1, 1], Some(32));
+    check(&c);
+}
+
 /// Runs a validated kernel; `None` when there is no wave32 GPU.
 fn gpu(c: &[u8], mem: &[u32], tex: &[runner::TestTexture], smp: &[runner::TestSampler]) -> Option<runner::KernelResult> {
     match runner::wave32_supported() {

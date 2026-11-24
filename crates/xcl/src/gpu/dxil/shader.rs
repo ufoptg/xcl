@@ -287,6 +287,7 @@ impl Shader {
 
     /// A raw-buffer handle from the descriptor heap (`RWByteAddressBuffer` if `uav`).
     pub fn heap_raw_buffer(&mut self, index: Value, uav: bool, nonuniform: bool) -> RawUav {
+        self.require(Feature::RawAndStructuredBuffers);
         let h = self.handle_from_heap(index, false, nonuniform);
         let handle = self.annotate(h, kind::RAW_BUFFER | if uav { 0x1000 } else { 0 }, 0);
         RawUav { handle, binding: None }
