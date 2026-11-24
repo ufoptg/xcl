@@ -138,6 +138,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
   `XCL_PSO_TRACE=1` logs every driver compile.
+- `XCL_PSO_FRAME_WAIT_MS=<ms>` caps total time spent waiting on pending compute pipelines across a
+  single frame (off by default). The budget refills on each `PresentX`; pipelines skipped because
+  the frame budget ran out are not marked permanently late and get another chance on the next frame.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.

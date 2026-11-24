@@ -8,7 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
@@ -507,6 +507,49 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    /// A shared per-frame wait budget caps total wait across multiple slow pipelines in one frame
+    /// and refills when the next frame begins.
+    #[test]
+    fn shared_frame_budget_caps_multiple_slow_pipelines_and_refills_on_next_frame() {
+        let (s1, s2) = (0x7E57_B009usize, 0x7E57_B00Ausize);
+        let (go1, rx1) = mpsc::channel::<()>();
+        let (go2, rx2) = mpsc::channel::<()>();
+        submit(s1, true, Box::new(move || { let _ = rx1.recv(); 0x6161 }));
+        submit(s2, true, Box::new(move || { let _ = rx2.recv(); 0x6262 }));
+
+        // Seed a 40 ms shared frame budget.
+        let frame_rem = AtomicU64::new(40_000);
+        let bind_with_frame = |pso: usize| {
+            let rem = std::time::Duration::from_micros(frame_rem.load(Ordering::Relaxed));
+            let t0 = std::time::Instant::now();
+            let r = resolve_wait_for_ex(pso, Some(rem), false);
+            let spent = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let _ = frame_rem.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(spent)));
+            r
+        };
+
+        let t_all = std::time::Instant::now();
+        assert_eq!(bind_with_frame(s1), s1, "first pipeline exhausts the frame budget");
+        let t_second = std::time::Instant::now();
+        assert_eq!(bind_with_frame(s2), s2, "second pipeline skips immediately once frame budget is spent");
+        assert!(t_second.elapsed() < std::time::Duration::from_millis(25), "second bind waited {:?}", t_second.elapsed());
+        assert!(t_all.elapsed() < std::time::Duration::from_millis(400), "combined wait {:?}", t_all.elapsed());
+
+        // Refill budget on next frame and let s2 complete promptly.
+        frame_rem.store(2_000_000, Ordering::Relaxed);
+        let _ = go2.send(());
+        assert_eq!(bind_with_frame(s2), 0x6262, "second pipeline is waited for and resolved after budget refill");
+
+        let _ = go1.send(());
+        let start = std::time::Instant::now();
+        while is_pending(s1) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve(s1), 0x6161);
+        let _ = released(s1);
+        let _ = released(s2);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -532,17 +575,40 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    let frame_cap = frame_wait_budget().map(|_| frame_budget_remaining());
+    let per_pso = wait_budget();
+    let budget = match (per_pso, frame_cap) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let mark_late = match (per_pso, frame_cap) {
+        (Some(a), Some(b)) => a <= b,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let t0 = frame_cap.map(|_| std::time::Instant::now());
+    let r = resolve_wait_for_ex(pso, budget, mark_late);
+    if let Some(t0) = t0 {
+        consume_frame_budget(t0.elapsed());
+    }
+    r
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+    resolve_wait_for_ex(pso, budget, true)
+}
+
+fn resolve_wait_for_ex(pso: usize, budget: Option<std::time::Duration>, mark_late: bool) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        return resolve_within(&p, pso, budget, mark_late);
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
@@ -568,10 +634,52 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
+/// Shared per-frame wait budget across all `resolve_wait` binds (`XCL_PSO_FRAME_WAIT_MS`; unset
+/// or 0: off). Caps total time spent waiting on pending pipelines in a single frame so a burst of
+/// new pipelines during world load does not multiply per-pipeline waits into multi-second stalls.
+fn frame_wait_budget() -> Option<std::time::Duration> {
+    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("XCL_PSO_FRAME_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+fn frame_budget_us_cell() -> &'static AtomicU64 {
+    static REMAINING: OnceLock<AtomicU64> = OnceLock::new();
+    REMAINING.get_or_init(|| {
+        let initial = frame_wait_budget().map_or(0, |d| d.as_micros().min(u64::MAX as u128) as u64);
+        AtomicU64::new(initial)
+    })
+}
+
+fn frame_budget_remaining() -> std::time::Duration {
+    std::time::Duration::from_micros(frame_budget_us_cell().load(Ordering::Relaxed))
+}
+
+fn consume_frame_budget(elapsed: std::time::Duration) {
+    let spent = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    if spent == 0 {
+        return;
+    }
+    let cell = frame_budget_us_cell();
+    let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rem| Some(rem.saturating_sub(spent)));
+}
+
+/// Refill the shared per-frame PSO wait budget on `PresentX`.
+pub fn begin_frame() {
+    if let Some(b) = frame_wait_budget() {
+        frame_budget_us_cell().store(b.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+}
+
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
-/// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+/// pipeline not built by then gets the stand-in (its dispatches are skipped) until a worker has
+/// built it. When `mark_late` is true (per-PSO budget), later binds do not wait for it again.
+fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration, mark_late: bool) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
@@ -586,12 +694,17 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return pso;
     }
     p.want();
+    if budget.is_zero() {
+        return pso;
+    }
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
         return built(p);
     }
     drop(done);
-    p.late.store(true, Ordering::Release);
+    if mark_late {
+        p.late.store(true, Ordering::Release);
+    }
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n.is_power_of_two() {

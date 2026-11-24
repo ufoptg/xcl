@@ -63,6 +63,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::pso_async::begin_frame();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
