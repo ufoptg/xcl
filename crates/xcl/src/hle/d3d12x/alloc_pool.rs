@@ -28,11 +28,31 @@ struct Backing {
     users: HashSet<usize>,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
+    /// still-pending fences from queues released before GPU completion
+    retired: Vec<(ID3D12Fence, u64)>,
 }
 
 impl Backing {
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty()
+            && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+            && self.retired.iter().all(|(f, v)| f.GetCompletedValue() >= *v)
+    }
+
+    fn clear_marks(&mut self) {
+        self.marks.clear();
+        self.retired.clear();
+    }
+}
+
+unsafe fn take_completed(retired: &mut Vec<(ID3D12Fence, u64)>, out: &mut Vec<ID3D12Fence>) {
+    let mut i = 0;
+    while i < retired.len() {
+        if retired[i].0.GetCompletedValue() >= retired[i].1 {
+            out.push(retired.swap_remove(i).0);
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -82,6 +102,31 @@ pub(super) fn forget_list(list: usize) {
             b.users.remove(&list);
         }
     }
+}
+
+/// The command queue's final Release: drop its per-queue fence and completed marks;
+/// any still-pending mark moves to `retired` so a later queue at the same address cannot
+/// overwrite it before the GPU finishes.
+pub(super) fn forget_queue(queue: usize) {
+    let mut dropped = Vec::new();
+    {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        if let Some((f, _)) = s.fences.remove(&queue) {
+            dropped.push(f);
+        }
+        for b in s.backings.values_mut() {
+            if let Some((f, v)) = b.marks.remove(&queue) {
+                if unsafe { f.GetCompletedValue() } >= v {
+                    dropped.push(f);
+                } else {
+                    b.retired.push((f, v));
+                }
+            }
+            unsafe { take_completed(&mut b.retired, &mut dropped) };
+        }
+    }
+    drop(dropped);
 }
 
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
@@ -140,7 +185,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| super::real::create_pc_fence(&d)) else { return };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
@@ -151,11 +196,16 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         *v += 1;
         (f.clone(), *v)
     };
+    let mut done_retired = Vec::new();
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
-            s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
+            let backing = s.backings.entry(b).or_default();
+            backing.marks.insert(key, (fence.clone(), value));
+            take_completed(&mut backing.retired, &mut done_retired);
         }
     }
+    drop(g);
+    drop(done_retired);
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
@@ -207,7 +257,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
-            b.marks.clear();
+            b.clear_marks();
         }
         if c == a {
             return None;
@@ -226,7 +276,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
             }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
-                b.marks.clear();
+                b.clear_marks();
             }
             f
         }
@@ -442,6 +492,206 @@ mod tests {
             drop(alloc);
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
+        }
+    }
+
+    /// Queue release drops `State.fences` and completed marks immediately, moves still-pending
+    /// GPU marks to `retired` so queue-address reuse cannot overwrite them, and releases them
+    /// once the GPU completes.
+    #[test]
+    fn forget_queue_prunes_completed_and_preserves_pending_across_address_reuse() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            let n = f.refs.get() + 1;
+            f.refs.set(n);
+            n
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            let n = f.refs.get().checked_sub(1).expect("underflow");
+            f.refs.set(n);
+            n
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+
+        let mut f_done = Fence { vtable: vtable.as_ptr(), value: Cell::new(3), refs: Cell::new(1) };
+        let mut f_pending = Fence { vtable: vtable.as_ptr(), value: Cell::new(1), refs: Cell::new(1) };
+        let mut f_reused = Fence { vtable: vtable.as_ptr(), value: Cell::new(1), refs: Cell::new(1) };
+        let mut ids = Box::new([0u8; 4]);
+        let base = ids.as_mut_ptr() as usize;
+        let (alloc_done, alloc_busy, q_done, q_busy) = (base, base + 1, base + 2, base + 3);
+
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            let fd = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut f_done).cast()) };
+            s.backings.entry(alloc_done).or_default().marks.insert(q_done, (fd.clone(), 3));
+            s.fences.insert(q_done, (fd, 3));
+
+            let fp = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut f_pending).cast()) };
+            s.backings.entry(alloc_busy).or_default().marks.insert(q_busy, (fp.clone(), 5));
+            s.fences.insert(q_busy, (fp, 5));
+        }
+
+        // Completed queue: both State.fences and Backing.marks refs drop immediately.
+        forget_queue(q_done);
+        let done_cleaned = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.fences.contains_key(&q_done)
+                && s.backings[&alloc_done].marks.is_empty()
+                && s.backings[&alloc_done].retired.is_empty()
+                && unsafe { s.backings[&alloc_done].free() }
+        };
+
+        // Pending queue: State.fences drops, Backing keeps the pending fence in `retired`.
+        forget_queue(q_busy);
+        let pending_preserved = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.fences.contains_key(&q_busy)
+                && !s.backings[&alloc_busy].marks.contains_key(&q_busy)
+                && s.backings[&alloc_busy].retired.len() == 1
+                && !unsafe { s.backings[&alloc_busy].free() }
+        };
+        let pending_refs_while_busy = f_pending.refs.get();
+
+        // A later queue reusing `q_busy` finishes immediately, but `alloc_busy` stays busy
+        // until the retired pending fence also completes.
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let fr = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut f_reused).cast()) };
+            s.backings.get_mut(&alloc_busy).unwrap().marks.insert(q_busy, (fr.clone(), 1));
+            s.fences.insert(q_busy, (fr, 1));
+        }
+        let still_busy_after_reuse = !unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc_busy].free() };
+
+        f_pending.value.set(5);
+        let free_after_retired_completes = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc_busy].free() };
+        forget_queue(q_busy);
+
+        // Clean up synthetic state before asserting so stack fences are never left in global STATE.
+        unsafe {
+            forget(alloc_done);
+            forget(alloc_busy);
+        }
+
+        assert!(done_cleaned, "completed queue release drops fence and completed mark");
+        assert_eq!(f_done.refs.get(), 0, "completed fence refcount hits zero immediately");
+        assert!(pending_preserved, "pending mark moves to retired and keeps backing busy");
+        assert_eq!(pending_refs_while_busy, 1, "only the pending backing mark still holds the fence");
+        assert!(still_busy_after_reuse, "reusing queue address must not overwrite a retired pending fence");
+        assert!(free_after_retired_completes, "backing becomes free once retired fence completes");
+        assert_eq!(f_pending.refs.get(), 0, "retired fence refcount hits zero once completed and reaped");
+        assert_eq!(f_reused.refs.get(), 0, "reused queue fence refcount hits zero on release");
+    }
+
+    /// On an adopted device, `alloc_pool::executed` creates an internal PC fence without
+    /// registering it in `real::FENCES`; releasing the queue via `q_release` drops both
+    /// `State.fences` and completed marks so the fence's COM refcount hits 0, and reusing the
+    /// queue address afterwards creates a fresh fence (#1909).
+    #[test]
+    fn released_queue_frees_alloc_pool_fence_and_skips_title_fences() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+
+            let release_last = |fence: ID3D12Fence| -> u32 {
+                let raw = fence.into_raw();
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+                rel(raw)
+            };
+            let wait_done = |fence: &ID3D12Fence, target: u64| {
+                let start = std::time::Instant::now();
+                while fence.GetCompletedValue() < target && start.elapsed().as_secs() < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(fence.GetCompletedValue() >= target, "queue signal completed");
+            };
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            let (q_key, a_key, l_key) = (queue.as_raw() as usize, alloc.as_raw() as usize, list.as_raw() as usize);
+            created_on(l_key, a_key, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+
+            executed(queue.as_raw(), &[list.as_raw()]);
+            let (probe, signaled) = {
+                let g = STATE.lock().unwrap();
+                let (f, v) = g.as_ref().unwrap().fences.get(&q_key).expect("alloc_pool created per-queue fence");
+                (f.clone(), *v)
+            };
+            assert_eq!(signaled, 1);
+            assert!(!super::super::real::is_fence(probe.as_raw() as usize), "internal alloc_pool fence must not be registered in real::FENCES");
+            assert!(!super::super::real::is_adopted(probe.as_raw()), "internal alloc_pool fence must not be adopted");
+            wait_done(&probe, signaled);
+
+            // Final queue Release triggers `real::q_release` → `alloc_pool::forget_queue`.
+            drop(queue);
+            let (in_fences, in_marks, retired_empty) = {
+                let g = STATE.lock().unwrap();
+                let s = g.as_ref().unwrap();
+                (
+                    s.fences.contains_key(&q_key),
+                    s.backings[&a_key].marks.contains_key(&q_key),
+                    s.backings[&a_key].retired.is_empty(),
+                )
+            };
+            assert!(!in_fences, "q_release must remove released queue from alloc_pool fences");
+            assert!(!in_marks, "completed mark for released queue must be pruned");
+            assert!(retired_empty, "completed mark must not linger in retired");
+            assert_eq!(release_last(probe), 0, "internal alloc_pool fence must reach COM refcount 0 after queue release");
+
+            // Queue-pointer reuse after `forget_queue` allocates a fresh fence starting at value 1.
+            let queue2: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q2_key = queue2.as_raw() as usize;
+            executed(queue2.as_raw(), &[list.as_raw()]);
+            let (first, first_val) = {
+                let g = STATE.lock().unwrap();
+                let (f, v) = g.as_ref().unwrap().fences.get(&q2_key).unwrap();
+                (f.clone(), *v)
+            };
+            assert_eq!(first_val, 1);
+            wait_done(&first, 1);
+            forget_queue(q2_key);
+            assert_eq!(release_last(first), 0, "first fence freed before queue address reuse");
+
+            executed(queue2.as_raw(), &[list.as_raw()]);
+            let (second, second_val) = {
+                let g = STATE.lock().unwrap();
+                let (f, v) = g.as_ref().unwrap().fences.get(&q2_key).unwrap();
+                (f.clone(), *v)
+            };
+            assert_eq!(second_val, 1, "reused queue address starts a fresh fence at value 1");
+            assert!(!super::super::real::is_fence(second.as_raw() as usize));
+            wait_done(&second, 1);
+            drop(queue2);
+            assert_eq!(release_last(second), 0, "second fence freed when queue2 is released");
+
+            drop(list);
+            drop(alloc);
         }
     }
 }
