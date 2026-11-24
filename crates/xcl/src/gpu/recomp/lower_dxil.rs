@@ -571,6 +571,63 @@ mod tests {
     }
 
     #[test]
+    fn per_lane_atomics_take_their_declared_operands() {
+        const LINES: &[I] = &[
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 7), ("VDST", 12), ("SADDR", 0), ("OFFSET", 128), ("GLC", 1)]),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 4)]),
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 8), ("ADDR", 1), ("DATA0", 7)]),
+            ("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 6), ("DATA1", 9)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 1)]),
+            ("DS_MSKOR_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 13), ("DATA1", 14)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 1)]),
+            ENDPGM,
+        ];
+        let (direct, _) = super::kernel(&decode(LINES), false).unwrap();
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = u32::MAX;
+        st.sgpr[2] = 128; // raw buffer size in bytes
+        let mut mem = vec![0; 64];
+        for (i, v) in st.vgpr[..32].iter_mut().enumerate() {
+            let lane = i as u32;
+            mem[i] = 100 + lane;
+            mem[32 + i] = 200 + lane;
+            v[1] = 4 * lane;
+            v[2] = 5;
+            v[4] = 100 + lane;
+            v[5] = 500 + lane;
+            v[6] = 105 + lane;
+            v[7] = 5;
+            v[9] = 300 + lane;
+            v[13] = 15;
+            v[14] = 0x8000_0001;
+        }
+        let bytes = LINES.iter().flat_map(encode_line).collect::<Vec<_>>();
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let reference = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&reference, &st, &mem).unwrap();
+        let actual = runner::run(&direct, &st, &mem).unwrap();
+        assert_eq!(actual.mem, reference.mem);
+        for i in 0..32 {
+            let lane = i as u32;
+            assert_eq!((actual.mem[i], actual.mem[32 + i]), (500 + lane, 205 + lane));
+            for (r, expected) in [(2, 100), (5, 105), (8, 100), (10, 105), (11, 300), (12, 200)] {
+                assert_eq!(actual.vgpr[i][r], reference.vgpr[i][r]);
+                assert_eq!(actual.vgpr[i][r], expected + lane);
+            }
+            assert_eq!(actual.vgpr[i][15], reference.vgpr[i][15]);
+            assert_eq!(actual.vgpr[i][15], ((300 + lane) & !15) | 0x8000_0001);
+        }
+    }
+
+    #[test]
     fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
         if !gpu() { return; }
         if dxc::location().is_err() {
