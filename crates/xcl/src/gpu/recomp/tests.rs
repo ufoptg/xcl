@@ -3946,11 +3946,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 
@@ -4645,6 +4658,51 @@ fn gpu_global_atomics_and_sub_dword_access() {
         let (sn, bn) = (0xAB00 + n as u32, 0x90 + n as u32);
         assert_eq!((v[49], v[50]), (sn, sn | 0xFFFF_0000), "lane {l}: ds_read_u16 / i16 of the neighbour");
         assert_eq!((v[51], v[52]), (bn, bn | 0xFFFF_FF00), "lane {l}: ds_read_u8 / i8 of the neighbour");
+    }
+}
+
+/// LDS subtracts of a register: one slot per lane without and with the old value returned, and
+/// one slot all lanes subtract from. NVIDIA's Blackwell drivers refuse a pipeline (E_OUTOFMEMORY)
+/// with a group-shared subtract or an add of a negated value.
+#[test]
+fn gpu_ds_sub_u32_of_a_register() {
+    if !gpu_ready() {
+        return;
+    }
+    let ds = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_DS", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let barrier = encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap();
+    let mut code = Vec::new();
+    for (a, d) in [(1, 2), (3, 4), (5, 6)] {
+        code.extend(ds("DS_WRITE_B32", &[("ADDR", a), ("DATA0", d)]));
+    }
+    code.extend(&barrier);
+    code.extend(ds("DS_SUB_U32", &[("ADDR", 1), ("DATA0", 7)]));
+    code.extend(ds("DS_SUB_RTN_U32", &[("VDST", 10), ("ADDR", 3), ("DATA0", 7)]));
+    code.extend(ds("DS_SUB_U32", &[("ADDR", 5), ("DATA0", 7)]));
+    code.extend(&barrier);
+    for (d, a) in [(11, 1), (12, 3), (13, 5)] {
+        code.extend(ds("DS_READ_B32", &[("VDST", d), ("ADDR", a)]));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[1] = 4 * l;
+        r[2] = 10 * l; // below the subtrahend of some lanes: wraps
+        r[3] = 512 + 4 * l;
+        r[4] = 5000 + l;
+        r[5] = 1024;
+        r[6] = 1_000_000;
+        r[7] = 3 * l + 100;
+    }
+    let total: u32 = (0..64).map(|l| 3 * l + 100).sum();
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let l = l as u32;
+        let x = 3 * l + 100;
+        assert_eq!(v[11], (10 * l).wrapping_sub(x), "lane {l}: ds_sub_u32");
+        assert_eq!((v[10], v[12]), (5000 + l, 5000 + l - x), "lane {l}: ds_sub_rtn_u32 (old, new)");
+        assert_eq!(v[13], 1_000_000 - total, "lane {l}: the shared slot");
     }
 }
 
@@ -7592,6 +7650,38 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
 }
 
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
