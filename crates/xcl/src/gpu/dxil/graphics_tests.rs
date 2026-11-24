@@ -1193,3 +1193,42 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+#[test]
+fn deep_phi_deps_do_not_overflow_stack() {
+    let handle = std::thread::Builder::new()
+        .name("dxil-graphics-deps-test".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut s = Shader::new(Stage::Pixel, (6, 6));
+            let mut io = GraphicsIo::new(Stage::Pixel);
+            let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+            let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+            let x = io.load_input(&mut s, pos, 0, 0);
+            let f32 = s.m.f32();
+            let one = f(&mut s, 1.0);
+            let cond = s.m.i1c(true);
+            let mut cur_val = x;
+            for _ in 0..4000 {
+                let prev_b = s.m.current_block();
+                let then_b = s.m.new_block();
+                let join_b = s.m.new_block();
+                s.m.cond_br(cond, then_b, join_b);
+                s.m.set_block(then_b);
+                let added = s.m.fbin(BinOp::Add, cur_val, one, 0);
+                s.m.br(join_b);
+                s.m.set_block(join_b);
+                let phi = s.m.phi(f32);
+                s.m.add_incoming(phi, cur_val, prev_b);
+                s.m.add_incoming(phi, added, then_b);
+                cur_val = phi;
+            }
+            for c in 0..4u8 {
+                io.store_output(&mut s, tgt, 0, c, cur_val);
+            }
+            let c = s.try_finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false }).expect("graphics finish");
+            assert_valid(&c);
+        })
+        .expect("spawn bounded-stack thread");
+    handle.join().expect("graphics compute_deps overflowed or panicked");
+}
