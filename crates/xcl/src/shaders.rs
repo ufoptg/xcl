@@ -4,7 +4,7 @@
 //! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
 //! `--compile N` also compiles N of the complete translations with DXC. `--export-hlsl`
-//! writes deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
+//! writes deterministic compute HLSL, and `--measure-pso` times one exact driver PSO creation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -876,6 +876,19 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         );
     }
     if let Some(hash) = measure {
+        let direct = match required("--backend") {
+            Ok(None) => false,
+            Ok(Some(v)) if v == "hlsl" => false,
+            Ok(Some(v)) if v == "direct" => true,
+            Ok(Some(_)) => {
+                eprintln!("xcl shaders: --backend must be hlsl or direct");
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        };
         let hash = match parse_record_hash(hash) {
             Ok(h) => h,
             Err(e) => {
@@ -889,6 +902,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             opt("--repeat").unwrap_or(1).max(1),
             runtime_windows(),
             opt("--split").map(|v| v != 0),
+            direct,
+            json,
         );
     }
     if args.iter().any(|a| a == "--precompile") {
@@ -1027,12 +1042,11 @@ enum MeasureError {
     Failed(String),
 }
 
-/// Compile one exact console compute shader through DXC, then time only the driver's
-/// `CreateComputePipelineState`. The implicit D3D and driver caches must both be disabled;
-/// refusing to do that is an error rather than a misleading warm-cache measurement.
-/// This is the HLSL path the runtime uses by default (not `XCL_DIRECT_DXIL`).
-fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> i32 {
-    match measure_pso_result(input, hash, repeat, windows, split) {
+/// Translate one exact console compute shader, then time only the driver's
+/// `CreateComputePipelineState`. D3D12 must accept disabling its implicit cache kinds, but
+/// that control is a driver hint and does not prove that a measured call compiled cold.
+fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>, direct: bool, json: bool) -> i32 {
+    match measure_pso_result(input, hash, repeat, windows, split, direct, json) {
         Ok(()) => 0,
         Err(MeasureError::Unavailable(e) | MeasureError::Failed(e)) => {
             eprintln!("xcl shaders --measure-pso: {e}");
@@ -1041,7 +1055,7 @@ fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Opt
     }
 }
 
-fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> Result<(), MeasureError> {
+fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>, direct: bool, json: bool) -> Result<(), MeasureError> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D12::*;
     use MeasureError::{Failed, Unavailable};
@@ -1050,7 +1064,9 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     if !is_compute_container(&blob) {
         return Err(Failed(format!("{name} is not a console compute shader")));
     }
-    recomp::dxc::location().map_err(|e| Unavailable(format!("DXC: {e}")))?;
+    if !direct {
+        recomp::dxc::location().map_err(|e| Unavailable(format!("DXC: {e}")))?;
+    }
     let pipeline = Pipelines::new().map_err(|e| Unavailable(format!("no GPU device: {e}")))?;
     // before translating and compiling (tens of seconds for a big program): a machine that
     // cannot turn the caches off fails at once
@@ -1059,11 +1075,20 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
         .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
-    let dxc_start = std::time::Instant::now();
-    let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
-    let dxc_ms = dxc_start.elapsed().as_millis();
-    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
+    let start = std::time::Instant::now();
+    let (dxil, samplers, translation_ms, hlsl_bytes, dxc_ms) = if direct {
+        let compiled = recomp::pso::direct_compute(&blob, 0, windows, split)
+            .map_err(|e| Failed(format!("{name}: direct DXIL: {e}")))?;
+        (compiled.dxil, compiled.samplers, start.elapsed().as_secs_f64() * 1000.0, None, None)
+    } else {
+        let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split)
+            .map_err(|e| Failed(format!("{name}: {e}")))?;
+        let translation_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let dxc_start = std::time::Instant::now();
+        let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
+        (dxil, translation.static_samplers, translation_ms, Some(translation.hlsl.len()), Some(dxc_start.elapsed().as_secs_f64() * 1000.0))
+    };
+    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
     let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
@@ -1082,7 +1107,9 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
                 break;
             }
         }
-        println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
+        if !json {
+            println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
+        }
         times.push(elapsed.as_secs_f64());
     }
     // the root signature's reference, on every path
@@ -1090,14 +1117,34 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     if let Some(e) = failure {
         return Err(e);
     }
-    times.sort_by(f64::total_cmp);
-    let median = if times.len() & 1 == 0 { (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0 } else { times[times.len() / 2] };
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let backend = if direct { "direct" } else { "hlsl" };
+    let mid = sorted.len() / 2;
+    let median = if sorted.len() & 1 == 0 { (sorted[mid - 1] + sorted[mid]) / 2.0 } else { sorted[mid] };
+    if json {
+        println!("{}", serde_json::json!({
+            // Keep enough context in every result to reject the kind of unqualified FPS or
+            // compile-time claim that cannot be reproduced on another adapter. Driver version,
+            // OS build, and command line remain properties of the benchmark host/run manifest.
+            "record_hash": format!("{hash:016x}"), "record_name": name,
+            "backend": backend, "adapter": pipeline.adapter,
+            "windows": windows & !recomp::HEAP_WINDOWS, "heap_windows": windows & recomp::HEAP_WINDOWS != 0,
+            "split_wave64": split, "static_samplers": samplers,
+            "translation_ms": translation_ms, "hlsl_bytes": hlsl_bytes, "dxc_ms": dxc_ms,
+            "dxil_bytes": dxil.len(), "driver_seconds": times, "driver_median_seconds": median,
+            "cache_disable_requested": true, "cold_compile_verified": false
+        }));
+        return Ok(());
+    }
+    let dxc = dxc_ms.map_or_else(String::new, |ms| format!(", {ms:.3} ms DXC"));
     println!(
-        "PSO {hash:016x}: {} bytes DXIL, {dxc_ms} ms DXC, {repeat} cache-off run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name}",
+        "PSO {hash:016x} ({backend}, {}): {} bytes DXIL, {translation_ms:.3} ms translation{dxc}, {repeat} cache-disable-requested run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name} (cold compilation is not verified)",
+        pipeline.adapter,
         dxil.len(),
         median,
-        times[0],
-        times[times.len() - 1]
+        sorted[0],
+        sorted[sorted.len() - 1]
     );
     Ok(())
 }
@@ -1118,6 +1165,9 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// cache the runtime reads at startup. Nothing runs on the GPU.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    /// DXGI adapter name recorded with cold-compile measurements. A timing without the
+    /// adapter (and the run manifest's driver version) is not a comparable benchmark.
+    adapter: String,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
@@ -1138,10 +1188,11 @@ impl Pipelines {
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let (adapter, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let adapter_name = crate::gpu::adapter::name(&desc);
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines { dev, adapter: adapter_name, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
         }
     }
 
@@ -1754,6 +1805,8 @@ mod tests {
         assert_eq!(run(&dir, &args(&["--export-hlsl", "--record-hash", "DEADBEEF"])), 2);
         assert!(!std::path::Path::new("--record-hash").exists(), "the next flag is not taken as the value");
         assert_eq!(run(&dir, &args(&["--measure-pso"])), 2);
+        assert_eq!(run(&dir, &args(&["--measure-pso", "deadbeef", "--backend", "--json"])), 2);
+        assert_eq!(run(&dir, &args(&["--measure-pso", "deadbeef", "--backend", "auto"])), 2);
         assert_eq!(run(&dir, &args(&["--export-hlsl", "out", "--record-hash"])), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1774,7 +1827,7 @@ mod tests {
         let blob = compute_sample();
         std::fs::write(&path.0, &blob).unwrap();
         let hash = shader::fnv64(&blob);
-        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None) {
+        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None, false, false) {
             Ok(()) => {}
             // no DXC, a WARP-only or cacheless device, cache control without Developer Mode
             Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),

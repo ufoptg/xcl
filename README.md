@@ -116,9 +116,18 @@ xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console contain
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
-xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # driver PSO timing (cache-disable requested)
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --backend direct --repeat 3 --json
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
+
+`--measure-pso --json` reports the exact shader hash and name, backend, selected DXGI
+adapter, translation/DXC time, DXIL size, and every driver PSO time after D3D12 accepted a
+cache-disable request. That API is a hint: a driver may still reuse an internal or on-disk
+result, so a fast repeat is not proof of a cold compile. Record the driver version, OS build,
+full command line, GPU power settings and any vendor-specific cache control beside the JSON;
+compare interleaved HLSL/direct runs of the same hash and do not treat an in-game FPS
+screenshot as a shader-compiler benchmark.
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
