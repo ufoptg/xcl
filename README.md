@@ -7,6 +7,8 @@ XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a 
 
 XCL works only on unpacked game files you already own. It does not download, decrypt or unpack game packages (XVC / MSIXVC) and contains nothing for circumventing DRM. The repository holds no code, headers or binaries from the console SDK, no keys and no game data; the Windows components XCL relies on (XGameRuntime, XAudio2, D3D12, DXC) come from your own system or the public Windows SDK and are not distributed with XCL.
 
+XCL is an independent project, not affiliated with or endorsed by Microsoft, AMD or any game publisher. Xbox, Xbox Series X|S and the names of the games in this README are trademarks of their owners and are used here only to say what XCL is compatible with.
+
 ## Games
 
 | Game | Package (version) | State | What works | Limits |
