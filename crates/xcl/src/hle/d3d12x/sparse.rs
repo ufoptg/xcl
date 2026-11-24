@@ -974,34 +974,44 @@ impl State {
         }
     }
 
-    /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
-    /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
-    unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
-        if len == 0 {
-            return;
-        }
-        let mut pg = va & !(PAGE - 1);
-        let end = va + len;
-        while pg < end {
-            let t = pg & !(TILE - 1);
-            let tile_end = (t + TILE).min(end);
-            if let Some(entry) = self.mapped.get_mut(&t) {
-                let mut p = pg;
-                while p < tile_end {
-                    let idx = (p - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                        let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
-                        let lo = va.saturating_sub(p) / CHUNK;
-                        let hi = (end.min(p + PAGE) - p).div_ceil(CHUNK).min(CHUNKS);
-                        for k in lo..hi {
-                            sent[k] = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
+    /// `parts` (address, offset at `p`, bytes) read back from video memory into the CPU view
+    /// (its committed pages). A GPU-unchanged chunk leaves pending CPU writes alone. For
+    /// a partial chunk, copy only the requested bytes and keep pending changes dirty.
+    unsafe fn copy_back(&mut self, p: *const u8, parts: &[(usize, usize, usize)]) {
+        for &(dst, off, len) in parts {
+            let mut at = dst;
+            let end = dst + len;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let idx = (pg - t) / PAGE;
+                let page_end = (pg + PAGE).min(end);
+                if let Some(entry) = self.mapped.get_mut(&t).filter(|e| e.holes & (1u16 << idx) == 0) {
+                    let sent = &mut entry.sent[idx];
+                    let first = (at - pg) / CHUNK;
+                    let last = (page_end - pg).div_ceil(CHUNK);
+                    for k in first..last {
+                        let chunk = pg + k * CHUNK;
+                        let mut bytes = (chunk as *const [u8; CHUNK]).read_unaligned();
+                        let synced = sent.as_deref().map_or(ZERO_HASH, |hashes| hashes[k]);
+                        let dirty = chunk_hash(&bytes) != synced;
+                        let lo = at.max(chunk);
+                        let hi = page_end.min(chunk + CHUNK);
+                        let incoming = std::slice::from_raw_parts(p.add(off + (lo - dst)), hi - lo);
+                        bytes[lo - chunk..hi - chunk].copy_from_slice(incoming);
+                        let after = chunk_hash(&bytes);
+                        let full_chunk = lo == chunk && hi == chunk + CHUNK;
+                        if full_chunk && dirty && after == synced {
+                            continue;
+                        }
+                        std::ptr::copy_nonoverlapping(incoming.as_ptr(), lo as *mut u8, incoming.len());
+                        if full_chunk || !dirty {
+                            sent.get_or_insert_with(|| Box::new(ZERO_HASHES))[k] = after;
                         }
                     }
-                    p += PAGE;
                 }
+                at = page_end;
             }
-            pg = tile_end;
         }
     }
 
@@ -1027,24 +1037,7 @@ impl State {
                 s.wait_for(s.value);
                 s.reclaim_ring();
             }
-            for &(dst, off, len) in pending.iter() {
-                // copy only committed (non-hole) bytes
-                let mut at = dst;
-                let mut src_off = off;
-                let end = dst + len;
-                while at < end {
-                    let pg = at & !(PAGE - 1);
-                    let t = pg & !(TILE - 1);
-                    let idx = (pg - t) / PAGE;
-                    let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
-                    }
-                    at += step;
-                    src_off += step;
-                }
-                s.sync_sent_range(dst, len);
-            }
+            s.copy_back(p, pending);
             pending.clear();
             *used = 0;
         };
@@ -1839,7 +1832,7 @@ mod tests {
     }
 
     /// Mapping tiles for a placed buffer over partially-committed/reserved memory must preserve
-    /// uncommitted hole bits so `readback_ranges` / `sync_sent_range` do not access-violate,
+    /// uncommitted hole bits so readback only touches committed pages,
     /// and later commits clear those hole bits so subsequent writes scan cleanly.
     #[test]
     fn ensure_mapped_with_query_holes_skips_uncommitted_pages_on_readback() {
