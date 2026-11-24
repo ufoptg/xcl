@@ -3468,7 +3468,13 @@ impl Em {
             }
             "v_mul_hi_i32_i24" => format!("(uint)(((int64_t)i24({a}) * (int64_t)i24({b})) >> 32)"),
             "v_sat_pk_u8_i16" => format!("(uint)clamp(((int)({a} << 16)) >> 16, 0, 255) | ((uint)clamp((int){a} >> 16, 0, 255) << 8)"),
-            "v_div_fmas_f32" => fr(format!("mad({}, {}, {})", fs(0), fs(1), fs(2))),
+            "v_div_fmas_f32" => {
+                let (l, h) = u.get(3).ok_or("mask")?.split_once('|').ok_or("mask")?;
+                let bit = self.lane_of(l, h);
+                let t = self.t();
+                self.line(&format!("float {t} = mad({}, {}, {});", fs(0), fs(1), fs(2)));
+                fr(format!("select({bit}, ldexp_f({t}, 32), {t})"))
+            }
             "v_div_fixup_f32" => fr(format!("div_fixup({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cvt_pk_u8_f32" => format!(
                 "({c} & ~(0xFFu << (8u * ({b} & 3u)))) | (((uint)clamp(round({}), 0.0f, 255.0f)) << (8u * ({b} & 3u)))",
@@ -5621,7 +5627,18 @@ uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
-float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
+float div_fixup(float q, float d, float n) {
+    uint qu = asuint(q), du = asuint(d), nu = asuint(n);
+    uint qa = qu & 0x7FFFFFFFu, da = du & 0x7FFFFFFFu, na = nu & 0x7FFFFFFFu;
+    uint sign = (du ^ nu) & 0x80000000u;
+    if (da > 0x7F800000u) return asfloat(du | 0x00400000u);
+    if (na > 0x7F800000u) return asfloat(nu | 0x00400000u);
+    if ((da == 0u && na == 0u) || (da == 0x7F800000u && na == 0x7F800000u)) return asfloat(0xFFC00000u);
+    if (da == 0u || na == 0x7F800000u) return asfloat(sign | 0x7F800000u);
+    if (da == 0x7F800000u || na == 0u) return asfloat(sign);
+    if (qa > 0x7F800000u) return asfloat(sign | 0x7F800000u);
+    return asfloat(sign | qa);
+}
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.

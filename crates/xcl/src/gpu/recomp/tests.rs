@@ -7307,6 +7307,73 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_div_fmas_f32_scales_by_vcc() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_DIV_FMAS_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+            ("V_DIV_FMAS_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 128)], None),
+        ]);
+        let mut st = KernelState::default();
+        st.sgpr[106] = 0xAAAA_AAAA; // odd lanes in 0..31
+        st.sgpr[107] = 0x5555_5555; // even lanes in 32..63
+        for r in st.vgpr.iter_mut() {
+            r[0] = 2.0f32.to_bits();
+            r[1] = 3.0f32.to_bits();
+            r[2] = 1.0f32.to_bits();
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let vcc = if l < 32 { (st.sgpr[106] >> l) & 1 } else { (st.sgpr[107] >> (l - 32)) & 1 } != 0;
+            let want = if vcc { 7.0f32 * (1u64 << 32) as f32 } else { 7.0f32 };
+            assert_eq!(v[4], want.to_bits(), "wave{lanes} lane {l} (vcc={vcc}) v_div_fmas_f32");
+            assert_eq!(v[5], 0.0f32.to_bits(), "wave{lanes} lane {l} v_div_fmas_f32(0)");
+        }
+    }
+}
+
+#[test]
+fn gpu_div_fixup_f32_special_cases_and_sign() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[("V_DIV_FIXUP_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
+        const QNAN: u32 = 0x7FC0_0000;
+        const PINF: u32 = 0x7F80_0000;
+        const NINF: u32 = 0xFF80_0000;
+        const PZERO: u32 = 0x0000_0000;
+        const NZERO: u32 = 0x8000_0000;
+        const CASES: [(u32, u32, u32, u32); 12] = [
+            // (q, d, n, want)
+            (QNAN, (1e-20f32).to_bits(), (1e38f32).to_bits(), PINF),      // overflow q=NaN -> +Inf
+            (QNAN, (-1e-20f32).to_bits(), (1e38f32).to_bits(), NINF),     // overflow q=NaN -> -Inf
+            (PZERO, (-2.0f32).to_bits(), PZERO, NZERO),                   // +0 / -2 -> -0
+            (QNAN, (-2.0f32).to_bits(), PZERO, NZERO),                    // +0 / -2 beats q=NaN -> -0
+            (QNAN, PINF, (-1.0f32).to_bits(), NZERO),                     // -1 / +Inf beats q=NaN -> -0
+            (3.5f32.to_bits(), (-2.0f32).to_bits(), 7.0f32.to_bits(), (-3.5f32).to_bits()),  // sign(d)^sign(n) = -
+            ((-3.5f32).to_bits(), (-2.0f32).to_bits(), (-7.0f32).to_bits(), 3.5f32.to_bits()), // sign(d)^sign(n) = +
+            (1.0f32.to_bits(), NZERO, 1.0f32.to_bits(), NINF),            // +1 / -0 -> -Inf
+            (1.0f32.to_bits(), PZERO, PZERO, QNAN),                       // 0 / 0 -> NaN
+            (1.0f32.to_bits(), PINF, NINF, QNAN),                         // -Inf / +Inf -> NaN
+            (1.0f32.to_bits(), QNAN, 2.0f32.to_bits(), QNAN),             // d = NaN -> NaN
+            (1.0f32.to_bits(), 2.0f32.to_bits(), QNAN, QNAN),             // n = NaN -> NaN
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (q, d, n, _) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (q, d, n);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (q, d, n, want) = CASES[l % CASES.len()];
+            let got = v[4];
+            let both_nan = f32::from_bits(got).is_nan() && f32::from_bits(want).is_nan();
+            assert!(
+                got == want || both_nan,
+                "wave{lanes} lane {l} v_div_fixup_f32(q={q:#010x}, d={d:#010x}, n={n:#010x}) = {got:#010x}, want {want:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
