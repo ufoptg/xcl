@@ -31,7 +31,9 @@ const QUIET_LOOKS: u64 = 8;
 /// tiles made read-only in one look at most, so a look's extra cost stays bounded
 const COOL_PER_LOOK: usize = 64;
 /// tiles examined in one look at most (a cursor goes round the mapped tiles)
-const EXAMINE_PER_LOOK: usize = 4096;
+const EXAMINE_PER_LOOK: usize = 1024;
+/// `Quiet::last` of a tile this module made read-only (skipped until a write marks it again)
+const COOLED: u64 = u64::MAX;
 
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -55,10 +57,11 @@ static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 struct Quiet {
     look: u64,
-    /// the look a tile was last seen written (or first seen) in
-    last_written: HashMap<usize, u64>,
-    /// the mapped tiles with no hole, and where the cursor is in them
+    /// the mapped tiles with no hole, their index, and where the cursor is in them
     tiles: Vec<usize>,
+    index: HashMap<usize, u32>,
+    /// per tile: the look it was last seen written (or first seen) in, or `COOLED`
+    last: Vec<u64>,
     tiles_gen: u64,
     cursor: usize,
 }
@@ -192,44 +195,56 @@ pub unsafe fn after_look(dirty: &[usize], tiles_gen: u64, tiles: impl FnOnce() -
         return;
     }
     let mut g = QUIET.lock().unwrap_or_else(|e| e.into_inner());
-    let q = g.get_or_insert_with(|| Quiet { look: 0, last_written: HashMap::new(), tiles: Vec::new(), tiles_gen: u64::MAX, cursor: 0 });
+    let q = g.get_or_insert_with(|| Quiet {
+        look: 0,
+        tiles: Vec::new(),
+        index: HashMap::new(),
+        last: Vec::new(),
+        tiles_gen: u64::MAX,
+        cursor: 0,
+    });
     q.look += 1;
     let look = q.look;
-    let mut last = usize::MAX;
+    if q.tiles_gen != tiles_gen {
+        let tiles = tiles();
+        let last: Vec<u64> = tiles.iter().map(|t| q.index.get(t).map_or(look, |&i| q.last[i as usize])).collect();
+        q.index = tiles.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
+        q.tiles = tiles;
+        q.last = last;
+        q.tiles_gen = tiles_gen;
+        q.cursor = 0;
+    }
+    // a written tile (a cooled one too: its write faulted and warmed it) is quiet again from now
+    let mut prev = usize::MAX;
     for &p in dirty {
         let t = p & !(TILE - 1);
-        if t != last {
-            q.last_written.insert(t, look);
-            last = t;
+        if t != prev {
+            if let Some(&i) = q.index.get(&t) {
+                q.last[i as usize] = look;
+            }
+            prev = t;
         }
-    }
-    if q.tiles_gen != tiles_gen {
-        q.tiles = tiles();
-        q.tiles_gen = tiles_gen;
-        let live: HashSet<usize> = q.tiles.iter().copied().collect();
-        q.last_written.retain(|t, _| live.contains(t));
-        q.cursor = 0;
     }
     if q.tiles.is_empty() {
         return;
     }
     let mut cooled = 0usize;
-    let n = q.tiles.len().min(EXAMINE_PER_LOOK);
-    for _ in 0..n {
+    for _ in 0..q.tiles.len().min(EXAMINE_PER_LOOK) {
         if cooled == COOL_PER_LOOK {
             break;
         }
         q.cursor = (q.cursor + 1) % q.tiles.len();
-        let t = q.tiles[q.cursor];
-        let seen = *q.last_written.entry(t).or_insert(look);
-        if look - seen < QUIET_LOOKS {
+        let i = q.cursor;
+        let seen = q.last[i];
+        if seen == COOLED || look - seen < QUIET_LOOKS {
             continue;
         }
-        if cool_tile(t) {
+        if cool_tile(q.tiles[i]) {
+            q.last[i] = COOLED;
             cooled += 1;
+        } else {
+            q.last[i] = look;
         }
-        // a tile written later is seen written again by the look after its fault
-        q.last_written.insert(t, look);
     }
     if cooled > 0 {
         COUNTS[0].fetch_add(cooled as u64, Ordering::Relaxed);
