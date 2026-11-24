@@ -60,10 +60,42 @@ fn gpu_waves() -> Vec<bool> {
 /// A kernel compiled as a wave64 or wave32 program, and the code as memory from address 0,
 /// where `runner::run_program` puts it.
 fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
+    let mem = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    if runner::direct_dxil() {
+        return (runner::direct_kernel(code, wave64).unwrap(), mem);
+    }
     let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// `XCL_DIRECT_DXIL=1`: the direct DXIL translator's kernel for a kernel-mode program with
+/// one memory window (else `hlsl`, the HLSL path's container).
+fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
+    use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
+    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
+    if !runner::direct_dxil() || !windows {
+        return hlsl;
+    }
+    let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
+    // heap windows: `HEAP_WINDOWS` in the count, as `pso::mem_windows` passes it
+    let mem_windows = if opt.heap_windows && opt.mem_windows > 1 { opt.mem_windows | super::HEAP_WINDOWS } else { opt.mem_windows };
+    let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
+    match &opt.mode {
+        Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
+        Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Vertex(vs) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        _ => hlsl,
+    }
+}
+
+/// `XCL_DIRECT_DXIL=1`: a kernel-mode program the HLSL path only compiles must also go
+/// through the direct DXIL translator (and its validator check).
+fn direct_check(code: &[u8], opt: &Options) {
+    let _ = direct_or(code, opt, Vec::new());
 }
 
 /// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
@@ -196,6 +228,7 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     assert!(t.hlsl.contains("& (0xFFFFFFFFFFFFFFFFull >> (64u -") && t.hlsl.contains("(int64_t)(t") && t.hlsl.contains("== 0u) ? 0ull"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -211,6 +244,7 @@ fn scalar_bitcmp_64_selects_the_indexed_half() {
     assert!(t.hlsl.contains("scc = (uint)(") && t.hlsl.contains("== 0u);"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -229,6 +263,7 @@ fn scalar_64_bit_count_scan_and_set_cluster() {
     assert!(t.hlsl.contains("31u - firstbithigh(s5)") && t.hlsl.contains("s7 | select((s10 & 32u) != 0u") && t.hlsl.contains("s6 & ~select((s11 & 32u) == 0u"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -246,6 +281,7 @@ fn scalar_signed_leading_bit_scans() {
     assert!(t.hlsl.contains("31u - firstbithigh(") && t.hlsl.contains("63u - firstbithigh(") && t.hlsl.contains("0xFFFFFFFFu"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -263,6 +299,7 @@ fn scalar_relative_move_cluster() {
     assert!(t.hlsl.contains("switch (m0)") && t.hlsl.contains("switch ((m0 & 0x3FFu))") && t.hlsl.contains("switch (((m0 >> 16) & 0x3FFu))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -302,6 +339,7 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
     assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -431,6 +469,8 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
+        direct_check(&code, &Options { mem_windows: 2, ..Default::default() });
+        direct_check(&code, &Options { mem_windows: 2, heap_windows: true, ..Default::default() });
     }
 }
 
@@ -455,6 +495,7 @@ fn unary_f64_math_vop1_and_vop3() {
     assert_eq!(t.hlsl.matches("(double)1 / sqrt_d(").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -655,6 +696,7 @@ fn frexp_f64_instructions() {
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(0x00000000u, 0xBFF00000u))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -670,6 +712,7 @@ fn rndne_f64_instructions() {
     assert!(t.hlsl.contains("round_ne_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -1487,6 +1530,7 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
     assert!(t.hlsl.contains("f16tof32(((v16 >> 16) & 0xFFFFu))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -1510,6 +1554,8 @@ fn gpu_typed_buffer_loads_and_stores() {
         ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 32), ("SRSRC", 6), ("SOFFSET", 128), ("OFFSET", 2)], None),
         ("TBUFFER_LOAD_FORMAT_D16_XY", "ENC_MTBUF", &[("VDATA", 33), ("SRSRC", 8), ("SOFFSET", 128), ("FORMAT", 64)], None),
         ("BUFFER_STORE_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 34), ("SRSRC", 10), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 35), ("SRSRC", 11), ("SOFFSET", 128)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 35), ("SRSRC", 13), ("SOFFSET", 128)], None),
         ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 29), ("SRC0", V + 30), ("SRC1", 130), ("SRC2", 255)], Some(0x1122_3344)),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 0), ("VADDR", 1), ("SRSRC", 9), ("SOFFSET", 128), ("OFFEN", 1)], None),
         ("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 50), ("SSRC0", 133)], None),
@@ -1522,6 +1568,7 @@ fn gpu_typed_buffer_loads_and_stores() {
     mem[0x11C / 4] = 0x3C0 | 0x400 << 11 | 0x1C0 << 22; // E: 10_11_11_FLOAT (1.0, 2.0, 0.5)
     mem[0x120 / 4] = f(1.5);
     mem[0x124 / 4] = f(-3.25); // F: 32_32_FLOAT
+    mem[0x140 / 4..0x150 / 4].copy_from_slice(&[f(1.25), f(-2.5), f(3.75), f(-4.5)]);
     let mut st = KernelState::default();
     for (i, v) in [
         vs(0x100, 56, bgra),
@@ -1538,6 +1585,8 @@ fn gpu_typed_buffer_loads_and_stores() {
         st.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(v);
     }
     st.sgpr[40..44].copy_from_slice(&vs(0x130, 29, ident));
+    st.sgpr[44..48].copy_from_slice(&vs(0x140, 77, 0 | 1 << 3 | 4 << 6 | 7 << 9));
+    st.sgpr[52..56].copy_from_slice(&vs(0x150, 77, ident));
     st.sgpr[50] = 1;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[0] = 0xC0DE_0000 | l as u32;
@@ -1569,10 +1618,12 @@ fn gpu_typed_buffer_loads_and_stores() {
         assert_eq!(v[31], 0xC000_3C00, "lane {l} d16 16_16_float");
         assert_eq!(v[32], 0x0000_BC00, "lane {l} d16 16_snorm");
         assert_eq!(v[33], 0xC280_3E00, "lane {l} d16 tbuffer 32_32_float");
+        assert_eq!([fl(v[35]), fl(v[36]), fl(v[37]), fl(v[38])], [0.0, 1.0, 1.25, -4.5], "lane {l} 32_32_32_32 selectors");
         assert_eq!(v[29], 0x11C9_3344, "lane {l} v_cvt_pk_u8_f32 into byte 2");
         assert_eq!(r.mem[0x400 / 4 + l], 0xC0DE_0000 | l as u32, "lane {l} buffer_store_dword");
     }
     assert_eq!(r.mem[0x130 / 4], 0xB800_4000, "d16 store 16_16_float");
+    assert_eq!(&r.mem[0x150 / 4..0x160 / 4], &[f(0.0), f(1.0), f(1.25), f(-4.5)], "32_32_32_32 store");
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
@@ -1619,11 +1670,12 @@ fn gpu_graphics_vs_ps_draw() {
         input_ena: 0x302,
         attrs: None,
     };
-    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
-    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    let (vo, po) = (Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() });
+    let vt = translate(&vs_code, &vo).unwrap();
+    let pt = translate(&ps_code, &po).unwrap();
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
-    let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
-    let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let vs = direct_or(&vs_code, &vo, super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl)));
+    let ps = direct_or(&ps_code, &po, super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl)));
     let c = [0.8f32, 0.6, 0.4, 1.0];
     let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
     let layout = [
@@ -2603,6 +2655,7 @@ fn global_dword_addtid_address_is_saddr_plus_4_per_lane() {
     assert_eq!(t.hlsl.matches("_a = ").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
     }
 }
 
@@ -2853,9 +2906,10 @@ fn gpu_mesh_mode_two_passes() {
     list.push(exp(20, 1, [21, 0, 0, 0], 1));
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let pass = mesh_passthrough(&ms);
     let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
@@ -3102,7 +3156,7 @@ fn gpu_unified_memory_arena() {
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
     ]);
     let t = translate(&p, &on_gpu(Options::default())).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options::default()), super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let hi = (va >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(va + 0x1000) as u32, hi]);
@@ -3183,6 +3237,17 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
+    memory_windows_above_4_gib(false);
+}
+
+/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
+/// same results, and no `switch` over windows in the HLSL.
+#[test]
+fn gpu_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(true);
+}
+
+fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3213,9 +3278,12 @@ fn gpu_memory_windows_above_4_gib() {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
@@ -3256,6 +3324,17 @@ fn gpu_memory_windows_above_4_gib() {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3309,8 +3388,10 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil);
 
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
@@ -3443,8 +3524,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
     ]);
     let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
-    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
+    let dxil = direct_or(&p, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap());
 
     // Execute on the real D3D12.X device + queue (goes through q_execute_command_lists -> sparse::before_execute)
     unsafe {
@@ -3610,13 +3692,30 @@ fn dump_retail_interfaces() {
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
-    if !gpu_ready() || !mesh_ready() {
-        return;
-    }
-    use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    geometry_es_gs_strip(false);
+}
+
+/// The same program with branches in the ES (forward) and in the GS (EXEC-zero skip and a
+/// scalar loop): the guarded block chain must keep the phases apart in the split form – the
+/// ES stops at its s_setpc, the GS phase enters at `gs_start` (a structured stretch across the
+/// s_setpc ran the GS in the ES phase and left the GS phase without an entry: empty records).
+#[test]
+fn gpu_geometry_mode_es_gs_strip_with_branches() {
+    geometry_es_gs_strip(true);
+}
+
+/// The geometry program of `gpu_geometry_mode_es_gs_strip`, optionally with branches.
+fn geometry_es_gs_program(branches: bool) -> (Vec<u8>, super::GsInterface) {
+    use super::GsInterface;
     let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap();
     // ES: vertex (v9..v12) → LDS at lane·32, then into the GS
     let mut es = Vec::new();
+    if branches {
+        // if (s3 == 0) skip a s_mov (always taken or not: no effect on the result)
+        es.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)], None));
+        es.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None));
+        es.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 129)], None));
+    }
     es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
     es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
     es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 133), ("VSRC1", 20)], None));
@@ -3628,6 +3727,17 @@ fn gpu_geometry_mode_es_gs_strip() {
     let mut gs = Vec::new();
     gs.extend(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
     gs.extend(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    let mut skip_at = None;
+    if branches {
+        // no primitives: straight to GS done (patched below)
+        skip_at = Some(gs.len());
+        gs.extend(e("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None));
+        // s8 = 2; do { s8 -= 1 } while (s8 != 0)
+        gs.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 130)], None));
+        gs.extend(e("S_SUB_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None));
+        gs.extend(e("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)], None));
+        gs.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
     gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
     gs.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
     gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)], None));
@@ -3655,6 +3765,10 @@ fn gpu_geometry_mode_es_gs_strip() {
         gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None)); // emit
     }
     gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)], None)); // cut
+    if let Some(at) = skip_at {
+        let off = ((gs.len() - at - 4) / 4) as u64;
+        gs[at..at + 4].copy_from_slice(&e("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", off)], None));
+    }
     gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None)); // GS done
     gs.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
 
@@ -3678,6 +3792,29 @@ fn gpu_geometry_mode_es_gs_strip() {
     };
     let mut code = es;
     code.extend_from_slice(&gs);
+    (code, g)
+}
+
+/// Split form with branches: the ES phase ends at the s_setpc and the GS phase has its entry
+/// (`if (pc == gs_start)`), also where no GPU runs the program.
+#[test]
+fn geometry_split_phases_with_branches_have_entry_and_exit() {
+    let (code, g) = geometry_es_gs_program(true);
+    let s = g.gs_start.unwrap();
+    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains(&format!("if (pc == {s}u)")), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("pc = select(xcl_es_phase, 0xFFFFFFFFu, {s}u);")), "{}", t.hlsl);
+    let n = translate(&code, &Options { mode: Mode::Geometry(g), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(n.complete() && !n.hlsl.contains("xcl_es_phase"), "{}", n.hlsl);
+}
+
+fn geometry_es_gs_strip(branches: bool) {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    let (code, g) = geometry_es_gs_program(branches);
     let native = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
     assert!(native.hlsl.contains("[WaveSize(64)]"));
     assert!(!native.hlsl.contains("xcl_es_phase") && !native.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
@@ -4099,9 +4236,10 @@ fn gpu_compute_mode_dispatch_abi() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
     ]);
-    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -4135,7 +4273,7 @@ fn gpu_wave32_program_in_wave64_hardware() {
     ]);
     let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
     assert!(t.hlsl.contains("[WaveSize(64)]") && t.hlsl.contains("xcl_half"), "{}", t.hlsl);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
     let mut st = KernelState::default();
     st.sgpr[126] = u32::MAX; // exec of each half
     for (l, r) in st.vgpr.iter_mut().enumerate() {
@@ -4391,7 +4529,7 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
     let t = translate(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() }), super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap());
 
     let mut st = KernelState::default();
     st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
@@ -5943,13 +6081,14 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
     for dims in [[256u32, 1, 1], [8, 8, 4]] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
             assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;
@@ -6021,12 +6160,13 @@ fn gpu_split_wave64_waves_diverge() {
     for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
         let threads = dims.iter().product::<u32>();
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
-        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
         io[0] = base as u32;
@@ -6098,12 +6238,13 @@ fn bench_split_wave64() {
             let mut exchanges = 0;
             for wave64 in [false, true] {
                 let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
-                let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+                let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+                let t = translate(&p, &opt).unwrap();
                 // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
                 // selector, unless `XCL_X64_ALL_MASKS`) and the readfirstlane
                 exchanges = t.hlsl.matches("= xcl_x_ballot(and(").count() + t.hlsl.matches("xcl_x_rla_uniform(").count().saturating_sub(1);
                 assert!(t.complete(), "{:?}", t.unsupported_why);
-                let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+                let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
                 let groups = (1u32 << 18) / threads;
                 let mut io = vec![0u32; 128];
                 io[0] = 0;
@@ -6677,7 +6818,7 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
 
     let mut st = KernelState::default();
     st.sgpr[127] = 0;
@@ -6793,7 +6934,7 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
 
     // (f32 bits, RNE, RTZ, +inf, -inf)
     let cases: &[(u32, u16, u16, u16, u16)] = &[
@@ -6940,7 +7081,7 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
         let code = prog(&insns);
         let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
         assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let dxil = direct_or(&code, &Options { wave64, split_wave64, ..Default::default() }, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
         let mut st = KernelState::default();
         let lanes = if wave64 { 64 } else { 32 };
         for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {

@@ -61,6 +61,16 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod heap_window_tests;
+
+/// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
+/// window k is raw UAV `MEM_HEAP_BASE + k`.
+pub const MEM_HEAP_BASE: u32 = 0;
+
+/// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
+/// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
+pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -492,6 +502,11 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// with `mem_windows` > 1: reach window k through descriptor `MEM_HEAP_BASE + k` of the
+    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`) – one access per
+    /// site instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
+    /// access once per window (HANDOFF: twice the DXC + driver time with 4 windows)
+    pub heap_windows: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
@@ -499,7 +514,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
     }
 }
 
@@ -534,6 +549,9 @@ struct Ctx<'a> {
     loops: &'a [(u64, u64)],
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
+    /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
+    /// phase's entry, so no structured stretch may run across it
+    phase_split: bool,
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
 }
@@ -1083,6 +1101,9 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     let mut j = i;
     while j < c.leaders.len() && c.leaders[j] < hi {
         let (s, e) = (c.leaders[j], block_end(c, j));
+        if c.phase_split && insts_in(c, s, e).last().is_some_and(|d| d.inst.name == "S_SETPC_B64" && d.far_target.is_none()) {
+            break;
+        }
         match term(c, s, e) {
             Term::End | Term::Other => break,
             Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
@@ -1316,7 +1337,7 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
 /// set by s_mov / s_movk with constants earlier in its block, those words.
-fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
     for d in insts {
@@ -1357,6 +1378,13 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let normalized;
+    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
+        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        &normalized
+    } else {
+        opt
+    };
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1444,11 +1472,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, phase_split, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
