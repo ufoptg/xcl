@@ -315,6 +315,9 @@ impl TraceFilter {
 pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool) -> usize {
     let key = dll_key(dll);
     let (mut addr, source) = resolve_inner(&key, what, 0);
+    if matches!(source, Source::GameDll(_)) && crate::hle::bink::is_bink_dll(&key) {
+        addr = crate::hle::bink::wrap(&fname(what), addr);
+    }
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
     if let Some(f) = trace_filter() {
         if f.wants(&key, &fname(what), &source) {
@@ -424,7 +427,12 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
         return r;
     }
     if let Some(m) = modules::find_mapped_by_base(h) {
-        return resolve_export_of_mapped(&m, what, 0);
+        let mut addr = resolve_export_of_mapped(&m, what, 0)?;
+        let key = dll_key(&m.name);
+        if crate::hle::bink::is_bink_dll(&key) {
+            addr = crate::hle::bink::wrap(&fname(what), addr);
+        }
+        return Some(addr);
     }
     // A real module: kernel-family modules prefer our overrides.
     let mut buf = [0u16; 260];
