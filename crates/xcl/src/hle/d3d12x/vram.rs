@@ -864,6 +864,12 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     ((p.pages.len() + p.extra_pages.len()) * PAGE + su, p.pools.len() * POOL_PAGES as usize * PAGE + sp)
 }
 
+#[cfg(test)]
+pub(super) fn extra_page_bytes_for(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    g.get(&device).and_then(|p| p.as_ref()).map_or(0, |p| p.extra_pages.len() * PAGE)
+}
+
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let (su, sp) = super::vram_small::bytes();

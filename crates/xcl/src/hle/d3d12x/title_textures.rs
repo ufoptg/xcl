@@ -1647,6 +1647,15 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+        // Unaligned 88 KiB mip-chain siblings at +0x4000 own page +0x1_0000 plus 1 extra_page;
+        // an aligned 64 KiB cover at +0x1_0000 supersedes both without allocating a new base page.
+        let tex_88k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 8, 28, 0x105)).unwrap());
+        assert_eq!(tex_88k.size(), 0x1_6000);
+        assert_eq!(tbl.insert(30, entry(0x30_4000, &tex_88k, true, true)), (1, vec![]));
+        assert_eq!(tbl.insert(31, entry(0x30_4000, &tex_88k, true, true)), (0, vec![]));
+        let (_, mut unmap_unaligned) = tbl.insert(32, entry(0x31_0000, &tex_64k, true, true));
+        unmap_unaligned.sort_unstable();
+        assert_eq!(unmap_unaligned, vec![30, 31]);
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased
@@ -1875,17 +1884,25 @@ mod tests {
             drop((reused, adj));
 
             // Reclaiming dead extra_pages immediately when a >= 64 KiB unaligned tiled texture is
-            // overwritten by a larger placement without Release:
-            let d64_mips = console_desc(3, 128, 128, 1, 8, 28, 0x105); // 2 tiles (mip 0 + packed mips)
-            let d128 = console_desc(3, 256, 128, 1, 1, 28, 0x109); // 128 KiB, 2 tiles
-            let anchor = place_tex(base, &d64);
+            // overwritten by an overlapping placement without Release:
+            // `unaligned_a`/`b` at `base + 0x4000` (88 KiB, 2 tiles) own page `base + 0x1_0000`
+            // plus 1 `extra_pages` tile; `cover` at `base + 0x1_0000` reuses that already-live
+            // owned page (+0 new pages) while superseding both unaligned siblings and reclaiming
+            // their `extra_pages` tile immediately (-64 KiB).
+            let d64_mips = console_desc(3, 128, 128, 1, 8, 28, 0x105); // 88 KiB, 2 tiles (mip 0 + packed mips)
+            let extra_before = super::super::vram::extra_page_bytes_for(dev_key);
             let unaligned_a = place_tex(base + 0x4000, &d64_mips);
+            let extra_after_a = super::super::vram::extra_page_bytes_for(dev_key);
+            assert!(extra_after_a > extra_before, "unaligned >= 64 KiB tiled texture must allocate extra_pages ({extra_before} -> {extra_after_a})");
             let unaligned_b = place_tex(base + 0x4000, &d64_mips);
+            assert_eq!(super::super::vram::extra_page_bytes_for(dev_key), extra_after_a, "reusing unaligned va must share extra_pages tile");
             let pages_with_extra = dev_pages();
-            let cover = place_tex(base, &d128);
+            let cover = place_tex(base + 0x1_0000, &d64);
             let pages_after_cover = dev_pages();
+            let extra_after_cover = super::super::vram::extra_page_bytes_for(dev_key);
+            assert_eq!(extra_after_cover, extra_before, "superseded unaligned extra_pages must drop back to baseline ({extra_after_a} -> {extra_after_cover})");
             assert!(pages_after_cover < pages_with_extra, "superseded unaligned extra_pages must be reclaimed immediately ({pages_with_extra} -> {pages_after_cover})");
-            drop((cover, unaligned_b, unaligned_a, anchor));
+            drop((cover, unaligned_b, unaligned_a));
 
             // 4. Full mip chain (standard + packed mips, RGBA8 & BC7), tiny all-packed mips,
             // 6-slice cubemap (exercises extra_pages reuse), and 3D volume texture (Tier 3).
