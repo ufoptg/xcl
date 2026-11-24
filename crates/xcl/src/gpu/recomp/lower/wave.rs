@@ -92,6 +92,18 @@ impl<I: Ir> Lower<'_, I> {
         self.ir.count_bits(below)
     }
 
+    /// Leading zero bits of `x` (32 if `x == 0`).
+    fn clz32(&mut self, mut x: I::V) -> I::V {
+        for sh in [1, 2, 4, 8, 16] {
+            let s = self.c(sh);
+            let t = self.ir.bin(Bin::LShr, x, s);
+            x = self.ir.bin(Bin::Or, x, t);
+        }
+        let all = self.c(u32::MAX);
+        let inv = self.ir.bin(Bin::Xor, x, all);
+        self.ir.count_bits(inv)
+    }
+
     /// The lowest set bit of the 64-bit (lo, hi), `none` if none.
     fn first_set(&mut self, [lo, hi]: [I::V; 2], none: u32) -> I::V {
         let z = self.ir.int(0);
@@ -434,37 +446,71 @@ impl<I: Ir> Lower<'_, I> {
             self.write_scc(b, bit);
             return Ok(true);
         }
-        let (ones, count) = match name {
-            "S_BCNT1_I32_B32" | "S_BCNT1_I32_B64" => (true, true),
-            "S_BCNT0_I32_B32" | "S_BCNT0_I32_B64" => (false, true),
-            "S_FF1_I32_B32" | "S_FF1_I32_B64" => (true, false),
+        enum MaskOp {
+            Bcnt(bool),
+            Ff(bool),
+            Flbit,
+        }
+        let op = match name {
+            "S_BCNT1_I32_B32" | "S_BCNT1_I32_B64" => MaskOp::Bcnt(true),
+            "S_BCNT0_I32_B32" | "S_BCNT0_I32_B64" => MaskOp::Bcnt(false),
+            "S_FF1_I32_B32" | "S_FF1_I32_B64" => MaskOp::Ff(true),
+            "S_FF0_I32_B32" | "S_FF0_I32_B64" => MaskOp::Ff(false),
+            "S_FLBIT_I32_B32" | "S_FLBIT_I32_B64" => MaskOp::Flbit,
             _ => return Ok(false),
         };
         // only where the source is a mask: numbers take the usual path
         if self.mask_reg(b, s0).is_none() {
             return Ok(false);
         }
-        let w = if name.ends_with("_B64") {
+        let b64 = name.ends_with("_B64");
+        let w = if b64 {
             self.words(b, d, s0)?
         } else {
             [self.word(b, d, s0)?, self.c(0)]
         };
-        let w = if ones {
-            w
-        } else {
-            let all = self.c(u32::MAX);
-            let hi = if name.ends_with("_B64") { self.ir.bin(Bin::Xor, w[1], all) } else { w[1] };
-            [self.ir.bin(Bin::Xor, w[0], all), hi]
-        };
-        let r = if count {
-            let (lo, hi) = (self.ir.count_bits(w[0]), self.ir.count_bits(w[1]));
-            let r = self.ir.bin(Bin::Add, lo, hi);
-            let z = self.c(0);
-            let c = self.ir.icmp(Cmp::Ne, r, z);
-            self.ssa.write(b, Var::Scc, c);
-            r
-        } else {
-            self.first_set(w, u32::MAX)
+        let r = match op {
+            MaskOp::Bcnt(ones) => {
+                let w = if ones {
+                    w
+                } else {
+                    let all = self.c(u32::MAX);
+                    let hi = if b64 { self.ir.bin(Bin::Xor, w[1], all) } else { w[1] };
+                    [self.ir.bin(Bin::Xor, w[0], all), hi]
+                };
+                let (lo, hi) = (self.ir.count_bits(w[0]), self.ir.count_bits(w[1]));
+                let r = self.ir.bin(Bin::Add, lo, hi);
+                let z = self.c(0);
+                let c = self.ir.icmp(Cmp::Ne, r, z);
+                self.ssa.write(b, Var::Scc, c);
+                r
+            }
+            MaskOp::Ff(ones) => {
+                let w = if ones {
+                    w
+                } else {
+                    let all = self.c(u32::MAX);
+                    let hi = if b64 { self.ir.bin(Bin::Xor, w[1], all) } else { w[1] };
+                    [self.ir.bin(Bin::Xor, w[0], all), hi]
+                };
+                self.first_set(w, u32::MAX)
+            }
+            MaskOp::Flbit => {
+                let (z, none) = (self.c(0), self.c(u32::MAX));
+                let cl = self.clz32(w[0]);
+                if b64 {
+                    let ch = self.clz32(w[1]);
+                    let c32 = self.c(32);
+                    let cl64 = self.ir.bin(Bin::Add, cl, c32);
+                    let lz = self.ir.icmp(Cmp::Eq, w[0], z);
+                    let lo_r = self.ir.select(lz, none, cl64);
+                    let hz = self.ir.icmp(Cmp::Eq, w[1], z);
+                    self.ir.select(hz, lo_r, ch)
+                } else {
+                    let lz = self.ir.icmp(Cmp::Eq, w[0], z);
+                    self.ir.select(lz, none, cl)
+                }
+            }
         };
         self.write_num(b, sd, r);
         Ok(true)
