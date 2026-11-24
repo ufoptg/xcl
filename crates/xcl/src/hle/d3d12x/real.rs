@@ -3160,6 +3160,22 @@ unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flag
     hr
 }
 
+/// Create an internal PC `ID3D12Fence` bypassing `dev_create_fence` (not adopted, not added to
+/// `FENCES`). Used for internal tracking fences the title never sees so releasing them frees them.
+pub(super) unsafe fn create_pc_fence(dev: &ID3D12Device) -> Option<ID3D12Fence> {
+    let raw = dev.as_raw();
+    if is_adopted(raw) {
+        type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateFence")));
+        let riid = &ID3D12Fence::IID as *const windows::core::GUID as *const GUID;
+        let mut out = std::ptr::null_mut();
+        let hr = f(raw, 0, D3D12_FENCE_FLAG_NONE, riid, &mut out);
+        (hr >= 0 && !out.is_null()).then(|| ID3D12Fence::from_raw(out))
+    } else {
+        dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+    }
+}
+
 /// End the title on purpose without leaving the process stuck in the driver: every fence it
 /// created is signalled to the largest value (GPU waits on values the title would have signalled
 /// later complete), the queues drain, and the process ends without running DLL detach code.
@@ -5396,6 +5412,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::alloc_pool::forget_queue(this as usize);
     }
     n
 }
@@ -5478,7 +5495,7 @@ pub(super) fn note_newer_device_method(slot: usize) {
 }
 
 /// Whether `p` is a fence the title created.
-fn is_fence(p: usize) -> bool {
+pub(super) fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
