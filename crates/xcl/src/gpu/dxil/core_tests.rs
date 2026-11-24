@@ -467,3 +467,68 @@ fn s_setreg_b32_mode_bit3_does_not_underflow() {
     assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (hlsl.vgpr[0][0], hlsl.vgpr[1][0]));
     assert_eq!((direct.vgpr[0][0], direct.vgpr[1][0]), (0x3C00, 0xBC01));
 }
+
+/// Collapsed forward `s_cbranch_execz` regions (triggered above the block threshold)
+/// produce bit-exact SGPRs, SCC, EXEC, and per-lane VGPRs matching the HLSL reference
+/// across EXEC == 0, partial EXEC, and full EXEC.
+#[test]
+fn collapsed_execz_kernel_matches_hlsl_on_gpu() {
+    use crate::gpu::recomp::{self, runner::{self, KernelState}, Options};
+    let mut seq: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    // 70 repeated nested `s_cbranch_execz` blocks (> 128 blocks total so Pass 2 triggers).
+    // Each iteration saves EXEC, narrows via `s_and_saveexec_b64`, conditionally modifies
+    // v1, v2, live-out SGPR s10, and SCC, then restores EXEC via `s_mov_b64 exec, s[4:5]`.
+    for _ in 0..70 {
+        seq.push(("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)], None));
+        seq.push(("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 6)], None));
+        seq.push(("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 8)], None));
+        seq.push(("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 3)], None));
+        seq.push(("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)], None));
+        seq.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None));
+        seq.push(("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 10), ("VSRC1", 2)], None));
+        seq.push(("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 6)], None));
+        seq.push(("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)], None));
+    }
+    let code = prog(&seq);
+    // Verify CFG actually collapsed to 1 block!
+    let cfg = super::cfg::Cfg::build_for(&code, true, true).unwrap();
+    assert_eq!(cfg.rpo.len(), 1, "expected 70 nested execz blocks to collapse to 1, got {}", cfg.rpo.len());
+    let split = runner::split_wave64() || runner::wave64_supported() != Ok(true);
+    let dxil = translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap();
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || recomp::dxc::location().is_err() {
+        return;
+    }
+    let hlsl = recomp::translate(&code, &Options { wave64: true, split_wave64: split, ..Default::default() }).unwrap();
+    let hlsl_dxil = recomp::dxc::compile(&hlsl.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    // Test 3 cases: (EXEC, s[2:3], s[8:9]) covering EXEC==0, partial EXEC, and full EXEC
+    let cases: [(u64, u64, u64); 3] = [
+        (0, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF),
+        (0x0F0F_0F0F_0F0F_0F0F, 0x00FF_00FF_00FF_00FF, 0x0555_0555_0555_0555),
+        (0xFFFF_FFFF_FFFF_FFFF, 0xAAAA_AAAA_AAAA_AAAA, 0xCCCC_CCCC_CCCC_CCCC),
+    ];
+    for (exec, m1, m2) in cases {
+        let mut st = KernelState::default();
+        st.sgpr[126] = exec as u32;
+        st.sgpr[127] = (exec >> 32) as u32;
+        st.sgpr[2] = m1 as u32;
+        st.sgpr[3] = (m1 >> 32) as u32;
+        st.sgpr[8] = m2 as u32;
+        st.sgpr[9] = (m2 >> 32) as u32;
+        st.sgpr[10] = 0x1234_5678;
+        st.scc = 1;
+        for lane in 0..64 {
+            st.vgpr[lane][1] = 100 + lane as u32;
+            st.vgpr[lane][2] = 0xDEAD_0000 | lane as u32;
+        }
+        let ref_out = runner::run(&hlsl_dxil, &st, &[]).unwrap();
+        let got_out = runner::run(&dxil, &st, &[]).unwrap();
+        assert_eq!((got_out.sgpr[126], got_out.sgpr[127]), (ref_out.sgpr[126], ref_out.sgpr[127]), "exec mismatch for exec={exec:#x}");
+        assert_eq!(got_out.scc, ref_out.scc, "scc mismatch for exec={exec:#x}");
+        assert_eq!(got_out.sgpr[10], ref_out.sgpr[10], "s10 mismatch for exec={exec:#x}");
+        for lane in 0..64 {
+            assert_eq!(got_out.vgpr[lane][1], ref_out.vgpr[lane][1], "v1[{lane}] mismatch for exec={exec:#x}");
+            assert_eq!(got_out.vgpr[lane][2], ref_out.vgpr[lane][2], "v2[{lane}] mismatch for exec={exec:#x}");
+        }
+    }
+}

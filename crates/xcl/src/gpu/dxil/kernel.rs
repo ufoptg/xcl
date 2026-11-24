@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use super::cfg::{Cfg, Term};
+use super::cfg::{Cfg, CfgOp, Term};
 use super::container::Stage;
 use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
@@ -37,7 +37,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 7;
+pub const TRANSLATOR_VERSION: u32 = 8;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -143,15 +143,14 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
     };
+    let kernel = matches!(entry, Entry::Kernel);
     let cfg = match &geo {
         Some(g) => Cfg::build_geometry(code, g.gs_start)?,
-        None => Cfg::build(code)?,
+        None => Cfg::build_for(code, o.wave64, kernel)?,
     };
-    let kernel = matches!(entry, Entry::Kernel);
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let split = o.wave64 && o.split && !gfx;
-    let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    let mut lw = Lw::new(&cfg.insts, &cfg.orig_leaders, o, &entry);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -266,6 +265,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     let mut gs_entry: Option<usize> = None;
+    let mut saved_execz: HashMap<u32, (Value, Vec<(u32, Value)>)> = HashMap::new();
     for &b in &cfg.rpo {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
@@ -291,8 +291,31 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
         }
-        for &i in &cfg.blocks[b].insts {
-            lw.inst(&cfg.insts[i])?;
+        for op in &cfg.blocks[b].ops {
+            match op {
+                CfgOp::Inst(i) => lw.inst(&cfg.insts[*i])?,
+                CfgOp::SaveExecZ { id, regs } => {
+                    let lo = lw.sreg(126);
+                    let mask = if lw.wave64 {
+                        let hi = lw.sreg(127);
+                        lw.or(lo, hi)
+                    } else {
+                        lo
+                    };
+                    let was_zero = lw.cmpc(Pred::Eq, mask, 0);
+                    let snap: Vec<(u32, Value)> = regs.iter().map(|&r| (r, lw.rd(r))).collect();
+                    saved_execz.insert(*id, (was_zero, snap));
+                }
+                CfgOp::RestoreIfExecZ { id, regs } => {
+                    let (was_zero, snap) = saved_execz.remove(id).expect("paired SaveExecZ");
+                    debug_assert_eq!(snap.len(), regs.len());
+                    for (r, old) in snap {
+                        let cur = lw.rd(r);
+                        let v = lw.sel(was_zero, old, cur);
+                        lw.wr(r, v);
+                    }
+                }
+            }
         }
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
