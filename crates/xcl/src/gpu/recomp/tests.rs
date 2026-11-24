@@ -7762,3 +7762,57 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// `geometry_es_gs_program(branches)` with its ES's tail (from the final s_setpc_b64 on)
+/// replaced by `tail`: (code, interface with `gs_start` after the new ES)
+fn geometry_with_es_tail(branches: bool, tail: &[u8]) -> (Vec<u8>, super::GsInterface) {
+    let (code, mut g) = geometry_es_gs_program(branches);
+    let s = g.gs_start.unwrap() as usize;
+    let mut es = code[..s - 4].to_vec();
+    es.extend_from_slice(tail);
+    g.gs_start = Some(es.len() as u64);
+    es.extend_from_slice(&code[s..]);
+    (es, g)
+}
+
+/// An ES with an early s_setpc_b64 on one branch: that branch goes to the GS, it does not fall
+/// through into the other branch's code, in the native wave64 form too.
+#[test]
+fn geometry_early_setpc_ends_the_es_in_every_wave_form() {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap();
+    let mut tail = Vec::new();
+    // if (s3 != 0) { s8 = 1; s_setpc } s8 = 2; s_setpc
+    tail.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)]));
+    tail.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]));
+    tail.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 129)]));
+    tail.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    tail.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 130)]));
+    tail.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let (code, g) = geometry_with_es_tail(false, &tail);
+    let s = g.gs_start.unwrap();
+    for split in [false, true] {
+        let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        // each s_setpc_b64 jumps to the GS on its own, no fall-through into the second branch
+        // (the split form emits the code once per phase)
+        let jump = if split { format!("pc = select(xcl_es_phase, 0xFFFFFFFFu, {s}u);") } else { format!("pc = {s}u;") };
+        assert_eq!(t.hlsl.matches(&jump).count(), if split { 4 } else { 2 }, "split {split}: {}", t.hlsl);
+    }
+}
+
+/// Padding between the ES's s_setpc_b64 and the GS: no structured stretch starting in it runs
+/// across `gs_start`, whose `if (pc == gs_start)` entry stays.
+#[test]
+fn geometry_padding_before_gs_start_keeps_its_entry() {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap();
+    let mut tail = Vec::new();
+    tail.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    tail.extend(e("S_NOP", "ENC_SOPP", &[("SIMM16", 0)]));
+    let (code, g) = geometry_with_es_tail(true, &tail);
+    let s = g.gs_start.unwrap();
+    for split in [false, true] {
+        let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(&format!("if (pc == {s}u)")), "split {split}: {}", t.hlsl);
+    }
+}
