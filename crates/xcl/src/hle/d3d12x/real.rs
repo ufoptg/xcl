@@ -1563,6 +1563,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut memory = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1576,22 +1577,36 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        // a held resource's tiles stay pinned until it goes (`late_release`)
+        if !held {
+            super::sparse::forget_buffer(this as usize);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
-            }
-        }
+        // the block XCL placed under it (not the title's own memory)
+        memory = match gone {
+            Some((p, _, true)) => Some(p),
+            _ => None,
+        };
     }
     if held {
-        super::late_release::hold(this as usize);
+        // its memory goes with it: a queue may still be using it
+        super::late_release::hold(this as usize, memory);
+    } else if let Some(p) = memory {
+        free_backing(p);
     }
     n
+}
+
+/// Give back the unified-memory or sparse-VRAM block XCL placed under a resource that is gone.
+pub(super) unsafe fn free_backing(p: usize) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    if u.is_sparse(p) {
+        super::sparse::free(p);
+    } else {
+        u.free(p);
+    }
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -5762,6 +5777,66 @@ mod console_format_query_tests {
             let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod held_release_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    /// A resource whose last `Release` is held (a queue still has work) keeps the unified memory
+    /// XCL placed under it until the hold ends: given back at the title's `Release`, the block
+    /// could go to the next allocation while the GPU still used it.
+    #[test]
+    fn a_held_resource_keeps_its_unified_memory_until_it_goes() {
+        unsafe {
+            if !super::super::late_release::enabled() {
+                return;
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(u) = crate::gpu::uma::get() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a queue with work in flight (it waits for a fence nobody has signalled yet) that
+            // the title has submitted to: late release waits for the queues it knows
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let raw = res.unwrap().into_raw();
+            adopt(raw, Kind::Resource);
+            // the block XCL placed under it, recorded as `place_console_buffer` does
+            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (p, 0x1_0000, true));
+
+            // the title's last Release, while the queue still has work
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(u.is_allocated(p), "the block under a held resource went back while a queue still had work");
+
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!u.is_allocated(p), "the block goes back once the held resource goes");
         }
     }
 }

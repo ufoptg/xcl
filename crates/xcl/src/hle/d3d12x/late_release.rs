@@ -21,8 +21,12 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+/// A held resource and the unified-memory or sparse-VRAM block XCL placed under it (given back
+/// when it goes: until then the queues may still use it).
+type Dead = (usize, Option<usize>);
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<Dead>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -31,7 +35,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<Dead>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -46,7 +50,7 @@ impl Held {
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<Dead> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -98,9 +102,10 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
 /// flight it goes before this returns (the queues pass a fence value at once): a title that
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
-pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+/// before. Otherwise the thread here lets it go. `memory`: the block XCL placed under it,
+/// given back (and its sparse tiles unpinned) only when it goes.
+pub unsafe fn hold(res: usize, memory: Option<usize>) {
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push((res, memory));
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -142,9 +147,15 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
+    for (res, memory) in gone {
+        // the queues are past the work that used it: its tiles and memory can go now (the
+        // tiles while it is still alive, so its address is no other resource's yet)
+        super::sparse::forget_buffer(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
+        if let Some(p) = memory {
+            super::real::free_backing(p);
+        }
     }
 }
 
@@ -180,7 +191,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push((raw, None));
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -194,7 +205,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![(raw, None)], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -204,8 +215,8 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push((0x1000, Some(0x2000)));
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![(0x1000, Some(0x2000))]);
         assert!(held.is_empty());
     }
 }

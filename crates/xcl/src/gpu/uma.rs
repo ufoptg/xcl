@@ -603,6 +603,18 @@ impl Uma {
         true
     }
 
+    /// Whether `p` is a block handed out and not freed since (tests).
+    #[cfg(test)]
+    pub fn is_allocated(&self, p: usize) -> bool {
+        {
+            let g = self.pool.lock().unwrap();
+            if p >= g.0 && p < g.1 {
+                return !g.2.contains(&p);
+            }
+        }
+        p.checked_sub(self.base).is_some_and(|off| self.inner.lock().unwrap().used.contains_key(&off))
+    }
+
     /// Bytes handed out.
     pub fn used(&self) -> usize {
         self.inner.lock().unwrap().used.values().sum()
