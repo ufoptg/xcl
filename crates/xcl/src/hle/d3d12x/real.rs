@@ -4862,8 +4862,21 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     if let Some(p) = &ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
-    for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+    mesh_stream_state(&mut out, &subs);
+    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+}
+
+/// The title's state of a console mesh stream (`subs`) in XCL's mesh pipeline `out`: blend,
+/// rasteriser, depth, formats … as the PC's. Not the RS and shaders (XCL's) nor the cached PSO,
+/// and nothing a mesh pipeline may not set: another shader stage (VS, DS, HS, GS, CS), an input
+/// layout, a strip cut value or stream output – D3D12's mesh shader rules, a pipeline with one
+/// of them is refused (E_INVALIDARG), and a console VS or GS there reached the driver as it is.
+/// Nor the topology type: the pass-through MS makes triangles whatever it said, as the VS+GS
+/// pipeline (`translated_gs_pso`), which has none.
+fn mesh_stream_state(out: &mut StreamOut, subs: &[(u32, &[u8])]) {
+    for (ty, payload) in subs {
+        // RS, VS, PS, DS, HS, GS, CS, stream output, input layout, strip cut, topology, cached PSO, AS, MS
+        let skip = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 19, 24, 25].contains(ty);
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -4879,7 +4892,112 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+}
+
+#[cfg(test)]
+mod mesh_stream_state_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// The state a title's mesh stream gives besides its RS and shaders (blend, sample mask,
+    /// rasteriser, depth, a console target format 116 and depth format 118, sample desc), and
+    /// what a mesh pipeline may not set: the VS `vs`, a null GS, an input layout of `layout`, a
+    /// strip cut value and a line topology type.
+    fn title_state(vs: &[u8], layout: &D3D12_INPUT_ELEMENT_DESC) -> StreamOut {
+        let mut s = StreamOut::default();
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, vs);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &[]);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: layout, NumElements: 1 });
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, &D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+        blend.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+        blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        blend.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        blend.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &u32::MAX);
+        let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast);
+        let keep = D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: D3D12_STENCIL_OP_KEEP, StencilDepthFailOp: D3D12_STENCIL_OP_KEEP, StencilPassOp: D3D12_STENCIL_OP_KEEP, StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS };
+        let depth = D3D12_DEPTH_STENCIL_DESC { DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO, DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS, StencilReadMask: 0xFF, StencilWriteMask: 0xFF, FrontFace: keep, BackFace: keep, ..Default::default() };
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &depth);
+        let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        rt.RTFormats[0] = DXGI_FORMAT(116);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &DXGI_FORMAT(118));
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+        s
+    }
+
+    /// The title's state goes into the mesh pipeline with the PC's formats; its VS, GS, CS,
+    /// input layout, strip cut value, topology type, stream output and cached PSO do not.
+    #[test]
+    fn a_mesh_pipeline_takes_the_titles_state_but_no_other_stage_or_input_assembler() {
+        let vs = [0x44u8, 0x58, 0x42, 0x43, 1, 2, 3, 4]; // stands for a console VS
+        let layout = D3D12_INPUT_ELEMENT_DESC::default();
+        let mut title = title_state(&vs, &layout);
+        title.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &vs);
+        title.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, &D3D12_STREAM_OUTPUT_DESC { NumEntries: 1, ..Default::default() });
+        title.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE { pCachedBlob: vs.as_ptr() as *const c_void, CachedBlobSizeInBytes: vs.len() });
+        let subs = stream_subobjects(&title.0).expect("the title's stream");
+        let mut out = StreamOut::default();
+        mesh_stream_state(&mut out, &subs);
+        let kept = stream_subobjects(&out.0).expect("XCL's stream");
+        let types: Vec<u32> = kept.iter().map(|s| s.0).collect();
+        // blend, sample mask, rasteriser, depth stencil, target formats, depth format, sample desc
+        assert_eq!(types, [8, 9, 10, 11, 15, 16, 17]);
+        assert_eq!(out.shader_bytes(), 0, "no shader of the title's");
+        let word = |ty: u32, at: usize| u32::from_le_bytes(kept.iter().find(|s| s.0 == ty).unwrap().1[at..at + 4].try_into().unwrap());
+        assert_eq!(word(15, 0), DXGI_FORMAT_R16G16B16A16_FLOAT.0 as u32, "the console's target format 116 as the PC's");
+        assert_eq!((word(15, 4), word(15, 32)), (0, 1), "one target");
+        assert_eq!(word(16, 0), DXGI_FORMAT_D24_UNORM_S8_UINT.0 as u32, "the console's D16S8 as the PC's");
+    }
+
+    /// GPU: the mesh pipeline XCL makes (RS, MS, PS + `mesh_stream_state`) of a title's mesh
+    /// stream that also names a VS (PC DXIL here, so the VS itself is valid), an input layout, a
+    /// strip cut value and a line topology type is created.
+    #[test]
+    fn gpu_a_mesh_stream_naming_a_vs_and_an_input_layout_makes_a_mesh_pipeline() {
+        use crate::gpu::recomp::{dxc, runner};
+        match runner::mesh_shaders_supported() {
+            Ok(true) => {}
+            r => return runner::skip_test(if r.is_err() { "no GPU" } else { "no mesh shaders" }),
+        }
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+            return runner::skip_test("no GPU");
+        }
+        let dev = dev.expect("device");
+        let compile = |src: &str, profile: &str| dxc::compile(src, "main", profile, &[]).unwrap_or_else(|e| panic!("{profile}: {e}"));
+        let ms = compile("struct V { float4 p : SV_Position; };\n[outputtopology(\"triangle\")]\n[numthreads(1, 1, 1)]\nvoid main(out vertices V v[3], out indices uint3 t[1]) { SetMeshOutputCounts(3, 1); v[0].p = float4(-1, -1, 0, 1); v[1].p = float4(-1, 1, 0, 1); v[2].p = float4(1, -1, 0, 1); t[0] = uint3(0, 1, 2); }\n", "ms_6_6");
+        let ps = compile("float4 main(float4 p : SV_Position) : SV_Target0 { return p; }\n", "ps_6_6");
+        let vs = compile("float4 main(float4 p : POSITION) : SV_Position { return p; }\n", "vs_6_6");
+        let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, true).expect("XCL ABI root signature");
+        let layout = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(b"POSITION\0".as_ptr()),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            ..Default::default()
+        };
+        let title = title_state(&vs, &layout);
+        let subs = stream_subobjects(&title.0).expect("the title's stream");
+        let mut out = StreamOut::default();
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs.as_raw());
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        mesh_stream_state(&mut out, &subs);
+        let dev2: ID3D12Device2 = dev.cast().expect("ID3D12Device2");
+        let pso: windows::core::Result<ID3D12PipelineState> = unsafe { dev2.CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: out.0.len(), pPipelineStateSubobjectStream: out.0.as_mut_ptr() as *mut c_void }) };
+        assert!(pso.is_ok(), "the mesh pipeline: {pso:?}");
+    }
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
