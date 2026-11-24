@@ -7775,3 +7775,45 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// Raw buffer accesses (stride 0) whose offset wraps past 2^32 are past num_records: the direct
+/// DXIL backend reads 0 and drops the store and the atomic, as for any other offset past the
+/// end (#1893).
+#[test]
+fn gpu_direct_raw_buffer_offsets_that_wrap_are_out_of_range() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x20), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x20), ("OFFEN", 1)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 256];
+    for (i, m) in mem.iter_mut().enumerate() {
+        *m = 0x1000 + i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x40, 0, 0x100, 0]); // V#: base 0x40, stride 0, 0x100 bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // lane 0 wraps, lane 1 is in range, the others are past the end
+        r[0] = [0xFFFF_FFF0, 4].get(l).copied().unwrap_or(0x200);
+        r[1] = [0xFFFF_FFFC, 4].get(l).copied().unwrap_or(0x200);
+        r[3] = 0xDEAD;
+        r[4] = 0xC0DE_0000 | l as u32;
+        r[5] = 0xDEAD;
+        r[6] = 5;
+    }
+    let k = runner::direct_kernel_full(&code, true).unwrap();
+    let r = runner::run(&k.dxil, &st, &mem).unwrap();
+    // lane 0: 32-bit sums that wrap to 0x10 (+ 0x40 = 0x50) and to 0x3C
+    assert_eq!(r.vgpr[0][3], 0, "load at voff 0xFFFF_FFF0 + OFFSET 0x20");
+    assert_eq!(r.vgpr[0][5], 0, "load at voff 0xFFFF_FFFC");
+    assert_eq!(r.mem[0x50 / 4], 0x1000 + 0x50 / 4, "store at voff 0xFFFF_FFF0 + OFFSET 0x20 dropped");
+    assert_eq!(r.mem[0x3C / 4], 0x1000 + 0x3C / 4, "atomic at voff 0xFFFF_FFFC dropped");
+    // lane 1 is in range
+    assert_eq!(r.vgpr[1][3], 0x1000 + (0x40 + 4 + 0x20) / 4, "lane 1 load");
+    assert_eq!(r.mem[(0x40 + 4 + 0x20) / 4], 0xC0DE_0001, "lane 1 store");
+    assert_eq!(r.mem[(0x40 + 4) / 4], 0x1000 + (0x40 + 4) / 4 + 5, "lane 1 atomic");
+}

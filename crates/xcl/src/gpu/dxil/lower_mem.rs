@@ -1162,9 +1162,14 @@ impl Lw {
         let act = self.act();
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let idx_ok = self.cmp(Pred::ULt, index, d2);
+        // an offset that wraps past 2^32 is past num_records too (#1893)
+        let off_ok = self.cmp(Pred::UGe, off, voff);
         let in_range = |lw: &mut Lw, bytes: Value| -> Value {
             let e = lw.add(off, bytes);
             let ok = lw.cmp(Pred::ULe, e, d2);
+            let no_wrap = lw.cmp(Pred::UGe, e, off);
+            let ok = lw.land(ok, no_wrap);
+            let ok = lw.land(ok, off_ok);
             lw.sel(szero, ok, idx_ok)
         };
         if let Some((n, signed, store, half)) = d16s {
@@ -1706,6 +1711,10 @@ impl Lw {
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let e = self.addc(off, bytes);
         let r1 = self.cmp(Pred::ULe, e, d2);
+        // an offset that wraps past 2^32 is past num_records too (#1893)
+        let (off_ok, no_wrap) = (self.cmp(Pred::UGe, off, voff), self.cmp(Pred::UGe, e, off));
+        let r1 = self.land(r1, off_ok);
+        let r1 = self.land(r1, no_wrap);
         let r2 = self.cmp(Pred::ULt, index, d2);
         let ok = self.sel(szero, r1, r2);
         let act = self.act();
