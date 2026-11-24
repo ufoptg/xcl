@@ -12,6 +12,28 @@ use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
 impl Lw {
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, 0xFFF);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -32,15 +54,6 @@ impl Lw {
         let f32 = self.s.m.f32();
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
-    fn load3f(&mut self, at: Value) -> [Value; 3] {
-        let mut r = [at; 3];
-        for (k, slot) in r.iter_mut().enumerate() {
-            let a = self.addc(at, 4 * k as u32);
-            let v = self.mem_ld(a);
-            *slot = self.f(v);
-        }
-        r
-    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -52,27 +65,34 @@ impl Lw {
         for box32 in [true, false] {
             let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
             self.guarded(is, &mut |lw| {
-                let mut child = [ones; 4];
-                for (k, c) in child.iter_mut().enumerate() {
-                    let a = lw.addc(at, 4 * k as u32);
-                    *c = lw.mem_ld(a);
-                }
+                // Box32 is 28 contiguous dwords (4 children + 4×6 box floats);
+                // Box16 is 16 contiguous dwords (4 children + 4×3 packed f16 pairs).
+                // Load the whole node in one window switch using 4-dword rawBufferLoads.
+                let at_al = lw.andc(at, !3);
+                let chunks = if box32 { 7usize } else { 4usize };
+                let words = lw.with_mem_i32s(None, chunks * 4, &mut |lw, m| {
+                    let mut out = Vec::with_capacity(chunks * 4);
+                    for j in 0..chunks {
+                        let a = lw.addc(at_al, 16 * j as u32);
+                        out.extend(lw.s.raw_load(m, a, 0xF));
+                    }
+                    out
+                });
+                let child = [words[0], words[1], words[2], words[3]];
                 let ninf = lw.s.m.f32c(0xFF80_0000);
                 let pinf = lw.s.m.f32c(0x7F80_0000);
                 let mut tn = [pinf; 4];
                 let mut id = [ones; 4];
-                for k in 0..4u32 {
+                for k in 0..4usize {
                     let (mn, mx) = if box32 {
-                        let a = lw.addc(at, 16 + 24 * k);
-                        let b = lw.addc(at, 28 + 24 * k);
-                        (lw.load3f(a), lw.load3f(b))
+                        let b = 4 + 6 * k;
+                        (
+                            [lw.f(words[b]), lw.f(words[b + 1]), lw.f(words[b + 2])],
+                            [lw.f(words[b + 3]), lw.f(words[b + 4]), lw.f(words[b + 5])],
+                        )
                     } else {
-                        let a = lw.addc(at, 16 + 12 * k);
-                        let mut h = [ones; 3];
-                        for (j, slot) in h.iter_mut().enumerate() {
-                            let x = lw.addc(a, 4 * j as u32);
-                            *slot = lw.mem_ld(x);
-                        }
+                        let b = 4 + 3 * k;
+                        let h = [words[b], words[b + 1], words[b + 2]];
                         let hx16 = lw.lshrc(h[0], 16);
                         let hy16 = lw.lshrc(h[1], 16);
                         let hz16 = lw.lshrc(h[2], 16);
@@ -102,7 +122,7 @@ impl Lw {
                     let a = lw.fmax(a, lo[2]);
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k as usize], u32::MAX);
+                    let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
                     let mut all = cv;
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
@@ -115,8 +135,8 @@ impl Lw {
                     let hit = lw.land(all, ab);
                     let x = lw.land(b0, at_);
                     let hit = lw.land(hit, x);
-                    tn[k as usize] = lw.sel(hit, a, pinf);
-                    id[k as usize] = lw.sel(hit, child[k as usize], ones);
+                    tn[k] = lw.sel(hit, a, pinf);
+                    id[k] = lw.sel(hit, child[k], ones);
                 }
                 for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
                     let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
@@ -145,9 +165,20 @@ impl Lw {
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
             let p2 = lw.addc(at, 24);
-            let v0 = lw.load3f(p0);
-            let v1 = lw.load3f(p1);
-            let v2 = lw.load3f(p2);
+            let p60 = lw.addc(at, 60);
+            let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
+            let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
+                let mut out = Vec::with_capacity(10);
+                out.extend(lw.s.raw_load(m, p0, 0x7));
+                out.extend(lw.s.raw_load(m, p1, 0x7));
+                out.extend(lw.s.raw_load(m, p2, 0x7));
+                out.push(lw.s.raw_load(m, p60, 0x1)[0]);
+                out
+            });
+            let v0 = [lw.f(words[0]), lw.f(words[1]), lw.f(words[2])];
+            let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
+            let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
+            let tw = words[9];
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -176,8 +207,6 @@ impl Lw {
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];
-            let p60 = lw.addc(at, 60);
-            let tw = lw.mem_ld(p60);
             let sh = lw.shlc(ty, 3);
             let tid = lw.shr_masked(tw, sh);
             let s0 = lw.andc(tid, 3);
@@ -240,6 +269,454 @@ impl Lw {
         let c = self.lshrc(fi, 3);
         self.uitof(c)
     }
+
+    fn smin_i32(&mut self, a: Value, b: Value) -> Value {
+        let lt = self.cmp(Pred::SLt, a, b);
+        self.sel(lt, a, b)
+    }
+
+    fn smax_i32(&mut self, a: Value, b: Value) -> Value {
+        let gt = self.cmp(Pred::SGt, a, b);
+        self.sel(gt, a, b)
+    }
+
+    /// Applies an RDNA2 3-bit `SQ_TEX_CLAMP` address mode (`0..=7`) to integer texel coordinate
+    /// `coord` against mip dimension `size` (`>= 1`). Returns `(in_bounds_coord, is_border)`.
+    fn apply_rdna2_addr_mode(&mut self, coord: Value, size: Value, mode: Value) -> (Value, Value) {
+        let z = self.c(0);
+        let one = self.c(1);
+        let max_c = self.sub(size, one);
+
+        // Wrap (mode 0): Euclidean modulo ((coord % size) + size) % size
+        let rem = self.bin(BinOp::SRem, coord, size);
+        let rem_neg = self.cmp(Pred::SLt, rem, z);
+        let rem_pos = self.add(rem, size);
+        let wrap = self.sel(rem_neg, rem_pos, rem);
+
+        // Mirror (mode 1): period 2*size
+        let period = self.shlc(size, 1);
+        let mrem = self.bin(BinOp::SRem, coord, period);
+        let mneg = self.cmp(Pred::SLt, mrem, z);
+        let mpos = self.add(mrem, period);
+        let m = self.sel(mneg, mpos, mrem);
+        let m_hi = self.cmp(Pred::SGe, m, size);
+        let p_m1 = self.sub(period, one);
+        let m_ref = self.sub(p_m1, m);
+        let mirror = self.sel(m_hi, m_ref, m);
+
+        // Clamp (modes 2, 4, 6): clamp(coord, 0, size - 1)
+        let clamped_hi = self.smin_i32(coord, max_c);
+        let clamped = self.smax_i32(z, clamped_hi);
+
+        // MirrorOnce (modes 3, 5, 7): reflect negative coords (-1 -> 0, -2 -> 1, ...) via ~coord = -1 - coord
+        let c_neg = self.cmp(Pred::SLt, coord, z);
+        let reflected = self.not(coord);
+        let mo_mag = self.sel(c_neg, reflected, coord);
+        let mo_clamped = self.smin_i32(mo_mag, max_c);
+
+        // Select final in-bounds coordinate by mode
+        let is_0 = self.cmpc(Pred::Eq, mode, 0);
+        let is_1 = self.cmpc(Pred::Eq, mode, 1);
+        let is_3 = self.cmpc(Pred::Eq, mode, 3);
+        let is_5 = self.cmpc(Pred::Eq, mode, 5);
+        let is_7 = self.cmpc(Pred::Eq, mode, 7);
+        let is_mo = self.lor(is_3, is_5);
+        let is_mo = self.lor(is_mo, is_7);
+
+        let res = self.sel(is_mo, mo_clamped, clamped);
+        let res = self.sel(is_1, mirror, res);
+        let res = self.sel(is_0, wrap, res);
+
+        // Border detection: mode 6 (ClampBorder) -> coord < 0 || coord >= size;
+        // mode 7 (MirrorOnceBorder) -> mo_mag >= size.
+        let is_6 = self.cmpc(Pred::Eq, mode, 6);
+        let oob_hi = self.cmp(Pred::SGe, coord, size);
+        let oob_6 = self.lor(c_neg, oob_hi);
+        let oob_7 = self.cmp(Pred::UGe, mo_mag, size);
+        let b6 = self.land(is_6, oob_6);
+        let b7 = self.land(is_7, oob_7);
+        let is_border = self.lor(b6, b7);
+
+        (res, is_border)
+    }
+
+    /// Evaluates RDNA2 `SQ_TEX_DEPTH_COMPARE` (`0..=7`, matching `D3D12_COMPARISON_FUNC - 1`):
+    /// `cmp_ref <OP> texel` → `1.0f` or `0.0f`.
+    fn apply_depth_compare(&mut self, cmp_ref: Value, texel: Value, func: Value) -> Value {
+        let f_false = self.s.m.i1c(false);
+        let f_true = self.s.m.i1c(true);
+        let c_lt = self.fcmp(Pred::FOLt, cmp_ref, texel);
+        let c_eq = self.fcmp(Pred::FOEq, cmp_ref, texel);
+        let c_le = self.fcmp(Pred::FOLe, cmp_ref, texel);
+        let c_gt = self.fcmp(Pred::FOGt, cmp_ref, texel);
+        let c_ne = self.fcmp(Pred::FUNe, cmp_ref, texel);
+        let c_ge = self.fcmp(Pred::FOGe, cmp_ref, texel);
+        let mut p = f_false;
+        for (k, cond) in [(1u32, c_lt), (2, c_eq), (3, c_le), (4, c_gt), (5, c_ne), (6, c_ge), (7, f_true)] {
+            let is = self.cmpc(Pred::Eq, func, k);
+            p = self.sel(is, cond, p);
+        }
+        let one = self.fc(1.0);
+        let zero = self.fc(0.0);
+        self.sel(p, one, zero)
+    }
+
+    /// Emulates explicit-LOD `image_gather4_l` / `image_gather4_l_o` (and `_c_` / `_cl` variants)
+    /// on 2D and 2DArray textures via 4 mip-level `textureLoad`s, honoring RDNA2 S# address modes,
+    /// border colors, LOD clamping, `UNORM=1` / `FORCE_UNORMALIZED`, `a16`/`d16`, and offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_gather4_lod(
+        &mut self,
+        d: &Decoded,
+        dim: u64,
+        kind: TexKind,
+        tw0: Value,
+        ssamp: u64,
+        coords: &[Value],
+        lod: Value,
+        cl: Option<Value>,
+        cmp: Option<Value>,
+        ovgpr: Option<Value>,
+        unorm: bool,
+        comps: &[u64],
+        vdata: u64,
+        d16: bool,
+        act: Value,
+    ) -> LResult<()> {
+        if comps.len() != 1 {
+            return err(d, "gather4 dmask");
+        }
+        let ch = comps[0] as usize;
+        let s0 = self.sreg(ssamp);
+        let s1 = self.sreg(ssamp + 1);
+        let s2 = self.sreg(ssamp + 2);
+        let s3 = self.sreg(ssamp + 3);
+
+        let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+
+        // Explicit LOD clamped by optional `cl`, sampler [min_lod, max_lod], and texture mip count.
+        let l = match cl {
+            Some(c) => self.fmax(lod, c),
+            None => lod,
+        };
+        let scale = self.fc(1.0 / 256.0);
+        let min_u = self.andc(s1, 0xFFF);
+        let min_f = self.uitof(min_u);
+        let min_lod = self.fmul(min_f, scale);
+        let max_u = self.lshrc(s1, 12);
+        let max_u = self.andc(max_u, 0xFFF);
+        let max_f = self.uitof(max_u);
+        let max_lod_raw = self.fmul(max_f, scale);
+        let mip_flt = self.lshrc(s2, 26);
+        let mip_flt = self.andc(mip_flt, 3);
+        let mip_none = self.cmpc(Pred::Eq, mip_flt, 0);
+        let max_lod = self.sel(mip_none, min_lod, max_lod_raw);
+        let l = self.fmax(l, min_lod);
+        let l = self.fmin(l, max_lod);
+
+        let z0 = self.c(0);
+        let one = self.c(1);
+        let dims0 = self.s.get_dimensions(tex.handle, Some(z0));
+        let num_mips = self.s.m.extract(dims0, 3);
+        let num_mips = self.umax(num_mips, one);
+        let max_mip = self.sub(num_mips, one);
+
+        let zf = self.fc(0.0);
+        let l_pos = self.fmax(l, zf);
+        let l_rnd = self.un(op::ROUND_NE, l_pos);
+        let mip_raw = self.ftoui(l_rnd);
+        let mip_i = self.umin(mip_raw, max_mip);
+
+        let dims = self.s.get_dimensions(tex.handle, Some(mip_i));
+        let w = self.s.m.extract(dims, 0);
+        let h = self.s.m.extract(dims, 1);
+        let w = self.umax(w, one);
+        let h = self.umax(h, one);
+
+        // Convert normalized coordinates to texel space unless `UNORM=1` or S# `FORCE_UNORMALIZED` is set.
+        let wf = self.uitof(w);
+        let hf = self.uitof(h);
+        let (px, py) = if unorm {
+            (coords[0], coords[1])
+        } else {
+            let force_unorm = self.lshrc(s0, 15);
+            let force_unorm = self.andc(force_unorm, 1);
+            let is_unorm = self.nz(force_unorm);
+            let sx = self.fmul(coords[0], wf);
+            let sy = self.fmul(coords[1], hf);
+            (self.sel(is_unorm, coords[0], sx), self.sel(is_unorm, coords[1], sy))
+        };
+
+        let half = self.fc(0.5);
+        let pxm = self.fsub(px, half);
+        let pym = self.fsub(py, half);
+        let fx = self.un(op::ROUND_NI, pxm);
+        let fy = self.un(op::ROUND_NI, pym);
+        let mut ix = self.ftosi(fx);
+        let mut iy = self.ftosi(fy);
+
+        if let Some(o) = ovgpr {
+            let ox = self.shlc(o, 26);
+            let ox = self.ashrc(ox, 26);
+            let oy = self.shlc(o, 18);
+            let oy = self.ashrc(oy, 26);
+            ix = self.add(ix, ox);
+            iy = self.add(iy, oy);
+        }
+
+        let ix1 = self.add(ix, one);
+        let iy1 = self.add(iy, one);
+
+        let mode_x = self.andc(s0, 7);
+        let mode_y = self.lshrc(s0, 3);
+        let mode_y = self.andc(mode_y, 7);
+
+        let (x0, bx0) = self.apply_rdna2_addr_mode(ix, w, mode_x);
+        let (x1, bx1) = self.apply_rdna2_addr_mode(ix1, w, mode_x);
+        let (y0, by0) = self.apply_rdna2_addr_mode(iy, h, mode_y);
+        let (y1, by1) = self.apply_rdna2_addr_mode(iy1, h, mode_y);
+
+        // For Texture2DArray, clamp rounded slice index to [0, array_size - 1].
+        let slice = if dim == 5 {
+            let arr = self.s.m.extract(dims, 2);
+            let arr = self.umax(arr, one);
+            let max_s = self.sub(arr, one);
+            let sr = self.un(op::ROUND_NE, coords[2]);
+            let si = self.ftosi(sr);
+            let si = self.smin_i32(si, max_s);
+            Some(self.smax_i32(z0, si))
+        } else {
+            None
+        };
+
+        // Sampler border color value for channel `ch` (matches `desc::sampler_d3d12`).
+        let btype = self.lshrc(s3, 30);
+        let is_white = self.cmpc(Pred::Eq, btype, 2);
+        let one_f = self.fc(1.0);
+        let border_val = if ch == 3 {
+            let is_opaque_black = self.cmpc(Pred::Eq, btype, 1);
+            let is_one = self.lor(is_white, is_opaque_black);
+            self.sel(is_one, one_f, zf)
+        } else {
+            self.sel(is_white, one_f, zf)
+        };
+
+        let cmp_func = self.lshrc(s0, 12);
+        let cmp_func = self.andc(cmp_func, 7);
+
+        // Gather4 2x2 texel order: (-,+), (+,+), (+,-), (-,-)
+        let taps = [(x0, y1, bx0, by1), (x1, y1, bx1, by1), (x1, y0, bx1, by0), (x0, y0, bx0, by0)];
+        let mut r = [zf; 4];
+        for (k, (cx, cy, bx, by)) in taps.into_iter().enumerate() {
+            let load_coords = match slice {
+                Some(sl) => vec![cx, cy, sl],
+                None => vec![cx, cy],
+            };
+            let loaded = self.s.texture_load(tex, Some(mip_i), &load_coords, &[]);
+            let is_b = self.lor(bx, by);
+            let val = self.sel(is_b, border_val, loaded[ch]);
+            r[k] = match cmp {
+                Some(z_ref) => self.apply_depth_compare(z_ref, val, cmp_func),
+                None => val,
+            };
+        }
+
+        let vals: Vec<Value> = r
+            .iter()
+            .map(|&v| if d16 { self.s.f32_to_f16(v) } else { self.bits(v) })
+            .collect();
+        self.image_result(vdata, &vals, d16, act)
+    }
+
+    /// Lowers non-cube `UNORM=1` sampling / `gather4` (non-`_l`) by converting unnormalized
+    /// texel coordinates (plus optional signed 6-bit texel offsets) to normalized `[0, 1]`
+    /// via `GetDimensions` before invoking the standard DXIL sample/gather op.
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_unorm_sample(
+        &mut self,
+        d: &Decoded,
+        dim: u64,
+        kind: TexKind,
+        tw0: Value,
+        ssamp: u64,
+        bias: Option<Value>,
+        cmp: Option<Value>,
+        grads: Option<(Vec<Value>, Vec<Value>)>,
+        mut coords: Vec<Value>,
+        lod: Option<Value>,
+        cl: Option<Value>,
+        ovgpr: Option<Value>,
+        gather: bool,
+        has_c: bool,
+        has_lz: bool,
+        comps: &[u64],
+        vdata: u64,
+        d16: bool,
+        act: Value,
+    ) -> LResult<()> {
+        let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
+        let s3 = self.sreg(ssamp + 3);
+        let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+        let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
+
+        let level = match (&lod, has_lz || gather) {
+            (_, true) => self.c(0),
+            (Some(l), _) => {
+                let r = self.un(op::ROUND_NE, *l);
+                let z = self.fc(0.0);
+                let r = self.fmax(r, z);
+                self.ftoui(r)
+            }
+            _ => self.c(0),
+        };
+        let dims = self.s.get_dimensions(tex.handle, Some(level));
+        let one = self.c(1);
+        let (w, hh, dd) = match dim {
+            0 | 4 => (self.s.m.extract(dims, 0), one, one),
+            1 | 5 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
+            2 => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), self.s.m.extract(dims, 2)),
+            _ => (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1), one),
+        };
+        let sizes = [self.umax(w, one), self.umax(hh, one), self.umax(dd, one)];
+        let shifts = [26u32, 18, 10];
+        let spatial_n = match dim {
+            0 | 4 => 1usize,
+            2 => 3,
+            _ => 2,
+        };
+        for k in 0..spatial_n.min(coords.len()) {
+            let mut c = coords[k];
+            if let Some(o) = ovgpr {
+                let x = self.shlc(o, shifts[k]);
+                let x = self.ashrc(x, 26);
+                let xf = self.sitof(x);
+                c = self.fadd(c, xf);
+            }
+            let sf = self.uitof(sizes[k]);
+            coords[k] = self.fdiv(c, sf);
+        }
+        let coord: Vec<Value> = match dim {
+            4 => vec![coords[0], self.un(op::ROUND_NE, coords[1])],
+            5 => vec![coords[0], coords[1], self.un(op::ROUND_NE, coords[2])],
+            _ => coords,
+        };
+        let floor = |lw: &mut Lw, l: Value| match cl {
+            Some(c) => lw.fmax(l, c),
+            None => l,
+        };
+        let r: [Value; 4] = if gather {
+            if comps.len() != 1 {
+                return err(d, "gather4 dmask");
+            }
+            match cmp {
+                Some(z) => self.s.gather_cmp(tex, smp, &coord, &[], comps[0] as u32, z),
+                None => self.s.gather(tex, smp, &coord, &[], comps[0] as u32),
+            }
+        } else {
+            match (&cmp, &grads, &lod, &bias) {
+                (Some(z), _, _, _) if has_lz || !ps => {
+                    let v = self.s.sample_cmp_level_zero(tex, smp, &coord, &[], *z);
+                    [v[0]; 4]
+                }
+                (Some(z), _, _, _) => {
+                    let v = self.s.sample_cmp(tex, smp, &coord, &[], *z, cl);
+                    [v[0]; 4]
+                }
+                (None, Some((dx, dy)), _, _) => self.s.sample_grad(tex, smp, &coord, &[], dx, dy, cl),
+                (None, None, Some(l), _) => self.s.sample_level(tex, smp, &coord, &[], *l),
+                (None, None, None, Some(b)) if ps => self.s.sample_bias(tex, smp, &coord, &[], *b, cl),
+                (None, None, None, Some(b)) => {
+                    let l = floor(self, *b);
+                    self.s.sample_level(tex, smp, &coord, &[], l)
+                }
+                _ if has_lz || !ps => {
+                    let z = self.fc(0.0);
+                    let l = floor(self, z);
+                    self.s.sample_level(tex, smp, &coord, &[], l)
+                }
+                _ => self.s.sample(tex, smp, &coord, &[], cl),
+            }
+        };
+        let rb: Vec<Value> = r.iter().map(|&v| self.bits(v)).collect();
+        let n = if gather { 4 } else { comps.len() };
+        let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+        let vals: Vec<Value> = sel
+            .iter()
+            .map(|&c| if d16 { self.s.f32_to_f16(r[c]) } else { rb[c] })
+            .collect();
+        self.image_result(vdata, &vals, d16, act)
+    }
+}
+
+#[cfg(test)]
+mod gather4_lod_tests {
+    use super::super::kernel::{translate_full, KernelOptions};
+    use super::super::validate::validate;
+    use crate::gpu::rdna2;
+
+    fn mimg(name: &str, fields: &[(&str, u64)]) -> Vec<u8> {
+        rdna2::encode(name, "ENC_MIMG", fields, None).unwrap()
+    }
+
+    fn endpgm() -> Vec<u8> {
+        rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()
+    }
+
+    fn opts() -> KernelOptions {
+        KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }
+    }
+
+    /// `image_gather4_l` and `image_gather4_l_o` (plus `_c_l`, `_c_l_o`, `UNORM=1`, `A16`, `D16`,
+    /// 2D and 2DArray) emulate explicit-LOD gather via 4 mip-level `textureLoad`s and validate cleanly.
+    #[test]
+    fn gather4_lod_variants_translate_and_validate() {
+        let cases: &[(&str, &[(&str, u64)])] = &[
+            // 2D gather4_l (normalized)
+            ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+            // 2D gather4_l_o (with texel offset + channel G)
+            ("IMAGE_GATHER4_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)]),
+            // 2DArray gather4_l (with UNORM=1 + channel A)
+            ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x8), ("DIM", 5), ("UNORM", 1)]),
+            // 2DArray gather4_l_o with A16=1 and D16=1
+            ("IMAGE_GATHER4_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x4), ("DIM", 5), ("A16", 1), ("D16", 1)]),
+            // 2D comparison gather4_c_l_o
+            ("IMAGE_GATHER4_C_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+        ];
+        for (name, fields) in cases {
+            let mut code = mimg(name, fields);
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).unwrap_or_else(|e| panic!("{name} ({fields:?}): {e}"));
+            if let Err(err) = validate(&k.dxil) {
+                panic!("{name} ({fields:?}) DXIL validation failed: {err}");
+            }
+        }
+    }
+
+    /// Non-cube `UNORM=1` sampling (`D1`, `D2`, `D3`, `D1Array`, `D2Array`, `sample_lz`, `sample_l_o`, `gather4_lz`)
+    /// translates cleanly instead of erroring with `MIMG unorm`, and validates with `dxil.dll`.
+    #[test]
+    fn non_cube_unorm_sampling_translates_and_validate() {
+        let cases: &[(&str, &[(&str, u64)])] = &[
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 0), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 4), ("UNORM", 1)]),
+            ("IMAGE_SAMPLE_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 5), ("UNORM", 1)]),
+            ("IMAGE_GATHER4_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]),
+            ("IMAGE_GATHER4_LZ_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 5), ("UNORM", 1), ("D16", 1)]),
+        ];
+        for (name, fields) in cases {
+            let mut code = mimg(name, fields);
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).unwrap_or_else(|e| panic!("{name} ({fields:?}): {e}"));
+            if let Err(err) = validate(&k.dxil) {
+                panic!("{name} ({fields:?}) DXIL validation failed: {err}");
+            }
+        }
+    }
+}
+
+impl Lw {
 
     pub fn mimg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
@@ -427,12 +904,73 @@ impl Lw {
             3 => TexKind::CubeArray,
             4 => TexKind::D1Array,
             5 => TexKind::D2Array,
+            // multisampled: the fragment index is the sample index (D3D12 MSAA resources have
+            // no FMASK; their samples are stored uncompressed)
+            6 => TexKind::D2MS,
+            7 => TexKind::D2MSArray,
             _ => return err(d, "MIMG dim"),
         };
+        let ms = matches!(dim, 6 | 7);
+        if ms && (sampling || base == "get_lod") {
+            return err(d, "MIMG sample MSAA");
+        }
+        if ms && !matches!(base, "load" | "msaa_load" | "get_resinfo") {
+            // stores / atomics need RWTexture2DMS (SM 6.7, WriteableMSAATextures)
+            return err(d, "MIMG MSAA store / atomic / load_mip");
+        }
+        if base == "msaa_load" && !ms {
+            return err(d, "image_msaa_load on a single-sampled dim");
+        }
 
         if sampling {
-            if f("UNORM") != 0 && dim != 3 {
-                return err(d, "MIMG unorm");
+            let unorm = f("UNORM") != 0;
+            let gather_l = base.starts_with("gather4") && has_l && matches!(dim, 1 | 5);
+            if gather_l || (unorm && dim != 3) {
+                let bias = i_bias.map(|i| compf(self, i));
+                let cmp = i_cmp.map(|i| compf(self, i));
+                let grads = if has_d {
+                    let dx: Vec<Value> = (0..grad_n as usize).map(|k| compf(self, i_grad + k)).collect();
+                    let dy: Vec<Value> = (0..grad_n as usize).map(|k| compf(self, i_grad + grad_n as usize + k)).collect();
+                    Some((dx, dy))
+                } else {
+                    None
+                };
+                let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
+                let lod = i_extra.map(|i| compf(self, i));
+                let cl = i_clamp.map(|i| compf(self, i));
+                let ovgpr = if has_o {
+                    if dim == 3 {
+                        return err(d, "MIMG offset cube");
+                    }
+                    Some(compu(self, 0))
+                } else {
+                    None
+                };
+                if gather_l {
+                    let lod = lod.expect("gather4_l has explicit LOD");
+                    return self.mimg_gather4_lod(d, dim, kind, tw0, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, act);
+                }
+                return self.mimg_unorm_sample(
+                    d,
+                    dim,
+                    kind,
+                    tw0,
+                    ssamp,
+                    bias,
+                    cmp,
+                    grads,
+                    coords,
+                    lod,
+                    cl,
+                    ovgpr,
+                    base.starts_with("gather4"),
+                    has_c,
+                    has_lz,
+                    &comps,
+                    vdata,
+                    d16,
+                    act,
+                );
             }
             let bias = i_bias.map(|i| compf(self, i));
             let cmp = i_cmp.map(|i| compf(self, i));
@@ -459,25 +997,7 @@ impl Lw {
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
-                    }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
-                }
-            };
+            let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
             if let Some(o) = ovgpr {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
@@ -613,9 +1133,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -623,8 +1140,7 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
@@ -636,6 +1152,19 @@ impl Lw {
                 r[c as usize]
             }).collect();
             return self.image_result(vdata, &vals, d16, act);
+        }
+
+        if base == "get_resinfo" && ms {
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+            let dims = self.s.get_dimensions(tex.handle, None);
+            let one = self.c(1);
+            let w = self.s.m.extract(dims, 0);
+            let hh = self.s.m.extract(dims, 1);
+            let dd = if dim == 7 { self.s.m.extract(dims, 2) } else { one };
+            let r = [w, hh, dd, one];
+            let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
+            return self.image_result(vdata, &vals, false, act);
         }
 
         if base == "get_resinfo" {
@@ -674,6 +1203,9 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        if ms {
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act);
+        }
         match base {
             "load" | "load_mip" => {
                 let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
@@ -789,6 +1321,72 @@ impl Lw {
             }
             _ => err(d, "MIMG"),
         }
+    }
+
+    /// `image_load` / `image_msaa_load` on a multisampled T#: `ic` = x, y, (slice,) fragment.
+    /// `image_load` reads the DMASK components of that sample; `image_msaa_load` reads the one
+    /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
+    /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value) -> LResult<()> {
+        let nc = kind.coords();
+        let frag = ic[nc];
+        let coords = ic[..nc].to_vec();
+        let samples: Vec<Value> = if base == "msaa_load" { (0..4).map(|k| self.addc(frag, k)).collect() } else { vec![frag] };
+        // per sample: the texel's four channels as raw bits
+        let tmps: Vec<[u32; 4]> = samples.iter().map(|_| [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()]).collect();
+        let z = self.c(0);
+        for t in &tmps {
+            for &v in t {
+                self.wr(v, z);
+            }
+        }
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            let samples = samples.clone();
+            let coords = coords.clone();
+            let tmps = tmps.clone();
+            self.guarded(is, &mut |lw| {
+                let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // Emit all TextureLoad calls before GetDimensions in this basic block:
+                // AMD's DXIL compiler (amdxc64.dll) hits a null-pointer dereference
+                // (0xc0000005) when dx.op.getDimensions precedes dx.op.textureLoad on a
+                // dynamically indexed heap Texture2DMS/Texture2DMSArray in the same block.
+                let loads: Vec<[Value; 4]> = samples.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let count = lw.s.m.extract(dims, 3);
+                for (si, (&sv, r)) in samples.iter().zip(loads).enumerate() {
+                    let inside = lw.cmp(Pred::ULt, sv, count);
+                    for k in 0..4 {
+                        let b = lw.bits(r[k]);
+                        let zz = lw.c(0);
+                        let b = lw.sel(inside, b, zz);
+                        lw.wr(tmps[si][k], b);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let raw: Vec<Value> = if base == "msaa_load" {
+            let c = comps.first().copied().unwrap_or(0) as usize;
+            tmps.iter().map(|t| self.rd(t[c])).collect()
+        } else {
+            comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
+        };
+        let vals: Vec<Value> = if d16 {
+            raw.iter()
+                .map(|&x| {
+                    let fx = self.f(x);
+                    let h = self.s.f32_to_f16(fx);
+                    let lo = self.andc(x, 0xFFFF);
+                    let fl = self.cmpc(Pred::Eq, cls, 0);
+                    self.sel(fl, h, lo)
+                })
+                .collect()
+        } else {
+            raw
+        };
+        self.image_result(vdata, &vals, d16, act)
     }
 
     /// A compare-exchange loop on a texel (`rmw32` on an `At::Ref` texel).
