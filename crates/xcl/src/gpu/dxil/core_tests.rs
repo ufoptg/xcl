@@ -383,3 +383,31 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// `v_cvt_f16_u16` and `v_cvt_f16_i16` take 16-bit integer sources, not f16: inline float
+/// constants (`240..=248`) must decode as f32 bit patterns (matching `emit.rs` and RDNA2 ISA),
+/// not f16 constants.
+#[test]
+fn v_cvt_f16_int_decodes_inline_float_constants_as_f32() {
+    use crate::gpu::recomp::{dxc, runner, Options};
+    let code = prog(&[
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 0), ("SRC0", 242)], None), // f32 1.0 = 0x3F80_0000 -> low16 = 0
+        ("V_CVT_F16_I16", "ENC_VOP1", &[("VDST", 1), ("SRC0", 243)], None), // f32 -1.0 = 0xBF80_0000 -> low16 = 0
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 2), ("SRC0", 248)], None), // f32 1/(2pi) = 0x3E22_F983 -> low16 = 0xF983
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct DXIL failed: {e}"));
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32");
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let st = runner::KernelState::default();
+    let direct = runner::run(&dxil, &st, &[]).unwrap();
+    let t = crate::gpu::recomp::translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+    for r in 0..=2 {
+        assert_eq!(direct.vgpr[0][r], hlsl.vgpr[0][r], "v{r}: {:#x} vs {:#x}", direct.vgpr[0][r], hlsl.vgpr[0][r]);
+    }
+}
