@@ -178,7 +178,36 @@ type Start = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
 type Destroy = unsafe extern "system" fn(*mut c_void);
 type Release = unsafe extern "system" fn(*mut c_void) -> u32;
 
+struct AudioGuard {
+    eng: *mut c_void,
+    master: *mut c_void,
+    voices: [*mut c_void; 3],
+}
+
+impl Drop for AudioGuard {
+    fn drop(&mut self) {
+        unsafe {
+            for v in self.voices {
+                if !v.is_null() {
+                    method::<Destroy>(v, 18)(v);
+                }
+            }
+            if !self.master.is_null() {
+                method::<Destroy>(self.master, 18)(self.master);
+            }
+            if !self.eng.is_null() {
+                method::<Release>(self.eng, 2)(self.eng);
+            }
+        }
+    }
+}
+
 pub fn xaudio2_console_voices() -> Result<(), String> {
+    // Declared before `guard` so Rust's LIFO drop order destroys all live voices
+    // and releases the engine before freeing submitted buffers on any early exit.
+    let mut packet = vec![0u8; 2048];
+    let samples = vec![0i16; 2400]; // 0.05 s
+    let mut opus_block = vec![0u8; 2048];
     unsafe {
         let mut eng: *mut c_void = std::ptr::null_mut();
         // 0x1 / 0x40: flags the Windows engine does not accept; 0x3c: a console core mask
@@ -186,15 +215,15 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if hr != 0 || eng.is_null() {
             return Err(format!("XAudio2Create → {:#x}", hr as u32));
         }
-        let release: Release = method(eng, 2);
+        let mut guard = AudioGuard { eng, master: std::ptr::null_mut(), voices: [std::ptr::null_mut(); 3] };
         let device = super::wide("console-audio-endpoint-0");
         let mut master: *mut c_void = std::ptr::null_mut();
         let hr = method::<CreateMasteringVoice>(eng, 7)(eng, &mut master, 2, 48_000, 0x4, device.as_ptr(), std::ptr::null(), 6);
         if hr < 0 {
             println!("  (no audio device: CreateMasteringVoice → {:#x}; skipping voices)", hr as u32);
-            release(eng);
             return Ok(());
         }
+        guard.master = master;
 
         // XMA2 mono 48 kHz – decoded to PCM16 by XCL (Windows XAudio2 cannot play it natively)
         let xma = Xma2Format {
@@ -214,6 +243,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if hr != 0 || xv.is_null() {
             return Err(format!("CreateSourceVoice(XMA2) → {:#x}", hr as u32));
         }
+        guard.voices[0] = xv;
         let mut det = VoiceDetails::default();
         method::<GetVoiceDetails>(xv, 0)(xv, &mut det);
         let (ch, rate) = (det.channels, det.rate);
@@ -221,7 +251,6 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
             return Err(format!("XMA2 voice: {ch} ch., {rate} Hz"));
         }
         let _ = method::<SetVolume>(xv, 12)(xv, 0.0, 0); // stay silent during automated tests
-        let mut packet = vec![0u8; 2048];
         packet[..XMA2_MONO_48K_PREFIX.len()].copy_from_slice(XMA2_MONO_48K_PREFIX);
         let xb = Buffer {
             flags: END_OF_STREAM,
@@ -255,7 +284,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if hr != 0 || pv.is_null() {
             return Err(format!("CreateSourceVoice(PCM) → {:#x}", hr as u32));
         }
-        let samples = vec![0i16; 2400]; // 0.05 s
+        guard.voices[1] = pv;
         let pb = Buffer {
             flags: END_OF_STREAM,
             audio_bytes: 4800,
@@ -278,13 +307,13 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if hr != 0 || ov.is_null() {
             return Err(format!("CreateSourceVoice(Opus) → {:#x}", hr as u32));
         }
+        guard.voices[2] = ov;
         let mut odet = VoiceDetails::default();
         method::<GetVoiceDetails>(ov, 0)(ov, &mut odet);
         if (odet.channels, odet.rate) != (1, 48_000) {
             return Err(format!("Opus voice: {} ch., {} Hz", { odet.channels }, { odet.rate }));
         }
         let _ = method::<SetVolume>(ov, 12)(ov, 0.0, 0); // stay silent during automated tests
-        let mut opus_block = vec![0u8; 2048];
         let mut pos = 0usize;
         for &pkt in OPUS_PACKETS {
             opus_block[pos..pos + 2].copy_from_slice(&(pkt.len() as u16).to_le_bytes());
@@ -348,10 +377,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
             return Err(format!("Opus buffer ended after {oms} ms (expected ≈100)"));
         }
         println!("  (XMA2 buffer ended after {ms} ms; Opus buffer ended after {oms} ms)");
-        for v in [xv, pv, ov, master] {
-            method::<Destroy>(v, 18)(v);
-        }
-        release(eng);
+        drop(guard);
         drop((packet, samples, opus_block));
         Ok(())
     }
