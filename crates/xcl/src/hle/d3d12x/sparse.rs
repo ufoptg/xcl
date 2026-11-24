@@ -1530,15 +1530,16 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                 PHASES[3].load(Ordering::Relaxed)
             );
             let looks = WATCH[2].load(Ordering::Relaxed).max(1);
-            let (cool, cooled, warmed) = super::sparse_cool::counts();
+            let (cool, cooled, warmed, pass_ms) = super::sparse_cool::counts();
             crate::xlog_info!(
-                "write-watch look: {:.3} ms and {} MB a look over {} looks; sparse tiles read-only {} (cooled {}, warmed {})",
+                "write-watch look: {:.3} ms and {} MB a look over {} looks; sparse tiles read-only {} (cooled {}, warmed {}, cooling pass {:.3} ms a look)",
                 WATCH[0].load(Ordering::Relaxed) as f64 / 1000.0 / looks as f64,
                 WATCH[3].load(Ordering::Relaxed) / looks >> 20,
                 looks,
                 cool,
                 cooled,
-                warmed
+                warmed,
+                pass_ms / looks as f64
             );
         }
     }

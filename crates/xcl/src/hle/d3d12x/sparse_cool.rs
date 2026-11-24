@@ -34,6 +34,11 @@ const COOL_PER_LOOK: usize = 64;
 const EXAMINE_PER_LOOK: usize = 1024;
 /// `Quiet::last` of a tile this module made read-only (skipped until a write marks it again)
 const COOLED: u64 = u64::MAX;
+/// looks between rebuilds of the tile list at most: the title maps and unmaps tiles all through a
+/// load, and rebuilding the whole list each time cost more than the look it saves. A stale list
+/// is harmless: a tile mapped since waits for the next rebuild, one unmapped since fails
+/// `cool_tile`'s query.
+const REBUILD_EVERY: u64 = 64;
 
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -52,8 +57,8 @@ pub fn enabled() -> bool {
 static COOL: RwLock<Option<HashSet<usize>>> = RwLock::new(None);
 /// changes when a tile is cooled or warmed: the look's cached ranges are made again
 static GEN: AtomicU64 = AtomicU64::new(0);
-/// tiles cooled and warmed so far, for the timing line
-static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// tiles cooled and warmed so far, and µs spent in `after_look`, for the timing line
+static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 struct Quiet {
     look: u64,
@@ -63,6 +68,7 @@ struct Quiet {
     /// per tile: the look it was last seen written (or first seen) in, or `COOLED`
     last: Vec<u64>,
     tiles_gen: u64,
+    built_at: u64,
     cursor: usize,
 }
 
@@ -72,10 +78,10 @@ pub fn gen() -> u64 {
     GEN.load(Ordering::Acquire)
 }
 
-/// (tiles read-only now, cooled so far, warmed so far)
-pub fn counts() -> (usize, u64, u64) {
+/// (tiles read-only now, cooled so far, warmed so far, ms spent in the cooling pass)
+pub fn counts() -> (usize, u64, u64, f64) {
     let now = COOL.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len());
-    (now, COUNTS[0].load(Ordering::Relaxed), COUNTS[1].load(Ordering::Relaxed))
+    (now, COUNTS[0].load(Ordering::Relaxed), COUNTS[1].load(Ordering::Relaxed), COUNTS[2].load(Ordering::Relaxed) as f64 / 1000.0)
 }
 
 fn install() {
@@ -194,6 +200,12 @@ pub unsafe fn after_look(dirty: &[usize], tiles_gen: u64, tiles: impl FnOnce() -
     if !enabled() {
         return;
     }
+    let t0 = std::time::Instant::now();
+    after_look_inner(dirty, tiles_gen, tiles);
+    COUNTS[2].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+unsafe fn after_look_inner(dirty: &[usize], tiles_gen: u64, tiles: impl FnOnce() -> Vec<usize>) {
     let mut g = QUIET.lock().unwrap_or_else(|e| e.into_inner());
     let q = g.get_or_insert_with(|| Quiet {
         look: 0,
@@ -201,17 +213,19 @@ pub unsafe fn after_look(dirty: &[usize], tiles_gen: u64, tiles: impl FnOnce() -
         index: HashMap::new(),
         last: Vec::new(),
         tiles_gen: u64::MAX,
+        built_at: 0,
         cursor: 0,
     });
     q.look += 1;
     let look = q.look;
-    if q.tiles_gen != tiles_gen {
+    if q.tiles_gen != tiles_gen && (q.tiles.is_empty() || look - q.built_at >= REBUILD_EVERY) {
         let tiles = tiles();
         let last: Vec<u64> = tiles.iter().map(|t| q.index.get(t).map_or(look, |&i| q.last[i as usize])).collect();
         q.index = tiles.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
         q.tiles = tiles;
         q.last = last;
         q.tiles_gen = tiles_gen;
+        q.built_at = look;
         q.cursor = 0;
     }
     // a written tile (a cooled one too: its write faulted and warmed it) is quiet again from now
