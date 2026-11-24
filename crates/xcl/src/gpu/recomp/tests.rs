@@ -7594,6 +7594,38 @@ fn fspx_containers_translate_and_compile() {
     assert_eq!(ok, n);
 }
 
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
+}
+
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
 /// inner loops, loops whose end is an inner loop's – give the same state as structured code and as
 /// the block dispatcher (`structured: false`).
@@ -7729,4 +7761,146 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Compute shaders only declare `globallycoherent` on their flat memory windows (`mem`, `mem1`…
+/// and `XCL_HEAP_WINDOWS` heap views) when the program uses cross-workgroup coherence: memory
+/// atomics, `GLC`/`DLC`/`SLC` memory ops, or cache invalidations. Both the HLSL and direct DXIL
+/// backends follow the same predicate.
+#[test]
+fn compute_globallycoherent_only_when_needed() {
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let prog = |insts: &[(&str, &str, &[(&str, u64)])]| {
+        let mut c = Vec::new();
+        for &(n, e, f) in insts {
+            c.extend(enc(n, e, f));
+        }
+        c.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+        c
+    };
+
+    // Plain compute: SMEM + MUBUF load/store + LDS + s_barrier, no GLC/DLC/SLC/atomics/inv.
+    let plain = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0)]),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]),
+        ("S_BARRIER", "ENC_SOPP", &[]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
+    ]);
+
+    let coherent_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("smem glc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)])])),
+        ("smem dlc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("DLC", 1)])])),
+        ("mubuf glc", prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)])])),
+        ("global dlc", prog(&[("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0), ("DLC", 1)])])),
+        ("mubuf slc", prog(&[("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("SLC", 1)])])),
+        ("buffer_atomic", prog(&[("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)])])),
+        ("global_atomic", prog(&[("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("DATA", 2), ("SADDR", 0)])])),
+        ("flat_atomic", prog(&[("FLAT_ATOMIC_ADD", "ENC_FLAT", &[("VDST", 1), ("ADDR", 2), ("DATA", 4)])])),
+        ("s_dcache_inv", prog(&[("S_DCACHE_INV", "ENC_SMEM", &[])])),
+        ("s_gl1_inv", prog(&[("S_GL1_INV", "ENC_SMEM", &[])])),
+        ("buffer_gl0_inv", prog(&[("BUFFER_GL0_INV", "ENC_MUBUF", &[])])),
+        ("buffer_gl1_inv", prog(&[("BUFFER_GL1_INV", "ENC_MUBUF", &[])])),
+    ];
+
+    for (windows, heap) in [(1u32, false), (2, false), (2, true)] {
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: windows, heap_windows: heap, ..Default::default() };
+        let t = translate(&plain, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(!t.hlsl.contains("globallycoherent"), "plain CS (windows={windows}, heap={heap}) must not emit globallycoherent:\n{}", t.hlsl);
+
+        for (label, code) in &coherent_cases {
+            let t = translate(code, &opt).unwrap();
+            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
+            assert!(t.hlsl.contains("globallycoherent"), "{label} (windows={windows}, heap={heap}) must emit globallycoherent");
+            if heap {
+                assert!(t.hlsl.contains("#define XCL_MW globallycoherent RWByteAddressBuffer"), "{label}: heap window accessor must be globallycoherent");
+            }
+        }
+    }
+
+    // Kernel mode stays non-coherent even with atomics.
+    let k = translate(&coherent_cases[6].1, &Options { mode: Mode::Kernel, wave64: false, ..Default::default() }).unwrap();
+    assert!(!k.hlsl.contains("globallycoherent"), "kernel mode must not emit globallycoherent");
+
+    // Direct DXIL backend: check the IsGloballyCoherent bit (0x4000) in annotateHandle properties
+    // (RAW_BUFFER=11 | IsUAV=0x1000 = 4107 vs RAW_BUFFER=11 | IsUAV=0x1000 | IsGloballyCoherent=0x4000 = 20491).
+    for mw in [1u32, super::HEAP_WINDOWS | 2] {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
+        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &cs).unwrap();
+        let coh_k = crate::gpu::dxil::kernel::translate_compute(&coherent_cases[6].1, o, &cs).unwrap();
+        if super::dxc::location().is_ok() {
+            let plain_dis = crate::gpu::dxil::validate::disassemble(&plain_k.dxil).unwrap();
+            let coh_dis = crate::gpu::dxil::validate::disassemble(&coh_k.dxil).unwrap();
+            assert!(!plain_dis.contains("i32 20491"), "direct DXIL plain CS (mw={mw:#x}) must not set IsGloballyCoherent:\n{plain_dis}");
+            assert!(coh_dis.contains("i32 20491"), "direct DXIL atomic CS (mw={mw:#x}) must set IsGloballyCoherent:\n{coh_dis}");
+        }
+    }
+}
+
+/// Real GPU check of both non-coherent (cached) and coherent (cross-workgroup atomic + GLC)
+/// compute shaders across HLSL and direct DXIL.
+#[test]
+fn gpu_compute_coherent_and_cached_loads() {
+    if !gpu_ready() {
+        return;
+    }
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+
+    // 1. Plain cached compute: each thread reads a uniform dword via SMEM (s[0:1] = 0x100) and
+    //    writes (val + group_id * 32 + tid) to mem[0x200 + (group_id * 32 + tid) * 4].
+    let mut plain = Vec::new();
+    plain.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]));
+    plain.extend(enc("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 133)])); // s3 = tgid * 32
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 3), ("VSRC1", 0)])); // v1 = tgid * 32 + v0
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 1)])); // v2 = mem[0x100] + idx
+    plain.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 1)])); // v3 = idx * 4
+    plain.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)]));
+    plain.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x200)]));
+    plain.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_plain = translate(&plain, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_plain.complete(), "{:?}", t_plain.unsupported_why);
+    assert!(!t_plain.hlsl.contains("globallycoherent"));
+    let dxil_plain_hlsl = super::dxc::compile(&t_plain.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_plain_direct = crate::gpu::dxil::kernel::translate_compute(&plain, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
+
+    let mut io = vec![0u32; super::KERNEL_SGPRS];
+    io[0] = 0x100;
+    let mut mem = vec![0u32; 0x400 / 4];
+    mem[0x100 / 4] = 0x1234_0000;
+    for (tag, dxil) in [("hlsl", &dxil_plain_hlsl), ("direct", &dxil_plain_direct)] {
+        let out = runner::dispatch(dxil, [4, 1, 1], &io, &mem).unwrap();
+        for idx in 0..128usize {
+            assert_eq!(out[(0x200 + idx * 4) / 4], 0x1234_0000 + idx as u32, "{tag} plain cached idx={idx}");
+        }
+    }
+
+    // 2. Cross-workgroup coherent compute: 16 groups of 32 threads atomically increment a shared
+    //    counter at mem[0x100] and record their returned ticket at mem[0x200 + ticket * 4].
+    let mut coh = Vec::new();
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)])); // v1 = 0
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)])); // v2 = 1
+    coh.extend(enc("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 1), ("DATA", 2), ("SADDR", 0), ("GLC", 1)]));
+    coh.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 3)])); // v4 = ticket * 4
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)]));
+    coh.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0x200), ("GLC", 1)]));
+    coh.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_coh = translate(&coh, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_coh.complete(), "{:?}", t_coh.unsupported_why);
+    assert!(t_coh.hlsl.contains("globallycoherent"));
+    let dxil_coh_hlsl = super::dxc::compile(&t_coh.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_coh_direct = crate::gpu::dxil::kernel::translate_compute(&coh, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
+
+    let mem2 = vec![0u32; (0x200 + 512 * 4) / 4];
+    for (tag, dxil) in [("hlsl", &dxil_coh_hlsl), ("direct", &dxil_coh_direct)] {
+        let out = runner::dispatch(dxil, [16, 1, 1], &io, &mem2).unwrap();
+        assert_eq!(out[0x100 / 4], 512, "{tag} coherent cross-group counter");
+        for ticket in 0..512usize {
+            assert_eq!(out[(0x200 + ticket * 4) / 4], ticket as u32, "{tag} coherent ticket={ticket}");
+        }
+    }
 }

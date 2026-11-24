@@ -64,6 +64,8 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
+    pub coherent_mem: bool,
 }
 
 /// Instructions without an effect in this execution model.
@@ -490,6 +492,7 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            coherent_mem: false,
         }
     }
 
@@ -4241,8 +4244,9 @@ impl Em {
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        // memory coherent across the GPU only when the program actually uses those; otherwise
+        // keep the cached (faster) view
+        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
         let windows = self.opt.mem_windows.clamp(1, 4);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
@@ -4703,7 +4707,7 @@ impl Em {
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
             h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h

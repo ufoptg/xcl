@@ -52,6 +52,10 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod dxc;
+pub mod dxil;
+pub mod lane_masks;
+pub mod lower;
+pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
@@ -59,6 +63,7 @@ pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
+pub mod ssa;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -628,6 +633,12 @@ impl Conts {
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
+/// Each guard of the structured form lists every pending skip flag, so it grows with the
+/// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),
+/// the next largest 61 (#1307).
+const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
@@ -1377,7 +1388,36 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
+///
+/// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
+/// then reading what other groups wrote) relies on `GLC`/`DLC`/`SLC`, memory atomics, or
+/// cache invalidation on the console. Programs without any of those only access read-only
+/// or disjointly written memory within the dispatch, so keeping their flat memory windows
+/// un-qualified lets the GPU cache them in L1.
+pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return true;
+        }
+        matches!(
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
         normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
@@ -1423,6 +1463,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
@@ -1482,6 +1523,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
+                return translate(program, &Options { structured: false, ..opt.clone() });
+            }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
