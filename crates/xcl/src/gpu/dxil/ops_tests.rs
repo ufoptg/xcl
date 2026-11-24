@@ -1112,3 +1112,52 @@ fn dx_op_attrs_match_dxc() {
     }
     assert!(n > 50, "only {n} declarations found");
 }
+
+/// 64-bit typed `image_atomic_*` (`DMASK = 0x3`, or `0xF` for `cmpswap`/`fcmpswap`)
+/// lowers to SM 6.6 `atomicBinOp.i64` / `atomicCompareExchange.i64` on `RWTexture*<u64|i64>`
+/// and passes DXIL validation, while 32-bit `cmpswap` (`DMASK = 0x3`) stays 32-bit.
+#[test]
+fn direct_image_atomic_64bit_validates() {
+    use crate::gpu::dxil::kernel::{self, KernelOptions};
+    use crate::gpu::rdna2;
+    let mimg = |name: &str, f: &[(&str, u64)]| rdna2::encode(name, "ENC_MIMG", f, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut code = Vec::new();
+    for (op, glc, dim) in [
+        ("IMAGE_ATOMIC_ADD", 1, 1),
+        ("IMAGE_ATOMIC_SUB", 1, 1),
+        ("IMAGE_ATOMIC_SMIN", 0, 1),
+        ("IMAGE_ATOMIC_UMIN", 1, 1),
+        ("IMAGE_ATOMIC_SMAX", 1, 5),
+        ("IMAGE_ATOMIC_UMAX", 0, 5),
+        ("IMAGE_ATOMIC_AND", 0, 1),
+        ("IMAGE_ATOMIC_OR", 0, 1),
+        ("IMAGE_ATOMIC_XOR", 1, 1),
+        ("IMAGE_ATOMIC_SWAP", 1, 1),
+        ("IMAGE_ATOMIC_INC", 1, 1),
+        ("IMAGE_ATOMIC_DEC", 1, 1),
+        ("IMAGE_ATOMIC_FMIN", 1, 1),
+        ("IMAGE_ATOMIC_FMAX", 1, 1),
+    ] {
+        code.extend(mimg(op, &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", dim), ("UNORM", 1), ("GLC", glc)]));
+    }
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FCMPSWAP", &[("VDATA", 18), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 5), ("UNORM", 1), ("GLC", 0)]));
+    code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let dxil = kernel::translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("translate 64-bit image atomics");
+    check(&dxil);
+    let dis = super::validate::disassemble(&dxil).expect("disassemble");
+    assert!(dis.contains("@dx.op.atomicBinOp.i64("), "expected atomicBinOp.i64:\n{dis}");
+    assert!(dis.contains("@dx.op.atomicCompareExchange.i64("), "expected atomicCompareExchange.i64:\n{dis}");
+    assert!(dis.contains("RWTexture2D<U64>") && dis.contains("RWTexture2D<I64>"), "expected U64 and I64 RWTexture2D annotations:\n{dis}");
+    assert!(dis.contains("RWTexture2DArray<I64>") && dis.contains("RWTexture2DArray<U64>"), "expected U64 and I64 RWTexture2DArray annotations:\n{dis}");
+
+    // 32-bit IMAGE_ATOMIC_CMPSWAP uses DMASK=0x3 (2 dwords: new + cmp) and must remain 32-bit.
+    let mut c32 = mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]);
+    c32.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let dxil32 = kernel::translate(&c32, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("translate 32-bit cmpswap");
+    check(&dxil32);
+    let dis32 = super::validate::disassemble(&dxil32).expect("disassemble 32-bit");
+    assert!(dis32.contains("@dx.op.atomicCompareExchange.i32("), "32-bit cmpswap must emit i32:\n{dis32}");
+    assert!(!dis32.contains("@dx.op.atomicCompareExchange.i64("), "32-bit cmpswap must not emit i64:\n{dis32}");
+}

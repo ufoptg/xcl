@@ -12,6 +12,28 @@ use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
 impl Lw {
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, 0xFFF);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -32,15 +54,6 @@ impl Lw {
         let f32 = self.s.m.f32();
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
-    fn load3f(&mut self, at: Value) -> [Value; 3] {
-        let mut r = [at; 3];
-        for (k, slot) in r.iter_mut().enumerate() {
-            let a = self.addc(at, 4 * k as u32);
-            let v = self.mem_ld(a);
-            *slot = self.f(v);
-        }
-        r
-    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -52,27 +65,34 @@ impl Lw {
         for box32 in [true, false] {
             let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
             self.guarded(is, &mut |lw| {
-                let mut child = [ones; 4];
-                for (k, c) in child.iter_mut().enumerate() {
-                    let a = lw.addc(at, 4 * k as u32);
-                    *c = lw.mem_ld(a);
-                }
+                // Box32 is 28 contiguous dwords (4 children + 4×6 box floats);
+                // Box16 is 16 contiguous dwords (4 children + 4×3 packed f16 pairs).
+                // Load the whole node in one window switch using 4-dword rawBufferLoads.
+                let at_al = lw.andc(at, !3);
+                let chunks = if box32 { 7usize } else { 4usize };
+                let words = lw.with_mem_i32s(None, chunks * 4, &mut |lw, m| {
+                    let mut out = Vec::with_capacity(chunks * 4);
+                    for j in 0..chunks {
+                        let a = lw.addc(at_al, 16 * j as u32);
+                        out.extend(lw.s.raw_load(m, a, 0xF));
+                    }
+                    out
+                });
+                let child = [words[0], words[1], words[2], words[3]];
                 let ninf = lw.s.m.f32c(0xFF80_0000);
                 let pinf = lw.s.m.f32c(0x7F80_0000);
                 let mut tn = [pinf; 4];
                 let mut id = [ones; 4];
-                for k in 0..4u32 {
+                for k in 0..4usize {
                     let (mn, mx) = if box32 {
-                        let a = lw.addc(at, 16 + 24 * k);
-                        let b = lw.addc(at, 28 + 24 * k);
-                        (lw.load3f(a), lw.load3f(b))
+                        let b = 4 + 6 * k;
+                        (
+                            [lw.f(words[b]), lw.f(words[b + 1]), lw.f(words[b + 2])],
+                            [lw.f(words[b + 3]), lw.f(words[b + 4]), lw.f(words[b + 5])],
+                        )
                     } else {
-                        let a = lw.addc(at, 16 + 12 * k);
-                        let mut h = [ones; 3];
-                        for (j, slot) in h.iter_mut().enumerate() {
-                            let x = lw.addc(a, 4 * j as u32);
-                            *slot = lw.mem_ld(x);
-                        }
+                        let b = 4 + 3 * k;
+                        let h = [words[b], words[b + 1], words[b + 2]];
                         let hx16 = lw.lshrc(h[0], 16);
                         let hy16 = lw.lshrc(h[1], 16);
                         let hz16 = lw.lshrc(h[2], 16);
@@ -102,7 +122,7 @@ impl Lw {
                     let a = lw.fmax(a, lo[2]);
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k as usize], u32::MAX);
+                    let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
                     let mut all = cv;
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
@@ -115,8 +135,8 @@ impl Lw {
                     let hit = lw.land(all, ab);
                     let x = lw.land(b0, at_);
                     let hit = lw.land(hit, x);
-                    tn[k as usize] = lw.sel(hit, a, pinf);
-                    id[k as usize] = lw.sel(hit, child[k as usize], ones);
+                    tn[k] = lw.sel(hit, a, pinf);
+                    id[k] = lw.sel(hit, child[k], ones);
                 }
                 for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
                     let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
@@ -145,9 +165,20 @@ impl Lw {
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
             let p2 = lw.addc(at, 24);
-            let v0 = lw.load3f(p0);
-            let v1 = lw.load3f(p1);
-            let v2 = lw.load3f(p2);
+            let p60 = lw.addc(at, 60);
+            let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
+            let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
+                let mut out = Vec::with_capacity(10);
+                out.extend(lw.s.raw_load(m, p0, 0x7));
+                out.extend(lw.s.raw_load(m, p1, 0x7));
+                out.extend(lw.s.raw_load(m, p2, 0x7));
+                out.push(lw.s.raw_load(m, p60, 0x1)[0]);
+                out
+            });
+            let v0 = [lw.f(words[0]), lw.f(words[1]), lw.f(words[2])];
+            let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
+            let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
+            let tw = words[9];
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -176,8 +207,6 @@ impl Lw {
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];
-            let p60 = lw.addc(at, 60);
-            let tw = lw.mem_ld(p60);
             let sh = lw.shlc(ty, 3);
             let tid = lw.shr_masked(tw, sh);
             let s0 = lw.andc(tid, 3);
@@ -427,8 +456,23 @@ impl Lw {
             3 => TexKind::CubeArray,
             4 => TexKind::D1Array,
             5 => TexKind::D2Array,
+            // multisampled: the fragment index is the sample index (D3D12 MSAA resources have
+            // no FMASK; their samples are stored uncompressed)
+            6 => TexKind::D2MS,
+            7 => TexKind::D2MSArray,
             _ => return err(d, "MIMG dim"),
         };
+        let ms = matches!(dim, 6 | 7);
+        if ms && (sampling || base == "get_lod") {
+            return err(d, "MIMG sample MSAA");
+        }
+        if ms && !matches!(base, "load" | "msaa_load" | "get_resinfo") {
+            // stores / atomics need RWTexture2DMS (SM 6.7, WriteableMSAATextures)
+            return err(d, "MIMG MSAA store / atomic / load_mip");
+        }
+        if base == "msaa_load" && !ms {
+            return err(d, "image_msaa_load on a single-sampled dim");
+        }
 
         if sampling {
             if f("UNORM") != 0 && dim != 3 {
@@ -459,25 +503,7 @@ impl Lw {
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
-                    }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
-                }
-            };
+            let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
             if let Some(o) = ovgpr {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
@@ -613,9 +639,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -623,8 +646,7 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
@@ -636,6 +658,19 @@ impl Lw {
                 r[c as usize]
             }).collect();
             return self.image_result(vdata, &vals, d16, act);
+        }
+
+        if base == "get_resinfo" && ms {
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+            let dims = self.s.get_dimensions(tex.handle, None);
+            let one = self.c(1);
+            let w = self.s.m.extract(dims, 0);
+            let hh = self.s.m.extract(dims, 1);
+            let dd = if dim == 7 { self.s.m.extract(dims, 2) } else { one };
+            let r = [w, hh, dd, one];
+            let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
+            return self.image_result(vdata, &vals, false, act);
         }
 
         if base == "get_resinfo" {
@@ -674,6 +709,9 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        if ms {
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act);
+        }
         match base {
             "load" | "load_mip" => {
                 let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
@@ -745,8 +783,13 @@ impl Lw {
             }
             _ if base.starts_with("atomic_") => {
                 let opn = &base[7..];
-                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
                 let glc = f("GLC") == 1;
+                let is_cmpswap = opn == "cmpswap" || opn == "fcmpswap";
+                let wide64 = if is_cmpswap { comps.len() == 4 } else { comps.len() == 2 };
+                if wide64 {
+                    return self.mimg_atomic64(d, opn, &ic, tw0, lkind, vdata, glc, act);
+                }
+                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
                 let ui = self.addc(tw0, 1);
                 let signed = opn == "smin" || opn == "smax";
                 let ct = if signed { CompType::I32 } else { CompType::U32 };
@@ -791,6 +834,72 @@ impl Lw {
         }
     }
 
+    /// `image_load` / `image_msaa_load` on a multisampled T#: `ic` = x, y, (slice,) fragment.
+    /// `image_load` reads the DMASK components of that sample; `image_msaa_load` reads the one
+    /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
+    /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value) -> LResult<()> {
+        let nc = kind.coords();
+        let frag = ic[nc];
+        let coords = ic[..nc].to_vec();
+        let samples: Vec<Value> = if base == "msaa_load" { (0..4).map(|k| self.addc(frag, k)).collect() } else { vec![frag] };
+        // per sample: the texel's four channels as raw bits
+        let tmps: Vec<[u32; 4]> = samples.iter().map(|_| [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()]).collect();
+        let z = self.c(0);
+        for t in &tmps {
+            for &v in t {
+                self.wr(v, z);
+            }
+        }
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            let samples = samples.clone();
+            let coords = coords.clone();
+            let tmps = tmps.clone();
+            self.guarded(is, &mut |lw| {
+                let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // Emit all TextureLoad calls before GetDimensions in this basic block:
+                // AMD's DXIL compiler (amdxc64.dll) hits a null-pointer dereference
+                // (0xc0000005) when dx.op.getDimensions precedes dx.op.textureLoad on a
+                // dynamically indexed heap Texture2DMS/Texture2DMSArray in the same block.
+                let loads: Vec<[Value; 4]> = samples.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let count = lw.s.m.extract(dims, 3);
+                for (si, (&sv, r)) in samples.iter().zip(loads).enumerate() {
+                    let inside = lw.cmp(Pred::ULt, sv, count);
+                    for k in 0..4 {
+                        let b = lw.bits(r[k]);
+                        let zz = lw.c(0);
+                        let b = lw.sel(inside, b, zz);
+                        lw.wr(tmps[si][k], b);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let raw: Vec<Value> = if base == "msaa_load" {
+            let c = comps.first().copied().unwrap_or(0) as usize;
+            tmps.iter().map(|t| self.rd(t[c])).collect()
+        } else {
+            comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
+        };
+        let vals: Vec<Value> = if d16 {
+            raw.iter()
+                .map(|&x| {
+                    let fx = self.f(x);
+                    let h = self.s.f32_to_f16(fx);
+                    let lo = self.andc(x, 0xFFFF);
+                    let fl = self.cmpc(Pred::Eq, cls, 0);
+                    self.sel(fl, h, lo)
+                })
+                .collect()
+        } else {
+            raw
+        };
+        self.image_result(vdata, &vals, d16, act)
+    }
+
     /// A compare-exchange loop on a texel (`rmw32` on an `At::Ref` texel).
     fn texel_cas(&mut self, h: Value, ic: &[Value], opn: &str, v: Value) -> Value {
         // the initial value: an atomic or 0 reads it without changing it
@@ -825,6 +934,129 @@ impl Lw {
                 let (x, y) = (self.f(c), self.f(v));
                 let r = if opn == "fmin" { self.fmin(x, y) } else { self.fmax(x, y) };
                 self.bits(r)
+            }
+        };
+        let p = self.s.atomic_cmpxchg(h, ic, c, n);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        p
+    }
+
+    /// 64-bit typed image atomic (`DMASK = 0x3`, or `0xF` for `cmpswap`/`fcmpswap`):
+    /// operates on a single-component `R64_UINT`/`R64_SINT` UAV via SM 6.6 64-bit typed
+    /// heap atomics (`dx.op.atomicBinOp.i64` / `dx.op.atomicCompareExchange.i64`).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_atomic64(&mut self, d: &Decoded, opn: &str, ic: &[Value], tw0: Value, lkind: TexKind, vdata: u64, glc: bool, act: Value) -> LResult<()> {
+        let (vlo, vhi) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let v = self.pack64(vlo, vhi);
+        let is_cmpswap = opn == "cmpswap" || opn == "fcmpswap";
+        let cmpv = if is_cmpswap {
+            let (clo, chi) = (self.vreg(vdata + 2), self.vreg(vdata + 3));
+            self.pack64(clo, chi)
+        } else {
+            self.c64(0)
+        };
+        let ui = self.addc(tw0, 1);
+        let signed = opn == "smin" || opn == "smax";
+        let ct = if signed { CompType::I64 } else { CompType::U64 };
+        let aop = match opn {
+            "add" => Some(AtomicOp::Add),
+            "smin" => Some(AtomicOp::IMin),
+            "umin" => Some(AtomicOp::UMin),
+            "smax" => Some(AtomicOp::IMax),
+            "umax" => Some(AtomicOp::UMax),
+            "and" => Some(AtomicOp::And),
+            "or" => Some(AtomicOp::Or),
+            "xor" => Some(AtomicOp::Xor),
+            "swap" => Some(AtomicOp::Exchange),
+            "cmpswap" | "fcmpswap" | "sub" | "inc" | "dec" | "fmin" | "fmax" => None,
+            _ => return err(d, "image_atomic64"),
+        };
+        let (tmp_lo, tmp_hi) = (self.tmp_var(), self.tmp_var());
+        let z = self.c(0);
+        self.wr(tmp_lo, z);
+        self.wr(tmp_hi, z);
+        let opn = opn.to_string();
+        let ic2 = ic.to_vec();
+        self.guarded(act, &mut |lw| {
+            lw.s.heap_typed_atomic64();
+            let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
+            let old = match aop {
+                Some(o) => lw.s.atomic_binop(tex.handle, o, &ic2, v),
+                None if opn == "sub" => {
+                    let z64 = lw.c64(0);
+                    let neg = lw.sub(z64, v);
+                    lw.s.atomic_binop(tex.handle, AtomicOp::Add, &ic2, neg)
+                }
+                None if opn == "cmpswap" || opn == "fcmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                None => lw.texel_cas64(tex.handle, &ic2, &opn, v),
+            };
+            let (olo, ohi) = lw.unpack64(old);
+            lw.wr(tmp_lo, olo);
+            lw.wr(tmp_hi, ohi);
+            Ok(())
+        })?;
+        if glc {
+            let (olo, ohi) = (self.rd(tmp_lo), self.rd(tmp_hi));
+            let a = self.act();
+            let (cur_lo, cur_hi) = (self.vreg(vdata), self.vreg(vdata + 1));
+            let nlo = self.sel(a, olo, cur_lo);
+            let nhi = self.sel(a, ohi, cur_hi);
+            self.wr(VAR_VGPR + vdata as u32, nlo);
+            self.wr(VAR_VGPR + vdata as u32 + 1, nhi);
+        }
+        Ok(())
+    }
+
+    /// 64-bit compare-exchange loop on an `R64_UINT` texel (`inc`/`dec`/`fmin`/`fmax`).
+    fn texel_cas64(&mut self, h: Value, ic: &[Value], opn: &str, v: Value) -> Value {
+        let z64 = self.c64(0);
+        let init = self.s.atomic_binop(h, AtomicOp::Or, ic, z64);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let ex = self.block(Some(1));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i64t = self.i64();
+        let i32t = self.s.m.i32();
+        let c = self.s.m.phi(i64t);
+        let i = self.s.m.phi(i32t);
+        let z32 = self.c(0);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z32, pre);
+        let n = match opn {
+            "inc" => {
+                let ge = self.cmp(Pred::UGe, c, v);
+                let one = self.c64(1);
+                let c1 = self.add(c, one);
+                self.sel(ge, z64, c1)
+            }
+            "dec" => {
+                let cz = self.cmp(Pred::Eq, c, z64);
+                let gt = self.cmp(Pred::UGt, c, v);
+                let w = self.lor(cz, gt);
+                let one = self.c64(1);
+                let c1 = self.sub(c, one);
+                self.sel(w, v, c1)
+            }
+            _ => {
+                self.s.require(super::shader::Feature::Doubles);
+                let f64t = self.s.m.f64();
+                let x = self.s.m.bitcast(c, f64t);
+                let y = self.s.m.bitcast(v, f64t);
+                let r = if opn == "fmin" {
+                    self.s.binary(super::ops::Binary::FMin, x, y)
+                } else {
+                    self.s.binary(super::ops::Binary::FMax, x, y)
+                };
+                self.s.m.bitcast(r, i64t)
             }
         };
         let p = self.s.atomic_cmpxchg(h, ic, c, n);
