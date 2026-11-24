@@ -55,6 +55,32 @@ impl Lw {
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
 
+    fn bvh_load_box32(&mut self, at16: Value, k: Value) -> ([Value; 3], [Value; 3]) {
+        let k24 = self.c(24);
+        let off = self.mul(k, k24);
+        let a = self.add(at16, off);
+        let words = self.with_mem_i32s(None, 6, &mut |lw, m| {
+            let mut out = Vec::with_capacity(6);
+            out.extend(lw.s.raw_load(m, a, 0xF));
+            let b = lw.addc(a, 16);
+            out.extend(lw.s.raw_load(m, b, 0x3));
+            out
+        });
+        ([self.f(words[0]), self.f(words[1]), self.f(words[2])], [self.f(words[3]), self.f(words[4]), self.f(words[5])])
+    }
+    fn bvh_load_box16(&mut self, at16: Value, k: Value) -> ([Value; 3], [Value; 3]) {
+        let k12 = self.c(12);
+        let off = self.mul(k, k12);
+        let a = self.add(at16, off);
+        let h = self.with_mem_i32s(None, 3, &mut |lw, m| lw.s.raw_load(m, a, 0x7));
+        let hx16 = self.lshrc(h[0], 16);
+        let hy16 = self.lshrc(h[1], 16);
+        let hz16 = self.lshrc(h[2], 16);
+        let mn = [self.s.f16_to_f32(h[0]), self.s.f16_to_f32(hx16), self.s.f16_to_f32(h[1])];
+        let mx = [self.s.f16_to_f32(hy16), self.s.f16_to_f32(h[2]), self.s.f16_to_f32(hz16)];
+        (mn, mx)
+    }
+
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
     fn bvh_intersect(&mut self, ty: Value, at: Value, tmax: Value, o: [Value; 3], dir: [Value; 3], inv: [Value; 3], sort: Value, out: [u32; 4]) -> LResult<()> {
@@ -62,98 +88,147 @@ impl Lw {
         for &t in &out {
             self.wr(t, ones);
         }
-        for box32 in [true, false] {
-            let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
-            self.guarded(is, &mut |lw| {
-                // Box32 is 28 contiguous dwords (4 children + 4×6 box floats);
-                // Box16 is 16 contiguous dwords (4 children + 4×3 packed f16 pairs).
-                // Load the whole node in one window switch using 4-dword rawBufferLoads.
-                let at_al = lw.andc(at, !3);
-                let chunks = if box32 { 7usize } else { 4usize };
-                let words = lw.with_mem_i32s(None, chunks * 4, &mut |lw, m| {
-                    let mut out = Vec::with_capacity(chunks * 4);
-                    for j in 0..chunks {
-                        let a = lw.addc(at_al, 16 * j as u32);
-                        out.extend(lw.s.raw_load(m, a, 0xF));
-                    }
-                    out
-                });
-                let child = [words[0], words[1], words[2], words[3]];
-                let ninf = lw.s.m.f32c(0xFF80_0000);
-                let pinf = lw.s.m.f32c(0x7F80_0000);
-                let mut tn = [pinf; 4];
-                let mut id = [ones; 4];
-                for k in 0..4usize {
-                    let (mn, mx) = if box32 {
-                        let b = 4 + 6 * k;
-                        (
-                            [lw.f(words[b]), lw.f(words[b + 1]), lw.f(words[b + 2])],
-                            [lw.f(words[b + 3]), lw.f(words[b + 4]), lw.f(words[b + 5])],
-                        )
-                    } else {
-                        let b = 4 + 3 * k;
-                        let h = [words[b], words[b + 1], words[b + 2]];
-                        let hx16 = lw.lshrc(h[0], 16);
-                        let hy16 = lw.lshrc(h[1], 16);
-                        let hz16 = lw.lshrc(h[2], 16);
-                        let mn = [lw.s.f16_to_f32(h[0]), lw.s.f16_to_f32(hx16), lw.s.f16_to_f32(h[1])];
-                        let mx = [lw.s.f16_to_f32(hy16), lw.s.f16_to_f32(h[2]), lw.s.f16_to_f32(hz16)];
-                        (mn, mx)
-                    };
-                    let d1 = lw.f3(mn, o, Lw::fsub);
-                    let t1 = lw.f3(d1, inv, Lw::fmul);
-                    let d2 = lw.f3(mx, o, Lw::fsub);
-                    let t2 = lw.f3(d2, inv, Lw::fmul);
-                    let mut lo = [pinf; 3];
-                    let mut hi = [pinf; 3];
+        let is_box32 = self.cmpc(Pred::Eq, ty, 5);
+        let is_box16 = self.cmpc(Pred::Eq, ty, 4);
+        let is_box = self.lor(is_box16, is_box32);
+        self.guarded(is_box, &mut |lw| {
+            let f32t = lw.s.m.f32();
+            let i32t = lw.s.m.i32();
+            let ninf = lw.s.m.f32c(0xFF80_0000);
+            let pinf = lw.s.m.f32c(0x7F80_0000);
+            let z0 = lw.c(0);
+            let zf = lw.fc(0.0);
+            let at_al = lw.andc(at, !3);
+            let child_words = lw.with_mem_i32s(None, 4, &mut |lw, m| lw.s.raw_load(m, at_al, 0xF));
+            let children = [child_words[0], child_words[1], child_words[2], child_words[3]];
+            let at16 = lw.addc(at_al, 16);
+            let inv_inf = [lw.isinf(inv[0]), lw.isinf(inv[1]), lw.isinf(inv[2])];
+            let pre = lw.cur();
+            let lp = lw.block(Some(2));
+            let ex = lw.block(Some(1));
+            lw.br(lp);
+
+            lw.s.m.set_block(lp);
+            let k = lw.s.m.phi(i32t);
+            lw.s.m.add_incoming(k, z0, pre);
+            // 3-slot shift register carried across k = 0..4; on exit after k = 3,
+            // [t0, t1, t2, tk] and [i0, i1, i2, ik] hold children 0..4 in order.
+            let t2 = lw.s.m.phi(f32t);
+            let t1 = lw.s.m.phi(f32t);
+            let t0 = lw.s.m.phi(f32t);
+            let i2 = lw.s.m.phi(i32t);
+            let i1 = lw.s.m.phi(i32t);
+            let i0 = lw.s.m.phi(i32t);
+            for p in [t2, t1, t0] {
+                lw.s.m.add_incoming(p, pinf, pre);
+            }
+            for p in [i2, i1, i0] {
+                lw.s.m.add_incoming(p, ones, pre);
+            }
+
+            let child = lw.pick4f(&children, k);
+            let (mn, mx) = match lw.s.m.const_u64(is_box32) {
+                Some(1) => lw.bvh_load_box32(at16, k),
+                Some(0) => lw.bvh_load_box16(at16, k),
+                _ => {
+                    let b32 = lw.block(Some(1));
+                    let b16 = lw.block(Some(1));
+                    let got = lw.block(Some(2));
+                    lw.cond_br(is_box32, b32, b16);
+
+                    lw.s.m.set_block(b32);
+                    let (mn32, mx32) = lw.bvh_load_box32(at16, k);
+                    let e32 = lw.cur();
+                    lw.br(got);
+
+                    lw.s.m.set_block(b16);
+                    let (mn16, mx16) = lw.bvh_load_box16(at16, k);
+                    let e16 = lw.cur();
+                    lw.br(got);
+
+                    lw.s.m.set_block(got);
+                    let mut mn = [pinf; 3];
+                    let mut mx = [pinf; 3];
                     for c in 0..3 {
-                        let ge = lw.fcmp(Pred::FOGe, o[c], mn[c]);
-                        let le = lw.fcmp(Pred::FOLe, o[c], mx[c]);
-                        let slab = lw.land(ge, le);
-                        let ii = lw.isinf(inv[c]);
-                        let l0 = lw.sel(slab, ninf, pinf);
-                        let h0 = lw.sel(slab, pinf, ninf);
-                        let mn_t = lw.fmin(t1[c], t2[c]);
-                        let mx_t = lw.fmax(t1[c], t2[c]);
-                        lo[c] = lw.sel(ii, l0, mn_t);
-                        hi[c] = lw.sel(ii, h0, mx_t);
+                        mn[c] = lw.s.m.phi(f32t);
+                        lw.s.m.add_incoming(mn[c], mn32[c], e32);
+                        lw.s.m.add_incoming(mn[c], mn16[c], e16);
                     }
-                    let a = lw.fmax(lo[0], lo[1]);
-                    let a = lw.fmax(a, lo[2]);
-                    let b = lw.fmin(hi[0], hi[1]);
-                    let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
-                    let mut all = cv;
                     for c in 0..3 {
-                        let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
-                        all = lw.land(all, le);
+                        mx[c] = lw.s.m.phi(f32t);
+                        lw.s.m.add_incoming(mx[c], mx32[c], e32);
+                        lw.s.m.add_incoming(mx[c], mx16[c], e16);
                     }
-                    let ab = lw.fcmp(Pred::FOLe, a, b);
-                    let z = lw.fc(0.0);
-                    let b0 = lw.fcmp(Pred::FOGe, b, z);
-                    let at_ = lw.fcmp(Pred::FOLe, a, tmax);
-                    let hit = lw.land(all, ab);
-                    let x = lw.land(b0, at_);
-                    let hit = lw.land(hit, x);
-                    tn[k] = lw.sel(hit, a, pinf);
-                    id[k] = lw.sel(hit, child[k], ones);
+                    (mn, mx)
                 }
-                for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
-                    let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
-                    let sw = lw.land(sort, lt);
-                    let (ti, tj) = (lw.sel(sw, tn[j], tn[i]), lw.sel(sw, tn[i], tn[j]));
-                    let (ii, ij) = (lw.sel(sw, id[j], id[i]), lw.sel(sw, id[i], id[j]));
-                    tn[i] = ti;
-                    tn[j] = tj;
-                    id[i] = ii;
-                    id[j] = ij;
-                }
-                for k in 0..4 {
-                    lw.wr(out[k], id[k]);
-                }
-                Ok(())
-            })?;
-        }
+            };
+
+            let d1 = lw.f3(mn, o, Lw::fsub);
+            let t1_ = lw.f3(d1, inv, Lw::fmul);
+            let d2 = lw.f3(mx, o, Lw::fsub);
+            let t2_ = lw.f3(d2, inv, Lw::fmul);
+            let mut lo = [pinf; 3];
+            let mut hi = [pinf; 3];
+            for c in 0..3 {
+                let ge = lw.fcmp(Pred::FOGe, o[c], mn[c]);
+                let le = lw.fcmp(Pred::FOLe, o[c], mx[c]);
+                let slab = lw.land(ge, le);
+                let l0 = lw.sel(slab, ninf, pinf);
+                let h0 = lw.sel(slab, pinf, ninf);
+                let mn_t = lw.fmin(t1_[c], t2_[c]);
+                let mx_t = lw.fmax(t1_[c], t2_[c]);
+                lo[c] = lw.sel(inv_inf[c], l0, mn_t);
+                hi[c] = lw.sel(inv_inf[c], h0, mx_t);
+            }
+            let a = lw.fmax(lo[0], lo[1]);
+            let a = lw.fmax(a, lo[2]);
+            let b = lw.fmin(hi[0], hi[1]);
+            let b = lw.fmin(b, hi[2]);
+            let cv = lw.cmpc(Pred::Ne, child, u32::MAX);
+            let mut all = cv;
+            for c in 0..3 {
+                let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
+                all = lw.land(all, le);
+            }
+            let ab = lw.fcmp(Pred::FOLe, a, b);
+            let b0 = lw.fcmp(Pred::FOGe, b, zf);
+            let at_ = lw.fcmp(Pred::FOLe, a, tmax);
+            let hit = lw.land(all, ab);
+            let x = lw.land(b0, at_);
+            let hit = lw.land(hit, x);
+            let tk = lw.sel(hit, a, pinf);
+            let ik = lw.sel(hit, child, ones);
+
+            let k1 = lw.addc(k, 1);
+            let done = lw.cmpc(Pred::UGe, k1, 4);
+            let me = lw.cur();
+            lw.s.m.add_incoming(k, k1, me);
+            lw.s.m.add_incoming(t2, tk, me);
+            lw.s.m.add_incoming(t1, t2, me);
+            lw.s.m.add_incoming(t0, t1, me);
+            lw.s.m.add_incoming(i2, ik, me);
+            lw.s.m.add_incoming(i1, i2, me);
+            lw.s.m.add_incoming(i0, i1, me);
+            lw.cond_br(done, ex, lp);
+
+            lw.s.m.set_block(ex);
+            let mut tn = [t0, t1, t2, tk];
+            let mut id = [i0, i1, i2, ik];
+            for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
+                let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
+                let sw = lw.land(sort, lt);
+                let (ti, tj) = (lw.sel(sw, tn[j], tn[i]), lw.sel(sw, tn[i], tn[j]));
+                let (ii, ij) = (lw.sel(sw, id[j], id[i]), lw.sel(sw, id[i], id[j]));
+                tn[i] = ti;
+                tn[j] = tj;
+                id[i] = ii;
+                id[j] = ij;
+            }
+            for k in 0..4 {
+                lw.wr(out[k], id[k]);
+            }
+            Ok(())
+        })?;
         let tri = self.cmpc(Pred::ULe, ty, 3);
         self.guarded(tri, &mut |lw| {
             let t1 = lw.cmpc(Pred::Eq, ty, 1);
