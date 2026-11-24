@@ -621,27 +621,41 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
     }
 }
 
-/// device #61 CreateSamplerX(desc, destination): the title uses it for anisotropic samplers;
-/// the console desc (0x6C bytes) carries the PC fields at other offsets (+0x18 address U / V /
-/// W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40 comparison); its
-/// further anisotropy fields are not modelled
-pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *const u8, dest: u64) {
-    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
-        return;
+/// PC filter of a console sampler desc. The fields are numbered as in an S#: magnification and
+/// minification 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear, mip 2 linear.
+fn sampler_x_filter(mag: u32, min: u32, mip: u32, max_anisotropy: u32) -> D3D12_FILTER {
+    if max_anisotropy > 1 && (mag == 3 || min == 3) {
+        return D3D12_FILTER_ANISOTROPIC;
     }
-    let u = |o: usize| (x.add(o) as *const u32).read_unaligned();
-    let d = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_ANISOTROPIC,
+    // D3D12_ENCODE_BASIC_FILTER: linear = 1
+    D3D12_FILTER(((min & 1) << 4 | (mag & 1) << 2 | (mip == 2) as u32) as i32)
+}
+
+/// PC sampler desc of a console one (0x6C bytes; `u`: the dword at an offset). It carries the PC
+/// fields at other offsets (+4 / +8 / +0x10 magnification / minification / mip filter, +0x18
+/// address U / V / W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40
+/// comparison, +0x44 border colour); its further anisotropy fields are not modelled.
+fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: sampler_x_filter(u(4), u(8), u(0x10), u(0x34)),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(u(0x18) as i32),
         AddressV: D3D12_TEXTURE_ADDRESS_MODE(u(0x1C) as i32),
         AddressW: D3D12_TEXTURE_ADDRESS_MODE(u(0x20) as i32),
         MipLODBias: f32::from_bits(u(0x2C)),
         MaxAnisotropy: u(0x34).clamp(1, 16),
         ComparisonFunc: D3D12_COMPARISON_FUNC(u(0x40) as i32),
-        BorderColor: [0.0; 4],
+        BorderColor: [0x44, 0x48, 0x4C, 0x50].map(|o| f32::from_bits(u(o))),
         MinLOD: f32::from_bits(u(0x24)),
         MaxLOD: f32::from_bits(u(0x28)),
-    };
+    }
+}
+
+/// device #61 CreateSamplerX(desc, destination)
+pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *const u8, dest: u64) {
+    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
+        return;
+    }
+    let d = pc_sampler_desc(|o| (x.add(o) as *const u32).read_unaligned());
     real::dev_create_sampler_x(this, &d, dest);
 }
 
@@ -673,6 +687,13 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    }
+    // R9G9B9E5_SHAREDEXP targets / UAVs: PC D3D12 forbids ALLOW_RENDER_TARGET and
+    // ALLOW_UNORDERED_ACCESS on format 67 (Series S 1920x1080 target, flags 0x300005:
+    // E_INVALIDARG) – R11G11B10_FLOAT is the same 32 bpp unsigned HDR float format with full
+    // PC RTV/UAV/SRV support. Sampled-only R9G9B9E5 textures stay format 67.
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -723,10 +744,11 @@ fn depth_typeless(f: u32) -> Option<u32> {
 }
 
 /// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8, an R9G9B9E5 target is R11G11B10_FLOAT (`pc_resource_desc`).
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        67 => 26,
         f => pc_view_format(f),
     }
 }
@@ -749,6 +771,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`)
+        (26, 67) => 26,
         (_, v) => v,
     }
 }
@@ -1049,6 +1073,52 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 mod tests {
     use super::*;
 
+    /// A console sampler desc: [mag, min, z, mip] filters, address U / V / W, maximum anisotropy.
+    fn console_sampler(filters: [u32; 4], address: [u32; 3], anisotropy: u32) -> [u32; 0x6C / 4] {
+        let mut d = [0u32; 0x6C / 4];
+        d[1..5].copy_from_slice(&filters);
+        d[6..9].copy_from_slice(&address);
+        d[0x28 / 4] = 12f32.to_bits();
+        d[0x34 / 4] = anisotropy;
+        d[0x40 / 4] = 1;
+        d
+    }
+
+    /// Only an anisotropic console sampler is an anisotropic PC one (all of them were).
+    #[test]
+    fn console_samplers_keep_their_filter() {
+        let pc = |filters, anisotropy| {
+            let d = console_sampler(filters, [1, 2, 3], anisotropy);
+            pc_sampler_desc(|o| d[o / 4])
+        };
+        assert_eq!(pc([2, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        assert_eq!(pc([1, 1, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([1, 1, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
+        // the z filter is not the mip filter, and mag and min are not swapped
+        assert_eq!(pc([1, 1, 1, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([1, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT);
+        let d = pc([3, 3, 2, 2], 8);
+        assert_eq!((d.Filter, d.MaxAnisotropy), (D3D12_FILTER_ANISOTROPIC, 8));
+        // a maximum of 1 is trilinear, and anisotropic point is point
+        assert_eq!(pc([3, 3, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([2, 2, 1, 1], 8).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        // the other fields as before
+        let d = pc([1, 1, 2, 2], 1);
+        assert_eq!((d.AddressU.0, d.AddressV.0, d.AddressW.0, d.MinLOD, d.MaxLOD, d.ComparisonFunc.0), (1, 2, 3, 0.0, 12.0, 1));
+    }
+
+    /// The border colour is the desc's (it was transparent black whatever the title asked for).
+    #[test]
+    fn console_samplers_keep_their_border_colour() {
+        let mut d = console_sampler([1, 1, 2, 2], [4; 3], 1);
+        let border = |d: &[u32; 0x6C / 4]| pc_sampler_desc(|o| d[o / 4]).BorderColor;
+        assert_eq!(border(&d), [0.0; 4]);
+        for (k, v) in [0.25f32, 0.5, 0.75, 1.0].into_iter().enumerate() {
+            d[0x44 / 4 + k] = v.to_bits();
+        }
+        assert_eq!(border(&d), [0.25, 0.5, 0.75, 1.0]);
+    }
+
     #[test]
     fn console_types_and_descs_become_pc_ones() {
         assert_eq!(pc_list_type(XBOX_TYPE_DMA), D3D12_COMMAND_LIST_TYPE_COPY.0 as u32);
@@ -1142,6 +1212,11 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5_SHAREDEXP target + UAV
+        x[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+        assert_eq!(desc(&x), (26, 0x5));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // sampled-only R9G9B9E5 stays format 67
+        assert_eq!(desc(&x), (67, 0));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
@@ -1152,7 +1227,9 @@ mod tests {
         assert_eq!(pc_shader_view_format(19, 62), 22);
         assert_eq!(pc_shader_view_format(28, 86), 28);
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
-        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+        assert_eq!(pc_shader_view_format(26, 67), 26);
+        assert_eq!(pc_shader_view_format(67, 67), 67, "a sampled-only R9G9B9E5 texture that stayed one");
+        assert_eq!((pc_target_format(86), pc_target_format(67), pc_target_format(118), pc_view_format(117)), (28, 26, 45, 10));
     }
 
     #[test]
