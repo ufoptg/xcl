@@ -3598,7 +3598,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(bytes), super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3635,8 +3635,8 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – at most the configured number at
-/// once, and 3 GB of commit
-/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
+/// once, and the commit its size needs free (`big_compile_commit_needed`; the title loading
+/// next to it must not run out). Unless one of the
 /// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
 /// when that thread builds it itself. Holding such a build back holds the title back: on a
 /// machine with less than 3 GB of commit free throughout a retail title's world loading, the
@@ -3666,12 +3666,57 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
-/// 3 GB of commit are free (true when that is not known).
-fn big_compile_commit_free() -> bool {
+/// The commit a background driver compile of `bytes` of DXIL needs free before it starts:
+/// 3 GB, plus 1 GB for every 2 MB of DXIL. The driver's compiler takes memory in proportion
+/// to the program: ~1.5 GB for a 1 MB program (NVIDIA), and an AMD driver took the process
+/// from 34 to 42 GB of commit on a 13.8 MB one (a retail title's largest, #1332 in the form of
+/// #1321). With the fixed 3 GB, four ordinary lanes and that one next to them ran the process
+/// into the machine's commit limit at 28 s on 32 GB of RAM.
+fn big_compile_commit_needed(bytes: usize) -> u64 {
+    (3u64 << 30) + (bytes as u64 >> 1) * (1 << 10)
+}
+
+/// Whether a background compile that needs `needed` of commit may start with `free` of it on a
+/// machine with `physical` bytes of RAM: the commit is there, and the compile would take at
+/// most a quarter of the RAM. The commit free when a compile starts says nothing about what the
+/// title takes next: the 13.8 MB program above started at 4 s with 36 GB free and, with the
+/// title's own 25 GB of world loading after it, ran the process into the commit limit at 30 s
+/// on 32 GB (twice). Such a program waits for a bind that wants it (`big_compile_turn`) and is
+/// built then, as a title thread would.
+fn big_compile_may_start(needed: u64, free: u64, physical: u64, ram_share: usize) -> bool {
+    free >= needed && (ram_share == 0 || needed <= physical / ram_share as u64)
+}
+
+/// The share of the machine's RAM a background compile may take: a 1/`n`th (default 4,
+/// `XCL_HUGE_PSO_RAM_SHARE`; `0`: no such limit, the commit free alone decides, as before).
+fn huge_pso_ram_share() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_RAM_SHARE").ok().as_deref(), 4, 0, 64))
+}
+
+/// `big_compile_commit_needed(bytes)` of commit are free and within the machine's means
+/// (`big_compile_may_start`; true when that is not known). A program the RAM share holds back
+/// is said so in the log, once per program and worker: it is built when a game thread binds it.
+fn big_compile_commit_free(bytes: usize) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return true;
+    }
+    let (needed, share) = (big_compile_commit_needed(bytes), huge_pso_ram_share());
+    let may = big_compile_may_start(needed, m.ullAvailPageFile, m.ullTotalPhys, share);
+    if !may && share != 0 && needed > m.ullTotalPhys / share as u64 {
+        thread_local! { static NOTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        if NOTED.with(|n| n.replace(bytes)) != bytes {
+            crate::xlog_info!(
+                "D3D12.X: a background compile of {bytes} B DXIL is held back: it would take {} GB of commit, more than a 1/{share} of the {} GB of RAM (XCL_HUGE_PSO_RAM_SHARE) – built when a game thread binds it",
+                needed >> 30,
+                m.ullTotalPhys >> 30
+            );
+        }
+    }
+    may
 }
 
 #[cfg(test)]
@@ -3679,6 +3724,40 @@ mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_commit_a_background_compile_needs_grows_with_its_dxil() {
+        const GB: u64 = 1 << 30;
+        const MB: usize = 1 << 20;
+        // a small program: the 3 GB floor
+        assert_eq!(big_compile_commit_needed(0), 3 * GB);
+        assert_eq!(big_compile_commit_needed(256 << 10), 3 * GB + GB / 8);
+        // 1 GB per 2 MB of DXIL
+        assert_eq!(big_compile_commit_needed(2 * MB), 4 * GB);
+        assert_eq!(big_compile_commit_needed(1 * MB), 3 * GB + GB / 2);
+        // the 13.8 MB program that took a process from 34 to 42 GB of commit
+        let giant = big_compile_commit_needed(13_823_000);
+        assert!(giant > 9 * GB && giant < 11 * GB, "{giant}");
+    }
+
+    #[test]
+    fn a_background_compile_starts_within_the_commit_and_a_quarter_of_the_ram() {
+        const GB: u64 = 1 << 30;
+        let (small, giant) = (big_compile_commit_needed(1 << 20), big_compile_commit_needed(13_823_000));
+        // 32 GB of RAM, 36 GB of commit free: a 1 MB program yes, the 13.8 MB one never in the background
+        assert!(big_compile_may_start(small, 36 * GB, 32 * GB, 4));
+        assert!(!big_compile_may_start(giant, 36 * GB, 32 * GB, 4));
+        // 64 GB: the giant one too, once the commit is there
+        assert!(big_compile_may_start(giant, 36 * GB, 64 * GB, 4));
+        assert!(!big_compile_may_start(giant, 9 * GB, 64 * GB, 4));
+        // no commit, no start
+        assert!(!big_compile_may_start(small, 2 * GB, 32 * GB, 4));
+        // XCL_HUGE_PSO_RAM_SHARE=0: the commit free alone decides, as before; a bigger share holds more back
+        assert!(big_compile_may_start(giant, 36 * GB, 32 * GB, 0));
+        assert!(!big_compile_may_start(small, 36 * GB, 32 * GB, 16));
+        assert_eq!(env_count(Some("0"), 4, 0, 64), 0);
+        assert_eq!(env_count(None, 4, 0, 64), 4);
+    }
 
     #[test]
     fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
@@ -4766,7 +4845,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(bytes), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }
