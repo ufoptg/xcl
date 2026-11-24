@@ -783,8 +783,13 @@ impl Lw {
             }
             _ if base.starts_with("atomic_") => {
                 let opn = &base[7..];
-                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
                 let glc = f("GLC") == 1;
+                let is_cmpswap = opn == "cmpswap" || opn == "fcmpswap";
+                let wide64 = if is_cmpswap { comps.len() == 4 } else { comps.len() == 2 };
+                if wide64 {
+                    return self.mimg_atomic64(d, opn, &ic, tw0, lkind, vdata, glc, act);
+                }
+                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
                 let ui = self.addc(tw0, 1);
                 let signed = opn == "smin" || opn == "smax";
                 let ct = if signed { CompType::I32 } else { CompType::U32 };
@@ -929,6 +934,129 @@ impl Lw {
                 let (x, y) = (self.f(c), self.f(v));
                 let r = if opn == "fmin" { self.fmin(x, y) } else { self.fmax(x, y) };
                 self.bits(r)
+            }
+        };
+        let p = self.s.atomic_cmpxchg(h, ic, c, n);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        p
+    }
+
+    /// 64-bit typed image atomic (`DMASK = 0x3`, or `0xF` for `cmpswap`/`fcmpswap`):
+    /// operates on a single-component `R64_UINT`/`R64_SINT` UAV via SM 6.6 64-bit typed
+    /// heap atomics (`dx.op.atomicBinOp.i64` / `dx.op.atomicCompareExchange.i64`).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_atomic64(&mut self, d: &Decoded, opn: &str, ic: &[Value], tw0: Value, lkind: TexKind, vdata: u64, glc: bool, act: Value) -> LResult<()> {
+        let (vlo, vhi) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let v = self.pack64(vlo, vhi);
+        let is_cmpswap = opn == "cmpswap" || opn == "fcmpswap";
+        let cmpv = if is_cmpswap {
+            let (clo, chi) = (self.vreg(vdata + 2), self.vreg(vdata + 3));
+            self.pack64(clo, chi)
+        } else {
+            self.c64(0)
+        };
+        let ui = self.addc(tw0, 1);
+        let signed = opn == "smin" || opn == "smax";
+        let ct = if signed { CompType::I64 } else { CompType::U64 };
+        let aop = match opn {
+            "add" => Some(AtomicOp::Add),
+            "smin" => Some(AtomicOp::IMin),
+            "umin" => Some(AtomicOp::UMin),
+            "smax" => Some(AtomicOp::IMax),
+            "umax" => Some(AtomicOp::UMax),
+            "and" => Some(AtomicOp::And),
+            "or" => Some(AtomicOp::Or),
+            "xor" => Some(AtomicOp::Xor),
+            "swap" => Some(AtomicOp::Exchange),
+            "cmpswap" | "fcmpswap" | "sub" | "inc" | "dec" | "fmin" | "fmax" => None,
+            _ => return err(d, "image_atomic64"),
+        };
+        let (tmp_lo, tmp_hi) = (self.tmp_var(), self.tmp_var());
+        let z = self.c(0);
+        self.wr(tmp_lo, z);
+        self.wr(tmp_hi, z);
+        let opn = opn.to_string();
+        let ic2 = ic.to_vec();
+        self.guarded(act, &mut |lw| {
+            lw.s.heap_typed_atomic64();
+            let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
+            let old = match aop {
+                Some(o) => lw.s.atomic_binop(tex.handle, o, &ic2, v),
+                None if opn == "sub" => {
+                    let z64 = lw.c64(0);
+                    let neg = lw.sub(z64, v);
+                    lw.s.atomic_binop(tex.handle, AtomicOp::Add, &ic2, neg)
+                }
+                None if opn == "cmpswap" || opn == "fcmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                None => lw.texel_cas64(tex.handle, &ic2, &opn, v),
+            };
+            let (olo, ohi) = lw.unpack64(old);
+            lw.wr(tmp_lo, olo);
+            lw.wr(tmp_hi, ohi);
+            Ok(())
+        })?;
+        if glc {
+            let (olo, ohi) = (self.rd(tmp_lo), self.rd(tmp_hi));
+            let a = self.act();
+            let (cur_lo, cur_hi) = (self.vreg(vdata), self.vreg(vdata + 1));
+            let nlo = self.sel(a, olo, cur_lo);
+            let nhi = self.sel(a, ohi, cur_hi);
+            self.wr(VAR_VGPR + vdata as u32, nlo);
+            self.wr(VAR_VGPR + vdata as u32 + 1, nhi);
+        }
+        Ok(())
+    }
+
+    /// 64-bit compare-exchange loop on an `R64_UINT` texel (`inc`/`dec`/`fmin`/`fmax`).
+    fn texel_cas64(&mut self, h: Value, ic: &[Value], opn: &str, v: Value) -> Value {
+        let z64 = self.c64(0);
+        let init = self.s.atomic_binop(h, AtomicOp::Or, ic, z64);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let ex = self.block(Some(1));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i64t = self.i64();
+        let i32t = self.s.m.i32();
+        let c = self.s.m.phi(i64t);
+        let i = self.s.m.phi(i32t);
+        let z32 = self.c(0);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z32, pre);
+        let n = match opn {
+            "inc" => {
+                let ge = self.cmp(Pred::UGe, c, v);
+                let one = self.c64(1);
+                let c1 = self.add(c, one);
+                self.sel(ge, z64, c1)
+            }
+            "dec" => {
+                let cz = self.cmp(Pred::Eq, c, z64);
+                let gt = self.cmp(Pred::UGt, c, v);
+                let w = self.lor(cz, gt);
+                let one = self.c64(1);
+                let c1 = self.sub(c, one);
+                self.sel(w, v, c1)
+            }
+            _ => {
+                self.s.require(super::shader::Feature::Doubles);
+                let f64t = self.s.m.f64();
+                let x = self.s.m.bitcast(c, f64t);
+                let y = self.s.m.bitcast(v, f64t);
+                let r = if opn == "fmin" {
+                    self.s.binary(super::ops::Binary::FMin, x, y)
+                } else {
+                    self.s.binary(super::ops::Binary::FMax, x, y)
+                };
+                self.s.m.bitcast(r, i64t)
             }
         };
         let p = self.s.atomic_cmpxchg(h, ic, c, n);
