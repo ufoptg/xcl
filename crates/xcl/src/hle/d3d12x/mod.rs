@@ -31,6 +31,7 @@ pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
+mod vram_small;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

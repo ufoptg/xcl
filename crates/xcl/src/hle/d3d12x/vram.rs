@@ -120,7 +120,9 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
-        forget_pages(resource);
+        if !super::vram_small::forget(resource) {
+            forget_pages(resource);
+        }
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
@@ -847,17 +849,26 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Whether `va` already has a live 64 KiB page on `device` (e.g., an existing GPU-owned render
+/// target that a sampled view at the same 64 KiB-aligned address should alias).
+fn has_live_page(device: usize, va: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    g.get(&device).and_then(|p| p.as_ref()).is_some_and(|p| p.pages.contains_key(&va))
+}
+
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
+    let (su, sp) = super::vram_small::bytes_for(device);
     let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    let Some(Some(p)) = g.get(&device) else { return (su, sp) };
+    ((p.pages.len() + p.extra_pages.len()) * PAGE + su, p.pools.len() * POOL_PAGES as usize * PAGE + sp)
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
+    let (su, sp) = super::vram_small::bytes();
     let g = PAGES.lock().unwrap();
-    g.values().flatten().fold((0, 0), |(used, pools), p| {
+    g.values().flatten().fold((su, sp), |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
     })
 }
@@ -869,8 +880,9 @@ fn tier2(dev: &ID3D12Device) -> bool {
 }
 
 /// A sampled texture of the title at `va` (`desc`: the PC description, `console_bytes` its size on
-/// the console) backed by shared 64 KiB video-memory pages; None when reserved placement is not
-/// available (the caller falls back to a committed resource).
+/// the console) backed by shared 4 KiB small-resource heaps (when < 64 KiB and not aliasing an
+/// existing 64 KiB GPU page) or shared 64 KiB video-memory pages; None when neither applies (the
+/// caller falls back to a committed resource).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place_pages(
     this: *mut c_void,
@@ -885,6 +897,12 @@ pub unsafe fn place_pages(
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
+    }
+    if !(va % PAGE == 0 && has_live_page(dev.as_raw() as usize, va)) {
+        if let Some(hr) = super::vram_small::place(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
+            PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+            return Some(hr);
+        }
     }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
