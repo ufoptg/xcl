@@ -7789,6 +7789,8 @@ fn gpu_direct_raw_buffer_offsets_that_wrap_are_out_of_range() {
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0), ("OFFEN", 1)], None),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x20), ("OFFEN", 1)], None),
         ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // the instruction offset is what wraps: voff 0xFFFF_FFF0 + OFFSET 0x28 = 0x18 (returns the old value)
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x28), ("OFFEN", 1), ("GLC", 1)], None),
     ]);
     let mut mem = vec![0u32; 256];
     for (i, m) in mem.iter_mut().enumerate() {
@@ -7804,6 +7806,7 @@ fn gpu_direct_raw_buffer_offsets_that_wrap_are_out_of_range() {
         r[4] = 0xC0DE_0000 | l as u32;
         r[5] = 0xDEAD;
         r[6] = 5;
+        r[7] = 5;
     }
     let k = runner::direct_kernel_full(&code, true).unwrap();
     let r = runner::run(&k.dxil, &st, &mem).unwrap();
@@ -7816,4 +7819,10 @@ fn gpu_direct_raw_buffer_offsets_that_wrap_are_out_of_range() {
     assert_eq!(r.vgpr[1][3], 0x1000 + (0x40 + 4 + 0x20) / 4, "lane 1 load");
     assert_eq!(r.mem[(0x40 + 4 + 0x20) / 4], 0xC0DE_0001, "lane 1 store");
     assert_eq!(r.mem[(0x40 + 4) / 4], 0x1000 + (0x40 + 4) / 4 + 5, "lane 1 atomic");
+    // the atomic whose instruction offset wraps (voff + OFFSET): dropped, and it returns 0
+    assert_eq!(r.mem[0x58 / 4], 0x1000 + 0x58 / 4, "atomic at voff 0xFFFF_FFF0 + OFFSET 0x28 dropped");
+    assert_eq!(r.vgpr[0][7], 0, "dropped atomic returns 0");
+    // lane 1 is in range: it adds and returns the old value
+    assert_eq!(r.mem[0x6C / 4], 0x1000 + 0x6C / 4 + 5, "lane 1 atomic with OFFSET");
+    assert_eq!(r.vgpr[1][7], 0x1000 + 0x6C / 4, "lane 1 atomic returns the old value");
 }
