@@ -89,7 +89,13 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
     pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
 }
 
-unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+/// The type of a list XCL keeps state for (`on_create`), without a call to the list; None for
+/// any other
+pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+}
+
+pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -271,6 +277,8 @@ struct Bindings {
     scissors: Vec<windows::Win32::Foundation::RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    /// `RSSetShadingRate` the console set (the sanitized base rate and both combiners)
+    shading_rate: Option<(u32, [D3D12_SHADING_RATE_COMBINER; 2])>,
     vertex_buffers: std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>,
     render_targets: Option<RenderTargets>,
     /// slot → the title's (address, bytes, stride) of the vertex buffer (`XCL_TRACE_FRAME`)
@@ -491,6 +499,69 @@ pub(super) unsafe extern "system" fn om_set_stencil_ref_x(this: *mut c_void, r: 
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r)
 }
 
+/// console #124 RSSetShadingRate, and the newer layout's #126 (`real::NEWER_LIST_SLOTS`):
+/// the PC's `ID3D12GraphicsCommandList5::RSSetShadingRate` (#77). Without variable-rate
+/// shading on the host (`device_x::vrs`, D3D12_FEATURE_D3D12_OPTIONS6) a clean no-op: the
+/// console device always has the method, the PC adapter may not, and there the PC debug
+/// layer refuses the call. What the console passes is sanitized first (`sanitize_shading_rate`).
+pub(super) unsafe extern "system" fn rs_set_shading_rate_x(this: *mut c_void, rate: u32, combiners: *const D3D12_SHADING_RATE_COMBINER) {
+    let Some((tier, additional)) = device_x::vrs() else { return };
+    if tier.0 == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED.0 {
+        return;
+    }
+    // the method takes exactly the PC's two combiners; NULL means the defaults (both
+    // PASSTHROUGH) – a pointer that is not two readable 32-bit values is treated the same way
+    // rather than handed to the PC
+    let combiners = if combiners.is_null() {
+        None
+    } else if crate::gpu::shader::readable(combiners as usize, 8) {
+        let w = combiners as *const u32;
+        Some([w.read_unaligned(), w.add(1).read_unaligned()])
+    } else {
+        static BAD: AtomicU64 = AtomicU64::new(0);
+        if once(&BAD, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetShadingRate with an unreadable combiners pointer {combiners:p} – the default combiners are used");
+        }
+        None
+    };
+    let (rate, combiners) = sanitize_shading_rate(rate, combiners.unwrap_or([0; 2]), additional);
+    with_bindings(this, |b| b.shading_rate = Some((rate, combiners)));
+    apply_shading_rate(this, rate, &combiners);
+}
+
+/// Sanitize a console `RSSetShadingRate` for the PC: an axis the adapter does not support is
+/// clamped to the coarsest supported one (4X → 2X without additional rates – the platform
+/// sanitizes unsupported inputs to a rate that is supported), and a combiner value outside
+/// the five `D3D12_SHADING_RATE_COMBINER` ones acts as PASSTHROUGH (`ApplyCombiner`'s
+/// default arm). Returns the PC rate and combiners.
+fn sanitize_shading_rate(rate: u32, combiners: [u32; 2], additional: bool) -> (u32, [D3D12_SHADING_RATE_COMBINER; 2]) {
+    // D3D12_SHADING_RATE is (x << 2) | y over the axes D3D12_AXIS_SHADING_RATE 1X / 2X / 4X
+    let axis = |a: u32| a.min(if additional { 2 } else { 1 });
+    let rate = axis(rate >> 2) << 2 | axis(rate & 3);
+    let combiner = |c: u32| {
+        if c <= D3D12_SHADING_RATE_COMBINER_SUM.0 as u32 {
+            D3D12_SHADING_RATE_COMBINER(c as i32)
+        } else {
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+        }
+    };
+    (rate, [combiner(combiners[0]), combiner(combiners[1])])
+}
+
+/// Forward `RSSetShadingRate` to `list`'s `ID3D12GraphicsCommandList5` (the PC method):
+/// false when the host has no VRS or the runtime has no CL5 (an old inbox runtime). Also
+/// re-applies the recorded state after KickoffX and a deferred mid-list split (`restore_bindings`).
+unsafe fn apply_shading_rate(list: *mut c_void, rate: u32, combiners: &[D3D12_SHADING_RATE_COMBINER; 2]) -> bool {
+    let Some((tier, _)) = device_x::vrs() else { return false };
+    if tier.0 == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED.0 {
+        return false;
+    }
+    let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return false };
+    let Ok(cl5) = cl.cast::<ID3D12GraphicsCommandList5>() else { return false };
+    cl5.RSSetShadingRate(D3D12_SHADING_RATE(rate as i32), Some(combiners.as_ptr()));
+    true
+}
+
 /// OMSetRenderTargets as the PC list got it (`real::cl_om_set_render_targets`)
 pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     let num_targets = if rtvs.is_null() { 0 } else { n.min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) };
@@ -527,6 +598,9 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
     }
     if let Some(r) = b.stencil {
         pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r);
+    }
+    if let Some((rate, combiners)) = b.shading_rate {
+        apply_shading_rate(this, rate, &combiners);
     }
     for (&slot, v) in &b.vertex_buffers {
         pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS)(this, slot, 1, v);
@@ -6213,6 +6287,114 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    /// A rate and combiners the console passes are sanitized to what the adapter supports
+    /// (D3D12 VRS: unsupported inputs become a supported rate, `ApplyCombiner`'s default arm
+    /// is PASSTHROUGH).
+    #[test]
+    fn sanitize_shading_rate_clamps_to_what_the_adapter_supports() {
+        // D3D12_SHADING_RATE is (x << 2) | y over the axes 1X / 2X / 4X
+        assert_eq!(sanitize_shading_rate(0x5, [0, 0], true).0, 0x5, "2x2 stays");
+        assert_eq!(sanitize_shading_rate(0x1, [0, 0], true).0, 0x1, "1x2 stays");
+        assert_eq!(sanitize_shading_rate(0xA, [0, 0], true).0, 0xA, "4x4 with additional rates stays");
+        assert_eq!(sanitize_shading_rate(0xA, [0, 0], false).0, 0x5, "4x4 without them is 2x2");
+        assert_eq!(sanitize_shading_rate(0xFFFF_FFFF, [0, 0], true).0, 0xA, "every axis clamped to 4X");
+        assert_eq!(sanitize_shading_rate(0xFFFF_00F3, [0, 0], false).0, 0x5, "…and to 2X without them");
+        let (r, c) = sanitize_shading_rate(0x5, [1, 4], true);
+        assert_eq!(r, 0x5);
+        assert_eq!(c, [D3D12_SHADING_RATE_COMBINER_OVERRIDE, D3D12_SHADING_RATE_COMBINER_SUM], "the five combiners stay");
+        let (_, c) = sanitize_shading_rate(0x5, [5, 0xFF], true);
+        assert_eq!(c, [D3D12_SHADING_RATE_COMBINER_PASSTHROUGH; 2], "unknown combiners act as PASSTHROUGH");
+    }
+
+    /// Without a list the handler is a no-op (also once the host's VRS has been probed by
+    /// another test): it must not touch what it was given.
+    #[test]
+    fn rs_set_shading_rate_x_without_a_list_is_a_no_op() {
+        unsafe { rs_set_shading_rate_x(std::ptr::null_mut(), 0xFFFF_0005, std::ptr::null()) };
+    }
+
+    /// A call of the console shading-rate slot on a real list forwards cleanly: the debug
+    /// layer has no error to report – also with arguments the title should not produce, which
+    /// the handler sanitizes before the PC sees them. The debug layer is process-wide (it
+    /// changes every device created after it), so the check runs in a child process
+    /// (`rs_set_shading_rate_x_debug_layer_child`).
+    #[test]
+    fn rs_set_shading_rate_x_forwards_without_debug_layer_errors() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("rs_set_shading_rate_x_debug_layer_child")
+            .args(["--exact", "--test-threads=1"])
+            .env("XCL_SHADING_RATE_DEBUG_CHILD", "1")
+            .output()
+            .expect("spawn the test binary");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        // a skipped child (no GPU) is a skip of this test too
+        if let Some(line) = text.lines().find(|l| l.contains("SKIPPED")) {
+            eprintln!("{line}");
+        }
+        assert!(out.status.success(), "the child's shading-rate calls made debug-layer errors:\n{text}");
+    }
+
+    /// The body of `rs_set_shading_rate_x_forwards_without_debug_layer_errors`, run in a child
+    /// process with the debug layer enabled: on a plain suite run (without the parent's env
+    /// var) a no-op.
+    #[test]
+    fn rs_set_shading_rate_x_debug_layer_child() {
+        if std::env::var_os("XCL_SHADING_RATE_DEBUG_CHILD").is_none() {
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            // the debug layer validates what the handler forwards: enable it before the device
+            let mut dbg: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut dbg).is_ok() {
+                dbg.as_ref().unwrap().EnableDebugLayer();
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            device_x::probe_vrs(&dev);
+            let Ok(q) = dev.cast::<ID3D12InfoQueue>() else {
+                crate::gpu::recomp::runner::skip_test("no InfoQueue");
+                return;
+            };
+            let message = |i: u64| -> Option<(i32, String)> {
+                let mut len = 0usize;
+                if q.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                    return None;
+                }
+                let mut buf = vec![0u8; len];
+                if q.GetMessage(i, Some(buf.as_mut_ptr() as *mut D3D12_MESSAGE), &mut len).is_err() {
+                    return None;
+                }
+                let m = &*(buf.as_ptr() as *const D3D12_MESSAGE);
+                Some((m.Severity.0, std::ffi::CStr::from_ptr(m.pDescription as *const std::ffi::c_char).to_string_lossy().trim_end_matches('\0').to_string()))
+            };
+            let before = q.GetNumStoredMessages();
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let raw = list.as_raw() as *mut c_void;
+            // garbage axes and combiner values (and the same call NULL, the PC default)
+            let bad = [9u32, 0xFF];
+            rs_set_shading_rate_x(raw, 0xFFFF_00F3, bad.as_ptr() as *const D3D12_SHADING_RATE_COMBINER);
+            rs_set_shading_rate_x(raw, 0x5, std::ptr::null());
+            let combiners = [0u32, D3D12_SHADING_RATE_COMBINER_SUM.0 as u32];
+            rs_set_shading_rate_x(raw, 0x5, combiners.as_ptr() as *const D3D12_SHADING_RATE_COMBINER);
+            list.Close().unwrap();
+
+            let errors: Vec<String> = (before..q.GetNumStoredMessages())
+                .filter_map(message)
+                .filter(|(s, _)| *s <= D3D12_MESSAGE_SEVERITY_ERROR.0)
+                .map(|(_, t)| t)
+                .collect();
+            assert!(errors.is_empty(), "debug layer errors: {errors:#?}");
         }
     }
 }

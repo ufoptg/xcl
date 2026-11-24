@@ -540,6 +540,17 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        // variable-rate shading (OPTIONS6): the console's RSSetShadingRate (list_x) forwards
+        // to the PC's ID3D12GraphicsCommandList5 where the adapter supports it
+        match super::device_x::probe_vrs(&device) {
+            Some((D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED, _)) => {
+                crate::xlog_info!("D3D12.X: variable shading rate (OPTIONS6): not supported");
+            }
+            Some((tier, additional)) => {
+                crate::xlog_info!("D3D12.X: variable shading rate (OPTIONS6): tier {}, additional rates {}", tier.0, additional);
+            }
+            None => {}
+        }
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -843,11 +854,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// – FSR4 calls ClearUnorderedAccessViewUint at #53): 0–27 and 56–59 as on PC; the query
 /// methods come right after ExecuteBundle (28–31 = PC 52–55: BeginQuery, EndQuery,
 /// ResolveQueryData, SetPredication), so SetDescriptorHeaps … DiscardResource move up by 4
-/// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65), the shading-rate
-/// methods at 124 / 125 (PC 77 / 78). The console-only methods in between: `list_x`.
+/// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65),
+/// RSSetShadingRateImage at 125 (PC 78). RSSetShadingRate at 124 (and the newer layout's
+/// #126, `NEWER_LIST_SLOTS`) runs `list_x::rs_set_shading_rate_x` (`console_slots`) instead:
+/// the PC method is `ID3D12GraphicsCommandList5` #77. The console-only methods in between:
+/// `list_x`.
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
-        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
+        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(125, 78)]).collect(),
         // the DMA list: Close / Reset, then the copy methods (XDefiant calls #12 with
         // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
         // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
@@ -986,6 +1000,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (22, l::rs_set_scissors_x as usize),
                 (23, l::om_set_blend_factor_x as usize),
                 (24, l::om_set_stencil_ref_x as usize),
+                // the PC method is ID3D12GraphicsCommandList5::RSSetShadingRate (the newer
+                // layout's #126 = this slot, `NEWER_LIST_SLOTS`)
+                (124, l::rs_set_shading_rate_x as usize),
                 (32, l::set_descriptor_heaps_x as usize),
                 (59, b::execute_indirect as usize),
                 (83, l::copy_texture_region_flags_x as usize),
@@ -5467,7 +5484,7 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (126, 124), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -6237,6 +6254,27 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod shading_rate_slot_tests {
+    use super::*;
+    use crate::hle::d3d12x::list_x;
+
+    /// The console's base-layout RSSetShadingRate (#124) and the newer layout's #126 both run
+    /// `list_x::rs_set_shading_rate_x`; RSSetShadingRateImage keeps its direct remap.
+    #[test]
+    fn shading_rate_slots_run_the_handler() {
+        let slots = console_slots(Kind::CommandList);
+        assert!(
+            slots.iter().any(|&(s, f)| s == 124 && f == list_x::rs_set_shading_rate_x as usize),
+            "console #124 (RSSetShadingRate) runs the capability-gated handler"
+        );
+        assert!(NEWER_LIST_SLOTS.contains(&(126, 124)), "the newer layout's #126 is the base layout's #124 (RSSetShadingRate)");
+        let remap = console_remap(Kind::CommandList);
+        assert!(remap.contains(&(125, 78)), "RSSetShadingRateImage keeps its direct remap (PC #78)");
+        assert!(!remap.contains(&(124, 77)), "#124 no longer forwards straight to the PC method");
     }
 }
 
