@@ -29,7 +29,7 @@
 //! hyperbolic / inverse trig ops, and float division (2.5 ULP).
 //! `FMad` may or may not be fused: do not rely on either rounding.
 
-use super::module::{BinOp, CastOp, FnAttrs, RmwOp, Ty, Value};
+use super::module::{BinOp, CastOp, FnAttrs, Pred, RmwOp, Ty, Value};
 use super::shader::{kind, Feature, RawUav, ResClass, Shader};
 
 // ------------------------------------------------------------------ enums
@@ -364,6 +364,16 @@ impl Shader {
         }
         if self.is_i64(a) {
             self.require(Feature::Int64Ops);
+            // i64 min/max intrinsics remove the RX 6800M device on driver 30.0.13002.13003.
+            let pred = match op {
+                Binary::IMax => Pred::SGt,
+                Binary::IMin => Pred::SLt,
+                Binary::UMax => Pred::UGt,
+                Binary::UMin => Pred::ULt,
+                _ => return self.op(op as u32, "binary", Some(t), t, &[a, b], FnAttrs::ReadNone),
+            };
+            let take_a = self.m.cmp(pred, a, b);
+            return self.m.select(take_a, a, b);
         }
         self.op(op as u32, "binary", Some(t), t, &[a, b], FnAttrs::ReadNone)
     }

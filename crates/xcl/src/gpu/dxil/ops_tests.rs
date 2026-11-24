@@ -943,6 +943,7 @@ fn double_unary_legality_matches_dxil_tables() {
 
 #[test]
 fn int64_bit_ops_match_cpu() {
+    const MAX_INPUT: u64 = 0x8000_0000_8000_0000;
     let mut k = kernel();
     let lo = k.input(0);
     let hi = k.input(1);
@@ -959,23 +960,47 @@ fn int64_bit_ops_match_cpu() {
     }
     let rev = k.s.bfrev(v);
     outs.push(k.s.m.cast(CastOp::Trunc, rev, i32));
-    let mx = k.s.binary(Binary::UMax, v, h64);
-    let mx = { let c = k.s.m.const_int(i64, 32); k.s.m.bin(BinOp::LShr, mx, c) };
-    outs.push(k.s.m.cast(CastOp::Trunc, mx, i32));
+    let signed_bound = k.s.m.const_int(i64, (-7_i64) as u64);
+    let unsigned_bound = k.s.m.const_int(i64, MAX_INPUT);
+    for (op, bound) in [
+        (Binary::IMax, signed_bound),
+        (Binary::IMin, signed_bound),
+        (Binary::UMax, unsigned_bound),
+        (Binary::UMin, unsigned_bound),
+    ] {
+        let result = k.s.binary(op, v, bound);
+        outs.push(k.s.m.cast(CastOp::Trunc, result, i32));
+        let high = k.s.m.bin(BinOp::LShr, result, sh);
+        outs.push(k.s.m.cast(CastOp::Trunc, high, i32));
+    }
     for (i, &o) in outs.iter().enumerate() {
         k.out(i as u32, o);
     }
     let c = k.finish([32, 1, 1]);
-    let his: Vec<u32> = UVALS.iter().map(|v| v.rotate_right(9) & 0x00ff_ffff).collect();
+    let mut his: Vec<u32> = UVALS.iter().map(|v| v.rotate_right(9)).collect();
+    // Exercise both low-word orderings for equal high words (lanes 4 and 12).
+    his[4] = (MAX_INPUT >> 32) as u32;
     let Some(r) = gpu(&c, &mem_of(&[UVALS.to_vec(), his.clone()]), &[], &[]) else { return };
     for l in 0..32 {
         let v = UVALS[l] as u64 | (his[l] as u64) << 32;
+        let signed = v as i64;
+        let signed_max = signed.max(-7) as u64;
+        let signed_min = signed.min(-7) as u64;
+        let unsigned_max = v.max(MAX_INPUT);
+        let unsigned_min = v.min(MAX_INPUT);
         let want = [
             v.count_ones(),
             if v == 0 { u32::MAX } else { v.trailing_zeros() },
             if v == 0 { u32::MAX } else { v.leading_zeros() },
             v.reverse_bits() as u32,
-            his[l],
+            signed_max as u32,
+            (signed_max >> 32) as u32,
+            signed_min as u32,
+            (signed_min >> 32) as u32,
+            unsigned_max as u32,
+            (unsigned_max >> 32) as u32,
+            unsigned_min as u32,
+            (unsigned_min >> 32) as u32,
         ];
         for (i, &w) in want.iter().enumerate() {
             assert_eq!(outv(&r, i)[l], w, "i64 op #{i} of {v:#x}");
