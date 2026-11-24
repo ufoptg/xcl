@@ -751,12 +751,22 @@ fn resource_tiling_matches_the_console_library() {
                 for lay in [0x109u32, 0x10A, 0x119, 0x11A, 0x11B, 0x105, 0x101, 0] {
                     let x = desc(3, w, h, a, mips, f, lay, 0);
                     for (first, asked) in [(0u32, 32u32), (0, 2), (1, 32), (3, 7)] {
-                        let (Some(c), Some(o)) = (run(theirs, &x, first, asked), run(ours, &x, first, asked)) else { continue };
-                        cases += 1;
-                        if c != o {
-                            bad.push(format!("fmt {f} {w}x{h} a{a} mips {mips} layout {lay:#x} first {first} asked {asked}:
-   console {c:x?}
-   ours    {o:x?}"));
+                        match (run(theirs, &x, first, asked), run(ours, &x, first, asked)) {
+                            (None, None) => continue,
+                            (Some(c), Some(o)) => {
+                                cases += 1;
+                                if c != o {
+                                    bad.push(format!("fmt {f} {w}x{h} a{a} mips {mips} layout {lay:#x} first {first} asked {asked}:\n   console {c:x?}\n   ours    {o:x?}"));
+                                }
+                            }
+                            (c, o) => {
+                                cases += 1;
+                                bad.push(format!(
+                                    "fmt {f} {w}x{h} a{a} mips {mips} layout {lay:#x} first {first} asked {asked}: creation mismatch (console={}, ours={})",
+                                    c.is_some(),
+                                    o.is_some()
+                                ));
+                            }
                         }
                     }
                 }
@@ -767,5 +777,6 @@ fn resource_tiling_matches_the_console_library() {
     for b in bad.iter().take(6) {
         println!("  {b}");
     }
+    assert!(cases > 0, "expected at least one comparable resource-tiling case");
     assert!(bad.is_empty());
 }
