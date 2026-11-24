@@ -761,8 +761,12 @@ impl Lw {
                             let hp = self.andc(hp, 0xFFFF);
                             let fh = self.s.f16_to_f32(hp);
                             let fb = self.bits(fh);
+                            // SINT (cls 2) halves are signed 16-bit integers
+                            let sx = self.sx16(hp);
+                            let si = self.cmpc(Pred::Eq, cls, 2);
+                            let iv = self.sel(si, sx, hp);
                             let fl = self.cmpc(Pred::Eq, cls, 0);
-                            self.sel(fl, fb, hp)
+                            self.sel(fl, fb, iv)
                         } else {
                             self.vreg(vdata + k as u64)
                         };

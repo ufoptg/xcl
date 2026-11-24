@@ -437,3 +437,36 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// `image_store` with D16 on a SINT texture sign-extends each half: -1 stays -1 instead of
+/// becoming 65535 (clamped to 32767 by the R16 SINT store).
+#[test]
+fn gpu_direct_image_store_d16_sint_sign_extends() {
+    use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_SINT;
+    // T# s[16:23] (SRSRC 4): 2D 16_16_16_16_SINT (format 70); lane 0 stores texel (0, 0)
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None),
+        ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)], None),
+    ]);
+    let k = runner::direct_kernel_full(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&k.dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave64");
+        return;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&[0, 70 << 20, 0, 9 << 28, 0, 0, 0, 0]);
+    let h = |v: i16| v as u16 as u32;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 0;
+        r[10] = h(-1) | h(-100) << 16;
+        r[11] = h(42) | h(-32768) << 16;
+    }
+    let tex = TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R16G16B16A16_SINT, width: 4, height: 4, depth: 1, texel_bytes: 8, data: vec![0; 128], uav: true };
+    let res = runner::run_with_statics(&k.dxil, &st, &[], &[tex], &[], &k.static_samplers).expect("GPU run");
+    let t: Vec<i16> = res.textures[0].chunks(2).map(|c| i16::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(&t[..4], &[-1, -100, 42, -32768], "texel (0, 0) after a D16 IMAGE_STORE on a SINT texture");
+    assert!(t[4..].iter().all(|&v| v == 0), "only texel (0, 0) is written");
+}
