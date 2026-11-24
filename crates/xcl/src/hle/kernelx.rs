@@ -218,18 +218,28 @@ pub mod mirrors {
     /// Bytes of a page the queue's page-mapping method maps (the console's 64 KiB pages).
     pub const PAGE: usize = 0x1_0000;
 
-    /// Pages of GPU views the title pointed somewhere else with the queue's page-mapping
-    /// method (`CopyPageMappingsBatchX`, `apply_batches`): GPU-view page → the page of the
-    /// title's memory it shows, or `None` for a page left unmapped. A page not listed shows
-    /// its CPU view (`source`).
-    static PAGES: Mutex<BTreeMap<usize, Option<usize>>> = Mutex::new(BTreeMap::new());
+    /// What a GPU-view page shows after the page-mapping method: the pool page it was given,
+    /// and the physical page the title had mapped there then (`None`: none). The console maps
+    /// that physical page, which the title often maps into the CPU view too – XCL keeps its
+    /// data where it was mapped last (`super::page_now`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Shown {
+        pub pool: usize,
+        pub page: Option<usize>,
+    }
 
-    /// What the page-mapping method put under `va`: `Some(Some(a))` – `va` shows `a` (the
-    /// same offset in its page), `Some(None)` – nothing (unmapped), `None` – the method never
-    /// mapped that page.
+    /// Pages of GPU views the title pointed somewhere else with the queue's page-mapping
+    /// method (`CopyPageMappingsBatchX`, `apply_batches`): GPU-view page → what it shows, or
+    /// `None` for a page left unmapped. A page not listed shows its CPU view (`source`).
+    static PAGES: Mutex<BTreeMap<usize, Option<Shown>>> = Mutex::new(BTreeMap::new());
+
+    /// What the page-mapping method put under `va`: `Some(Some(a))` – `va` shows the bytes at
+    /// `a` (where XCL keeps the physical page now, else the pool page itself), `Some(None)` –
+    /// nothing (unmapped), `None` – the method never mapped that page.
     pub fn mapped_source(va: usize) -> Option<Option<usize>> {
         let off = va & (PAGE - 1);
-        PAGES.lock().unwrap().get(&(va - off)).map(|to| to.map(|p| p + off))
+        let shown = *PAGES.lock().unwrap().get(&(va - off))?;
+        Some(shown.map(|s| s.page.and_then(super::page_now).unwrap_or(s.pool) + off))
     }
 
     /// One call of the queue's page-mapping method, `CopyPageMappingsBatchX(count, batches,
@@ -285,6 +295,12 @@ pub mod mirrors {
                 at += len * PAGE;
             }
         }
+        // the physical page the title has mapped at each pool page: what the console maps
+        let changes: Vec<(usize, Option<Shown>)> = {
+            let away = super::AWAY.lock().unwrap();
+            let title = |pool: usize| away.as_ref().and_then(|a| a.title.get(&pool).copied());
+            changes.into_iter().map(|(va, to)| (va, to.map(|pool| Shown { pool, page: title(pool) }))).collect()
+        };
         let s = STATE.lock().unwrap();
         let in_view = |va: usize| s.gpu.range(..=va).next_back().is_some_and(|(&g, &(size, _))| va < g + size);
         let mut out = Mapped::default();
@@ -295,7 +311,10 @@ pub mod mirrors {
                 continue;
             }
             match to {
-                Some(_) => out.mapped += 1,
+                Some(s) => {
+                    out.mapped += 1;
+                    out.physical += s.page.is_some() as u64;
+                }
                 None => out.unmapped += 1,
             }
             pages.insert(va, to);
@@ -307,6 +326,8 @@ pub mod mirrors {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Mapped {
         pub mapped: u64,
+        /// of those, pages whose pool page had a physical page the title mapped there
+        pub physical: u64,
         pub unmapped: u64,
         /// pages outside any GPU view: not recorded
         pub elsewhere: u64,
@@ -915,8 +936,20 @@ struct Away {
     /// homes in a sparse window whose pages went away in this call, given back at its end in
     /// runs (`give_back_homes`): one page at a time, a retail game's start took 20 s
     gone: Vec<usize>,
+    /// address → the page the title mapped there last. On the console a page stays mapped at
+    /// every address it was mapped at; here its data is in one place (`page`), so an address it
+    /// moved away from still names it here (the queue's page-mapping method maps the pages of
+    /// such addresses: `mirrors::apply_batches`).
+    title: std::collections::HashMap<usize, usize>,
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
+
+/// Where page `page`'s data is now: the address it is mapped at away from home, else its home
+/// (`None`: no allocated page has that number).
+fn page_now(page: usize) -> Option<usize> {
+    let away = AWAY.lock().unwrap().as_ref().and_then(|a| a.page.get(&page).copied());
+    away.or_else(|| page_home(page))
+}
 
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
@@ -1338,6 +1371,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         // (pages this call moved away and back are home again, not given back)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
+        for (i, &p) in pages.iter().enumerate() {
+            away.title.insert(home + i * PHYS_PAGE, p);
+        }
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
                 unmap_away(away, at, &(home..home + n * PHYS_PAGE));
@@ -1359,6 +1395,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
+        if p == 0 {
+            away.title.remove(&at);
+        } else {
+            away.title.insert(at, p);
+        }
         if unmap_away(away, at, &(0..0)) {
             (at_run, home_run) = Default::default();
         }
@@ -2540,7 +2581,7 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            let mut away = Away::default();
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());
@@ -2790,19 +2831,64 @@ mod tests {
         mirrors::released(other);
     }
 
+    /// A batch of the queue's page-mapping method: the first destination, the number of ranges
+    /// (`kind, start, count` each) and a pointer to them.
+    #[repr(C)]
+    struct Batch {
+        dest: u64,
+        ranges_n: u32,
+        _pad: u32,
+        ranges: usize,
+    }
+    fn batch(dest: usize, r: &[[u32; 3]]) -> Batch {
+        Batch { dest: dest as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize }
+    }
+
+    /// A GPU-view page given a pool page shows the physical page the title mapped there, where
+    /// XCL keeps it: at the pool page, then – once the title maps it into another address too
+    /// (the CPU view of a retail title's streamed textures) – there.
+    #[test]
+    fn a_gpu_view_page_shows_the_physical_page_where_it_is_kept() {
+        use mirrors::{apply_batches, mapped_source, Mapped, PAGE};
+        let null = std::ptr::null_mut();
+        unsafe {
+            let mut n = 1usize;
+            let mut page = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, page.as_mut_ptr()), 1);
+            // used at its home first, so the moves below copy it (no lazy page)
+            let home = MapTitlePhysicalPages(null, 1, 0, 4, page.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            *(home as *mut u32) = 0x600D;
+            // the pool: a reservation of the title's, the page mapped at its page 1
+            let pool = mem::VirtualAlloc(std::ptr::null(), 4 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages((pool + PAGE) as *mut c_void, 1, 0, 4, page.as_mut_ptr()) as usize, pool + PAGE);
+            let (cpu, gpu, size) = (0x7140_0000_0000usize, 0x7146_0000_0000usize, 0x125 * PAGE);
+            mirrors::reserved(cpu, size, 0x2040_2000, mem::PAGE_READWRITE);
+            mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+            // pool pages 0 (nothing mapped there) and 1 at the GPU view's pages 2 and 3
+            let r = [[0, 0, 2]];
+            assert_eq!(apply_batches(1, [batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 2, physical: 1, ..Mapped::default() }));
+            assert_eq!(mapped_source(gpu + 2 * PAGE + 8), Some(Some(pool + 8)), "no physical page: the pool page itself");
+            assert_eq!(mapped_source(gpu + 3 * PAGE + 8), Some(Some(pool + PAGE + 8)));
+            assert_eq!(*(pool as *const u8).add(PAGE).cast::<u32>(), 0x600D);
+            // the title maps the page at another address too: XCL moves its data there, and the
+            // GPU view shows it there
+            let other = mem::VirtualAlloc(std::ptr::null(), PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(other as *mut c_void, 1, 0, 4, page.as_mut_ptr()) as usize, other);
+            assert_eq!(*(other as *const u32), 0x600D);
+            assert_eq!(mapped_source(gpu + 3 * PAGE + 8), Some(Some(other + 8)));
+            mirrors::released(cpu);
+            assert_eq!(FreeTitlePhysicalPages(null, 1, page.as_mut_ptr()), 1);
+            mem::VirtualFree(other as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
     /// The queue's page-mapping method (`CopyPageMappingsBatchX`) points pages of a GPU view
     /// at pool pages or at nothing; a bad call records nothing; releasing the view drops them.
     #[test]
     fn page_mappings_point_gpu_view_pages_at_pool_pages() {
         use mirrors::{apply_batches, mapped_source, Mapped, PAGE};
-        #[repr(C)]
-        struct Batch {
-            dest: u64,
-            ranges_n: u32,
-            _pad: u32,
-            ranges: usize,
-        }
-        let batch = |dest: usize, r: &[[u32; 3]]| Batch { dest: dest as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize };
         // (a size no other test uses, so the GPU view pairs with this CPU view)
         let (cpu, gpu, size) = (0x7100_0000_0000usize, 0x7106_0000_0000usize, 0x123 * PAGE);
         let (pool, pool_pages) = (0x7200_0000_0000usize, 64u32);
@@ -2815,7 +2901,7 @@ mod tests {
             let r1 = [[0, 10, 2], [3, 0, 1], [1, 5, 3], [2, 0, 1]];
             let r2 = [[0, 0, 2]];
             let b = [batch(gpu + 4 * PAGE + 0x1234, &r1), batch(0x7300_0000_0000, &r2)];
-            assert_eq!(apply_batches(2, b.as_ptr() as usize, pool, pool_pages), Some(Mapped { mapped: 5, unmapped: 1, elsewhere: 2 }));
+            assert_eq!(apply_batches(2, b.as_ptr() as usize, pool, pool_pages), Some(Mapped { mapped: 5, unmapped: 1, elsewhere: 2, ..Mapped::default() }));
             assert_eq!(mapped_source(gpu + 4 * PAGE + 0x20), Some(Some(pool + 10 * PAGE + 0x20)));
             assert_eq!(mapped_source(gpu + 5 * PAGE), Some(Some(pool + 11 * PAGE)));
             assert_eq!(mapped_source(gpu + 6 * PAGE), None, "kept");

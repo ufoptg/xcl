@@ -5064,13 +5064,14 @@ unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pag
     static MAPPED: AtomicU64 = AtomicU64::new(0);
     static UNMAPPED: AtomicU64 = AtomicU64::new(0);
     static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+    static PHYSICAL: AtomicU64 = AtomicU64::new(0);
     let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
         Some(d) => {
             let add = |total: &AtomicU64, k: u64| total.fetch_add(k, Ordering::Relaxed) + k;
-            let (m, u, e) = (add(&MAPPED, d.mapped), add(&UNMAPPED, d.unmapped), add(&ELSEWHERE, d.elsewhere));
+            let (m, p, u, e) = (add(&MAPPED, d.mapped), add(&PHYSICAL, d.physical), add(&UNMAPPED, d.unmapped), add(&ELSEWHERE, d.elsewhere));
             if n == 1 || n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {m} mapped, {u} unmapped; {e} pages elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB)");
+                crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {n} calls; GPU-view pages so far: {m} mapped ({p} to a physical page the title mapped there), {u} unmapped; {e} pages elsewhere ignored (pool {pool:#x}, {pool_pages} pages of 64 KiB)");
             }
         }
         None => {
