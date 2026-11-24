@@ -3929,13 +3929,27 @@ pub(crate) mod driver_cache {
         format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+    pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+    }
+
+    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+    }
+
+    pub(super) fn two_pass_threshold() -> std::time::Duration {
+        static MIN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *MIN.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE_MIN_MS").ok()
+            .and_then(|v| v.trim().parse().ok()).map_or(KEEP, std::time::Duration::from_millis))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
         std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    pub(super) fn stats() -> (u64, u64, u64) {
+        (HITS.load(Ordering::Relaxed), STALE.load(Ordering::Relaxed), STORED.load(Ordering::Relaxed))
     }
 
     /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
@@ -3943,7 +3957,7 @@ pub(crate) mod driver_cache {
         if ok {
             let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's blob of an earlier run (kept on disk)");
+                crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's blob of an earlier run (kept on disk)");
             }
         } else {
             if let Some(p) = p {
@@ -3993,7 +4007,11 @@ pub(crate) mod driver_cache {
 
     /// Keep `blob`, of a build that took `took`, for the next run.
     pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        if took >= KEEP && write(p, blob) {
+        keep_at(p, blob, took, KEEP);
+    }
+
+    pub(super) fn keep_at(p: &Path, blob: &[u8], took: std::time::Duration, min: std::time::Duration) {
+        if took >= min && write(p, blob) {
             let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
@@ -4079,8 +4097,8 @@ pub(crate) mod driver_cache {
     }
 }
 
-/// The driver's compiled form of translated compute programs (`GetCachedBlob`),
-/// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
+/// Driver blobs, keyed by (identity hash, root signature, domain or compute flags),
+/// up to `COMPUTE_BLOBS_MAX` bytes across ordinary compute and both two-pass PSOs.
 static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
 const COMPUTE_BLOBS_MAX: usize = 512 << 20;
 /// smaller programs compile in milliseconds: not kept
@@ -4124,33 +4142,55 @@ mod compute_blob_tests {
             *total += 3;
         }
         assert_eq!(super::compute_blob(key).as_deref().map(|v| v.len()), Some(3));
-        let before = super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1;
         super::forget_compute_blob(key);
-        assert!(super::compute_blob(key).is_none());
-        assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+        let guard = super::COMPUTE_BLOBS.lock().unwrap();
+        let (map, total) = guard.as_ref().unwrap();
+        assert!(!map.contains_key(&key));
+        assert_eq!(*total, map.values().map(|blob| blob.len()).sum::<usize>());
     }
 }
 
-/// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
+/// Read the driver's compiled blob from an adopted or raw PC pipeline state.
+unsafe fn pso_cached_blob(pso: &ID3D12PipelineState) -> Option<Vec<u8>> {
+    let raw = pso.as_raw();
+    let blob = if is_adopted(raw) {
+        type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+        let get: GetBlob = std::mem::transmute(orig_fn(raw, slot_of(raw, "GetCachedBlob")));
+        let mut blob = std::ptr::null_mut();
+        let hr = get(raw, &mut blob);
+        if blob.is_null() { return None }
+        let blob = ID3DBlob::from_raw(blob);
+        if hr < 0 { return None }
+        blob
+    } else {
+        pso.GetCachedBlob().ok()?
+    };
+    let ptr = blob.GetBufferPointer().cast::<u8>();
+    let size = blob.GetBufferSize();
+    if ptr.is_null() || size == 0 { return None }
+    Some(std::slice::from_raw_parts(ptr, size).to_vec())
+}
+
+fn store_compute_blob(key: (u64, usize, i32), blob: std::sync::Arc<Vec<u8>>) {
+    let mut guard = COMPUTE_BLOBS.lock().unwrap();
+    let (map, total) = guard.get_or_insert_with(Default::default);
+    if blob.is_empty() || blob.len() > COMPUTE_BLOBS_MAX - *total {
+        return;
+    }
+    if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(key) {
+        *total += blob.len();
+        entry.insert(blob);
+    }
+}
+
+/// Keep the driver's compiled blob of an adopted title compute PSO.
 unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
     if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
         return;
     }
-    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
-    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
-    let mut raw = std::ptr::null_mut();
-    if get(pso, &mut raw) < 0 || raw.is_null() {
-        return;
+    if let Some(blob) = ID3D12PipelineState::from_raw_borrowed(&pso).and_then(|p| pso_cached_blob(p)) {
+        store_compute_blob(key, std::sync::Arc::new(blob));
     }
-    let blob = ID3DBlob::from_raw(raw);
-    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
-    let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4744,6 +4784,180 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
+fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if let Some(ps) = ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
+    use crate::gpu::recomp::{dxc, runner};
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if super::backend() != super::Backend::Real {
+        return runner::skip_test("no GPU");
+    }
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    if unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS7).cast(), std::mem::size_of_val(&options) as u32) }.is_err()
+        || options.MeshShaderTier.0 < D3D12_MESH_SHADER_TIER_1.0
+    {
+        return runner::skip_test("no mesh shaders");
+    }
+    let (ms, _) = dummy_mesh().expect("compile a synthetic triangle mesh shader");
+    unsafe {
+        let mut sig = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+        let sig = sig.unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(
+            0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize()),
+        ).unwrap();
+        let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreatePipelineState")));
+        let build = |stream: &StreamOut| {
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let mut pso = std::ptr::null_mut();
+            let hr = create(raw, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "mesh PSO creation failed ({hr:#x})");
+            ID3D12PipelineState::from_raw(pso)
+        };
+
+        let mut reference = StreamOut::default();
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs.as_raw());
+        reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        let blob = build(&reference).GetCachedBlob().unwrap();
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let subobjects = stream_subobjects(&translated.0).unwrap();
+        let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
+        assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
+        translated.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.GetBufferPointer(),
+            CachedBlobSizeInBytes: blob.GetBufferSize(),
+        });
+        build(&translated);
+    }
+}
+
+mod two_pass_identity;
+use two_pass_identity::{two_pass_cs_key, two_pass_stream_key, Fnv64};
+
+/// Persistent driver-cache counters for the current process: (hits, rejected, saved).
+#[doc(hidden)]
+pub fn driver_cache_stats() -> (u64, u64, u64) {
+    driver_cache::stats()
+}
+
+fn two_pass_driver_id(device: *mut c_void) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
+    let luid = unsafe { dev.GetAdapterLuid() };
+    let key = (luid.HighPart, luid.LowPart);
+    static IDS: OnceLock<Mutex<HashMap<(i32, u32), Option<u64>>>> = OnceLock::new();
+    let mut ids = IDS.get_or_init(Default::default).lock().unwrap();
+    *ids.entry(key).or_insert_with(|| unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc().ok()?;
+        let version = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+        let mut h = Fnv64::new();
+        h.u32(desc.VendorId);
+        h.u32(desc.DeviceId);
+        h.u32(desc.SubSysId);
+        h.u32(desc.Revision);
+        h.u64(version as u64);
+        Some(h.finish())
+    })
+}
+
+struct TwoPassBlob {
+    key: (u64, usize, i32),
+    disk: Option<std::path::PathBuf>,
+}
+
+impl TwoPassBlob {
+    fn new(hash: u64, bytes: usize, rs: *mut c_void, mesh: bool, persist: bool) -> Self {
+        let (prefix, tag) = if mesh { ("tp-ms", 0x5450_0001) } else { ("tp-cs", 0x5450_0002) };
+        let disk = persist.then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(
+            format!("{prefix}-{hash:016x}-{bytes:x}-0.pso"),
+        ));
+        Self { key: (hash, rs as usize, tag), disk }
+    }
+}
+
+/// Try the shared RAM cache first, then disk. Discard the disk counterpart of a
+/// rejected RAM blob as well, so a later process cannot load the rejected entry.
+unsafe fn build_two_pass_pso(
+    kind: &str,
+    bytes: usize,
+    cache: Option<&TwoPassBlob>,
+    take_cold_slot: &mut impl FnMut(),
+    mut create: impl FnMut(Option<&[u8]>, *mut *mut c_void) -> HRESULT,
+) -> Result<(HRESULT, ID3D12PipelineState, bool), HRESULT> {
+    let mut attempt = |blob: Option<&[u8]>| {
+        let mut raw = std::ptr::null_mut();
+        let (hr, took) = driver_compile_identified(kind, bytes, false, cache.map(|c| (c.key.0, blob.is_some())), || {
+            create(blob, &mut raw)
+        });
+        // Own even a partial result so any failure releases it before a retry.
+        let pso = (!raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw));
+        match pso {
+            Some(pso) if hr >= 0 => Ok((hr, pso, took)),
+            _ => Err(if hr < 0 { hr } else { E_INVALIDARG }),
+        }
+    };
+    if let Some(cache) = cache {
+        let disk = cache.disk.as_deref();
+        let mem = compute_blob(cache.key);
+        let from_disk = mem.is_none();
+        let cached = mem.or_else(|| disk.and_then(driver_cache::load).map(std::sync::Arc::new));
+        if let Some(blob) = cached {
+            if let Ok((hr, pso, _)) = attempt(Some(&blob)) {
+                if from_disk {
+                    driver_cache::note(true, None);
+                    store_compute_blob(cache.key, blob);
+                }
+                return Ok((hr, pso, true));
+            }
+            // A different thread may already have installed a replacement.
+            if let Some((map, total)) = COMPUTE_BLOBS.lock().unwrap().as_mut() {
+                if map.get(&cache.key).is_some_and(|b| std::sync::Arc::ptr_eq(b, &blob)) {
+                    *total -= map.remove(&cache.key).unwrap().len();
+                }
+            }
+            if from_disk || disk.is_some_and(|p| p.is_file()) {
+                driver_cache::note(false, disk);
+            }
+        }
+    }
+    take_cold_slot();
+    let (hr, pso, took) = attempt(None)?;
+    if let Some(cache) = cache {
+        let min = driver_cache::two_pass_threshold();
+        let disk = cache.disk.as_deref().filter(|_| took >= min);
+        let keep_ram = bytes >= COMPUTE_BLOB_MIN_DXIL || took >= min;
+        if let Some(blob) = (disk.is_some() || keep_ram).then(|| pso_cached_blob(&pso)).flatten() {
+            if let Some(path) = disk {
+                driver_cache::keep_at(path, &blob, took, min);
+            }
+            if keep_ram {
+                store_compute_blob(cache.key, std::sync::Arc::new(blob));
+            }
+        }
+    }
+    Ok((hr, pso, false))
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
@@ -4755,48 +4969,130 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
     }
 }
 
-/// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
-/// the title gets the mesh pipeline state.
+#[cfg(test)]
+mod two_pass_blob_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_insertion_counts_each_key_once() {
+        let key = (0x1357, 0, 0x5450_0001);
+        let blob = std::sync::Arc::new(vec![1; 64]);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| store_compute_blob(key, blob.clone()));
+            }
+        });
+        assert!(std::sync::Arc::ptr_eq(&compute_blob(key).unwrap(), &blob));
+        {
+            let guard = COMPUTE_BLOBS.lock().unwrap();
+            let (map, total) = guard.as_ref().unwrap();
+            assert_eq!(*total, map.values().map(|blob| blob.len()).sum::<usize>());
+        }
+        forget_compute_blob(key);
+    }
+
+    #[test]
+    fn a_rejected_ram_blob_evicts_its_disk_entry_before_the_gated_retry() {
+        let key = (0x2468, 0, 0x5450_0002);
+        let file = std::env::temp_dir().join(format!("xcl-rejected-two-pass-{}.pso", std::process::id()));
+        std::fs::write(&file, b"corrupt disk").unwrap();
+        store_compute_blob(key, std::sync::Arc::new(b"rejected RAM".to_vec()));
+        let cache = TwoPassBlob { key, disk: Some(file.clone()) };
+        let step = std::cell::Cell::new(0);
+        let result = unsafe {
+            build_two_pass_pso("NGG compute pass", 10, Some(&cache), &mut || {
+                assert_eq!(step.replace(2), 1);
+                assert!(!file.exists());
+                assert!(compute_blob(key).is_none());
+            }, |blob, _| {
+                if step.get() == 0 {
+                    assert_eq!(blob, Some(b"rejected RAM".as_slice()));
+                    step.set(1);
+                } else {
+                    assert_eq!(step.replace(3), 2);
+                    assert!(blob.is_none());
+                }
+                E_INVALIDARG
+            })
+        };
+        assert!(matches!(result, Err(E_INVALIDARG)));
+        assert_eq!(step.get(), 3);
+    }
+}
+
+/// Build both PSOs. A draw executes the NGG compute pass first, then the passthrough mesh graphics pass.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
-    let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    // the mesh pass and its compute pass: one turn for both
+    if ppv.is_null() { return E_INVALIDARG }
+    *ppv = std::ptr::null_mut();
+
+    let driver = two_pass_driver_id(this);
+    let persist = driver.is_some() && driver_cache::enabled();
+    let windows = crate::gpu::recomp::pso::mem_windows();
+    let cs = TwoPassBlob::new(two_pass_cs_key(&tp.cs, &tp.samplers, driver.unwrap_or(0), windows), tp.cs.len(), rs, false, persist);
+    let mesh = two_pass_stream_key(&stream.0, ps_samplers, driver.unwrap_or(0), windows)
+        .map(|(h, n)| TwoPassBlob::new(h, n, mesh_rs, true, persist));
+
+    // Take at most one cold turn for the pair, also when a cached attempt needs a retry.
     let bytes = stream.shader_bytes() + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
-    let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
-    if gate {
-        crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
-    }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
-    if hr < 0 {
-        note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
-        return E_INVALIDARG;
-    }
-    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
-    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    cdesc.CS = bytecode(&tp.cs);
-    let iid = pc_iid(Kind::PipelineState);
-    let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = driver_compile("compute pass", tp.cs.len(), false, || {
-        driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+    let mut cold_slot = None;
+    let mut take_cold_slot = || {
+        cold_slot.get_or_insert_with(|| {
+            let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+            gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten()
+        });
+    };
+
+    let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    let mesh_result = build_two_pass_pso("passthrough mesh graphics pass", stream.shader_bytes(), mesh.as_ref(), &mut take_cold_slot, |blob, out| {
+        let mut cached_stream;
+        let stream = if let Some(blob) = blob {
+            cached_stream = StreamOut(stream.0.clone(), stream.1);
+            cached_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len(),
+            });
+            &cached_stream
+        } else {
+            stream
+        };
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        finish_pso(this, fs, desc.as_ptr().cast(), riid, out)
     });
-    drop(_slot);
-    if hc < 0 || compute.is_null() {
-        note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
-        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
-        release(*ppv);
-        *ppv = std::ptr::null_mut();
-        return E_INVALIDARG;
-    }
+    let (hr, mesh_pso, mesh_reused) = match mesh_result {
+        Ok(result) => result,
+        Err(hr) => {
+            note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
+            return E_INVALIDARG;
+        }
+    };
+
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    desc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    desc.CS = bytecode(&tp.cs);
+    let iid = pc_iid(Kind::PipelineState);
+    let compute_result = build_two_pass_pso("NGG compute pass", tp.cs.len(), Some(&cs), &mut take_cold_slot, |blob, out| {
+        desc.CachedPSO = blob.map_or_else(Default::default, |b| D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: b.as_ptr().cast(), CachedBlobSizeInBytes: b.len(),
+        });
+        driver_pso(fc, this, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, out)
+    });
+    drop(cold_slot);
+    let (_, compute, cs_reused) = match compute_result {
+        Ok(result) => result,
+        Err(hr) => {
+            note_translation_error(format!("the driver rejected the NGG compute pass of the console {kind} ({hr:#x})"));
+            return E_INVALIDARG;
+        }
+    };
+
+    *ppv = mesh_pso.into_raw();
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+    if n < 5 || n % 1000 == 0 || pso_trace() {
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (NGG compute {} B, blob reused: {cs_reused}; passthrough mesh graphics {} B, blob reused: {mesh_reused})", tp.cs.len(), tp.ms.len());
     }
     hr
 }
@@ -4856,14 +5152,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -4879,7 +5170,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4931,12 +5222,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = StreamOut::default();
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
-        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
-    }
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
@@ -4950,7 +5236,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
