@@ -212,7 +212,8 @@ impl Lw {
                     let fib = self.b(fi);
                     let ok0 = self.lor(fib, on);
                     let ok = self.land(valid, ok0);
-                    let r = self.read_lane_half(v, lc);
+                    let src_l = self.sel(ok, lc, self.lane);
+                    let r = self.read_lane_half(v, src_l);
                     let (rm, bm) = (fv("ROW_MASK") as u32, fv("BANK_MASK") as u32);
                     let lane = self.lane;
                     let row = self.lshrc(lane, 4);
@@ -246,13 +247,14 @@ impl Lw {
                     let s = self.bin(BinOp::LShr, k, sh);
                     let s = self.andc(s, 7);
                     let l = self.or(a, s);
-                    let r = self.read_lane_half(v, l);
                     t = if !fi {
                         let on = self.lanebit_at(el, eh, l);
+                        let src_l = self.sel(on, l, self.lane);
+                        let r = self.read_lane_half(v, src_l);
                         let z = self.c(0);
                         self.sel(on, r, z)
                     } else {
-                        r
+                        self.read_lane_half(v, l)
                     };
                 }
                 if !u.is_empty() {
