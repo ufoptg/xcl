@@ -819,9 +819,7 @@ impl Lw {
                 if glc {
                     let old = self.rd(tmp);
                     let a = self.act();
-                    let cur = self.vreg(vdata);
-                    let nv = self.sel(a, old, cur);
-                    self.wr(VAR_VGPR + vdata as u32, nv);
+                    self.wr_if(VAR_VGPR + vdata as u32, a, old);
                 }
                 Ok(())
             }
@@ -974,9 +972,7 @@ impl Lw {
             out = vals.to_vec();
         }
         for (k, v) in out.into_iter().enumerate() {
-            let old = self.vreg(vdata + k as u64);
-            let nv = self.sel(act, v, old);
-            self.wr(VAR_VGPR + (vdata + k as u64) as u32, nv);
+            self.wr_if(VAR_VGPR + (vdata + k as u64) as u32, act, v);
         }
         Ok(())
     }

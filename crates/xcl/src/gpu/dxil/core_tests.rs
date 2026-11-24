@@ -437,3 +437,228 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// Full-wave CS / MS shaders and shaders whose EXEC is folded back to all-ones
+/// (`s_or_saveexec_* -1`) emit no `select` or `br i1` lane guards and skip dead
+/// `old`/`cur` VGPR reads; partial-wave shaders keep both guards, and RMW ops
+/// like `v_fmac_f32` still read `cur`.
+#[test]
+fn full_wave_exec_folds_away_lane_guards_and_dead_vgpr_reads() {
+    use super::kernel::{translate_compute, translate_mesh};
+    use super::validate;
+    use crate::gpu::recomp::{runner, CsInterface, MsInterface};
+    if crate::gpu::recomp::dxc::create_instance().is_none() {
+        return runner::skip_test("no dxcompiler.dll");
+    }
+    let cs_code = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 129), ("VSRC1", 2)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 244), ("VSRC1", 2)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let cs = |n| CsInterface { threads: [n, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let ko = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+
+    // Full-wave native CS (wave64 and wave32): zero lane-guard selects or branches.
+    for (wave64, n) in [(true, 64), (false, 32)] {
+        let dxil = translate_compute(&cs_code, ko(wave64, false), &cs(n)).unwrap().dxil;
+        let dis = validate::disassemble(&dxil).expect("disassembly");
+        assert!(!dis.contains("select "), "full-wave CS (wave64={wave64}) emitted select:\n{dis}");
+        assert!(!dis.contains("br i1 "), "full-wave CS (wave64={wave64}) emitted br i1:\n{dis}");
+    }
+
+    // Split wave64 full-wave CS: no br i1 guards, and VGPR writes add zero selects.
+    let split_one = translate_compute(&cs_code, ko(true, true), &cs(64)).unwrap().dxil;
+    let dis_one = validate::disassemble(&split_one).expect("disassembly");
+    assert!(!dis_one.contains("br i1 "), "split full-wave CS emitted br i1:\n{dis_one}");
+    let cs_more = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 129), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 131), ("VSRC1", 4)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 132), ("VSRC1", 5)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 6), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let dis_more = validate::disassemble(&translate_compute(&cs_more, ko(true, true), &cs(64)).unwrap().dxil).expect("disassembly");
+    assert!(!dis_more.contains("br i1 "), "split full-wave CS emitted br i1:\n{dis_more}");
+    assert_eq!(dis_more.matches("select ").count(), dis_one.matches("select ").count(), "VGPR writes in split full-wave CS added selects");
+
+    // Full-wave native MS (wave64 and wave32): zero selects or branches.
+    let ms_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0), ("DONE", 1)], None),
+    ]);
+    for (wave64, n) in [(true, 64), (false, 32)] {
+        let ms = MsInterface { outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], threads: n, max_vertices: n, max_primitives: 1 };
+        let dxil = translate_mesh(&ms_code, ko(wave64, false), &ms).unwrap().dxil;
+        let dis = validate::disassemble(&dxil).expect("disassembly");
+        assert!(!dis.contains("select "), "full-wave MS (wave64={wave64}) emitted select:\n{dis}");
+        assert!(!dis.contains("br i1 "), "full-wave MS (wave64={wave64}) emitted br i1:\n{dis}");
+    }
+
+    // Partial-wave CS keeps both guards; `s_or_saveexec_* -1` folds EXEC back to all-ones.
+    for (wave64, n, restore) in [(true, 48, "S_OR_SAVEEXEC_B64"), (false, 16, "S_OR_SAVEEXEC_B32")] {
+        let dis_part = validate::disassemble(&translate_compute(&cs_code, ko(wave64, false), &cs(n)).unwrap().dxil).expect("disassembly");
+        assert!(dis_part.contains("select "), "partial-wave CS (wave64={wave64}) lost VGPR select guard");
+        assert!(dis_part.contains("br i1 "), "partial-wave CS (wave64={wave64}) lost memory br i1 guard");
+
+        let restored = prog(&[
+            (restore, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 193)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 0)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ]);
+        let dis_rest = validate::disassemble(&translate_compute(&restored, ko(wave64, false), &cs(n)).unwrap().dxil).expect("disassembly");
+        assert!(!dis_rest.contains("select "), "{restore} -1 still emitted select:\n{dis_rest}");
+        assert!(!dis_rest.contains("br i1 "), "{restore} -1 still emitted br i1:\n{dis_rest}");
+    }
+
+    // Kernel mode: unconditional VGPR writes skip dead initial `io` loads, while `v_fmac_f32` loads `cur`.
+    let k_write = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 5)], None),
+    ]);
+    let dis_w = validate::disassemble(&translate(&k_write, ko(true, false)).unwrap()).expect("disassembly");
+    assert!(!dis_w.contains("select "), "all-ones kernel emitted select:\n{dis_w}");
+    assert_eq!(dis_w.matches("@dx.op.rawBufferLoad.i32(i32 139").count(), 4, "dead VGPR loads remained:\n{dis_w}");
+
+    let k_rmw = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 244), ("VSRC1", 6)], None),
+    ]);
+    let dis_r = validate::disassemble(&translate(&k_rmw, ko(true, false)).unwrap()).expect("disassembly");
+    assert!(!dis_r.contains("select "), "all-ones RMW kernel emitted select:\n{dis_r}");
+    assert_eq!(dis_r.matches("@dx.op.rawBufferLoad.i32(i32 139").count(), 6, "v_fmac_f32 must still load v5 (cur) and v6:\n{dis_r}");
+}
+
+/// GPU verification of EXEC folding: EXEC=0, half-active 64-bit masks (lower only and
+/// upper only), `s_or_saveexec_b64 -1` restoring all lanes, dynamic EXEC narrowing in
+/// full/partial-wave compute shaders, and `v_fmac_f32` reading `cur` under folded EXEC.
+#[test]
+fn exec_folding_and_rmw_match_expected_on_gpu() {
+    use super::kernel::translate_compute;
+    use crate::gpu::recomp::{runner, CsInterface};
+    let has64 = match runner::wave64_supported() {
+        Ok(b) => b,
+        Err(e) => return runner::skip_test(&e),
+    };
+    let has32 = match runner::wave32_supported() {
+        Ok(b) => b,
+        Err(e) => return runner::skip_test(&e),
+    };
+    if !has64 && !has32 {
+        return runner::skip_test("neither wave64 nor wave32 support");
+    }
+    let ko = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+    let w64 = ko(true, !has64);
+
+    let mut init = runner::KernelState::default();
+    let mem_init: Vec<u32> = (0..64u32).map(|l| 0xBEEF_0000 + l).collect();
+    for l in 0..64 {
+        init.vgpr[l][0] = 100 + l as u32;
+        init.vgpr[l][1] = (l as u32) * 4;
+        init.vgpr[l][2] = 777;
+        init.vgpr[l][3] = (10.0 + l as f32).to_bits();
+        init.vgpr[l][4] = (3.0 + l as f32).to_bits();
+    }
+
+    // 1. Constant EXEC = 0: neither VGPR write nor memory store executes.
+    let zero_code = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 170)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let r = runner::run(&translate(&zero_code, w64).unwrap(), &init, &mem_init).expect("EXEC=0 GPU run");
+    for l in 0..64 {
+        assert_eq!(r.vgpr[l][0], 100 + l as u32, "EXEC=0 clobbered v0 at lane {l}");
+        assert_eq!(r.mem[l], mem_init[l], "EXEC=0 clobbered mem at lane {l}");
+    }
+
+    // 2. Half-active constant EXEC (lower-only and upper-only), then `s_or_saveexec_b64 -1` + `v_fmac_f32`.
+    for (lo_src, hi_src, upper_only) in [(193u64, 128u64, false), (128u64, 193u64, true)] {
+        let half_code = prog(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", lo_src)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", hi_src)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 170)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 193)], None),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 0)], None),
+            ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 244), ("VSRC1", 4)], None),
+        ]);
+        let r = runner::run(&translate(&half_code, w64).unwrap(), &init, &mem_init).expect("half-EXEC GPU run");
+        assert_eq!(r.sgpr[0], if upper_only { 0 } else { u32::MAX }, "saved EXEC_LO (upper_only={upper_only})");
+        assert_eq!(r.sgpr[1], if upper_only { u32::MAX } else { 0 }, "saved EXEC_HI (upper_only={upper_only})");
+        assert_eq!((r.sgpr[126], r.sgpr[127]), (u32::MAX, u32::MAX), "restored EXEC");
+        for l in 0..64 {
+            let active = if upper_only { l >= 32 } else { l < 32 };
+            let want_v0 = if active { 42 } else { 100 + l as u32 };
+            let want_mem = if active { 42 } else { mem_init[l] };
+            let want_fmac = (2.0 * (3.0 + l as f32) + (10.0 + l as f32)).to_bits();
+            assert_eq!(r.vgpr[l][0], want_v0, "v0 lane {l} (upper_only={upper_only})");
+            assert_eq!(r.mem[l], want_mem, "mem lane {l} (upper_only={upper_only})");
+            assert_eq!(r.vgpr[l][2], want_v0 + 1, "v2 after s_or_saveexec_b64 -1 lane {l}");
+            assert_eq!(r.vgpr[l][3], want_fmac, "v_fmac_f32 cur read lane {l}");
+        }
+    }
+
+    // 3. Full-wave CS with RMW (`v_fmac_f32`), dynamic narrowing, and `s_or_saveexec_b64 -1` restore.
+    let cs = |n| CsInterface { threads: [n, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let full_cs = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 244), ("VSRC1", 2)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 170)], None),
+        ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 193)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let cs_in: Vec<u32> = (0..64).map(|l| (l as f32).to_bits()).collect();
+    let dxil = translate_compute(&full_cs, w64, &cs(64)).unwrap().dxil;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &[], &cs_in).expect("full-wave CS dispatch");
+    for (l, &got) in out.iter().enumerate().take(64) {
+        let want = if l < 16 { 42 } else { (2.0 * (l as f32) + 1.0).to_bits() };
+        assert_eq!(got, want, "full-wave CS lane {l}");
+    }
+
+    // 4. Partial-wave CS (`[48, 1, 1]`): inactive lanes inside the wave do not store.
+    let part_cs = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 138), ("VSRC1", 0)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let sentinel = vec![0xDEAD_BEEFu32; 64];
+    let dxil = translate_compute(&part_cs, w64, &cs(48)).unwrap().dxil;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &[], &sentinel).expect("partial-wave CS dispatch");
+    for (l, &got) in out.iter().enumerate().take(64) {
+        let want = if l < 16 { l as u32 + 10 } else { 0xDEAD_BEEF };
+        assert_eq!(got, want, "partial-wave CS lane {l}");
+    }
+
+    // 5. Wave32 full-wave CS when wave32 is supported.
+    if has32 {
+        let full_w32 = prog(&[
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+            ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 244), ("VSRC1", 2)], None),
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)], None),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 170)], None),
+            ("S_OR_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 193)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ]);
+        let dxil = translate_compute(&full_w32, ko(false, false), &cs(32)).unwrap().dxil;
+        let out = runner::dispatch(&dxil, [1, 1, 1], &[], &cs_in).expect("wave32 full-wave CS dispatch");
+        for (l, &got) in out.iter().enumerate().take(32) {
+            let want = if l < 16 { 42 } else { (2.0 * (l as f32) + 1.0).to_bits() };
+            assert_eq!(got, want, "wave32 full-wave CS lane {l}");
+        }
+    }
+}

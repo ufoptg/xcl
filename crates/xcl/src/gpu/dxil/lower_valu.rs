@@ -315,18 +315,18 @@ impl Lw {
             if let (Some(e), Dst::V(n)) = (ext_encoding(d), dst) {
                 let fv = |k: &str| rdna2::field_value(e, &d.words, k).unwrap_or(0);
                 if e.field("DST_SEL").is_some() {
-                    let cur = self.vreg(*n);
-                    val = self.sdwa_dst(val, cur, fv("DST_SEL") as u32, fv("DST_UNUSED") as u32);
+                    let sel = fv("DST_SEL") as u32;
+                    let unused = fv("DST_UNUSED") as u32;
+                    let cur = if sel < 6 && unused == 2 { self.vreg(*n) } else { self.c(0) };
+                    val = self.sdwa_dst(val, cur, sel, unused);
                 }
             }
         }
         match (self.dpp_enable.take(), dst) {
             (Some(en), Dst::V(n)) => {
-                let old = self.vreg(*n);
                 let a = self.act();
                 let c = self.land(a, en);
-                let v = self.sel(c, val, old);
-                self.wr(VAR_VGPR + *n as u32, v);
+                self.wr_if(VAR_VGPR + *n as u32, c, val);
             }
             _ => self.write32(dst, val),
         }
@@ -391,8 +391,8 @@ impl Lw {
         }
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let z = self.c(0);
-        let cur = match &dst {
-            Dst::V(n) => self.vreg(*n),
+        let cur = |s: &mut Self| match dst {
+            Dst::V(n) => s.vreg(n),
             _ => z,
         };
         let a = u.first().map(|s| s.w()).unwrap_or(z);
@@ -412,7 +412,7 @@ impl Lw {
             }};
         }
         if self.f32_rm {
-            if let Some(e) = self.valu_f32_rm(name, &m, &u, cur)? {
+            if let Some(e) = self.valu_f32_rm(name, &m, &u, &cur)? {
                 let res = self.fres(&m, e);
                 self.vwrite(d, &dst, res);
                 return Ok(());
@@ -468,13 +468,15 @@ impl Lw {
                 };
                 let h = self.to_f16(x);
                 if m.opsel >> 3 & 1 == 1 {
-                    let l = self.andc(cur, 0xFFFF);
+                    let old = cur(self);
+                    let l = self.andc(old, 0xFFFF);
                     let hh = self.shlc(h, 16);
                     self.or(l, hh)
                 } else if d.variant == Variant::Sdwa {
                     h
                 } else {
-                    let hi = self.andc(cur, 0xFFFF_0000);
+                    let old = cur(self);
+                    let hi = self.andc(old, 0xFFFF_0000);
                     self.or(hi, h)
                 }
             }
@@ -520,13 +522,15 @@ impl Lw {
                     "v_fma_mix_f32" => self.bits(e),
                     "v_fma_mixlo_f16" => {
                         let h = self.to_f16(e);
-                        let hi = self.andc(cur, 0xFFFF_0000);
+                        let old = cur(self);
+                        let hi = self.andc(old, 0xFFFF_0000);
                         self.or(hi, h)
                     }
                     _ => {
                         let h = self.to_f16(e);
                         let h = self.shlc(h, 16);
-                        let lo = self.andc(cur, 0xFFFF);
+                        let old = cur(self);
+                        let lo = self.andc(old, 0xFFFF);
                         self.or(lo, h)
                     }
                 }
@@ -620,7 +624,8 @@ impl Lw {
             }
             "v_fmac_f32" | "v_mac_f32" | "v_fmac_legacy_f32" => {
                 let (x, y) = (fs!(0), fs!(1));
-                let cf = self.f(cur);
+                let old = cur(self);
+                let cf = self.f(old);
                 fr!(match name {
                     "v_fmac_f32" => self.fmad(x, y, cf),
                     "v_mac_f32" => self.mad_nf(x, y, cf),
@@ -985,8 +990,11 @@ impl Lw {
                 let v = self.read_lane_half(a, l);
                 if bound {
                     self.sel(ok, v, z)
+                } else if self.s.m.const_u64(ok) == Some(1) {
+                    v
                 } else {
-                    self.sel(ok, v, cur)
+                    let old = cur(self);
+                    self.sel(ok, v, old)
                 }
             }
             "v_readfirstlane_b32" => {
@@ -1007,8 +1015,7 @@ impl Lw {
                     let l = self.andc(b, wmask);
                     let lane = self.lane;
                     let me = self.cmp(Pred::Eq, lane, l);
-                    let v = self.sel(me, a, cur);
-                    self.wr(VAR_VGPR + n as u32, v);
+                    self.wr_if(VAR_VGPR + n as u32, me, a);
                 }
                 return Ok(());
             }
@@ -1076,7 +1083,7 @@ impl Lw {
 
     /// The f32 instructions that round by MODE[1:0] in a program directing f32 rounding
     /// (`lower_round`): the result as a float before output modifiers, None for the rest.
-    fn valu_f32_rm(&mut self, name: &str, m: &Mods, u: &[Src], cur: Value) -> LResult<Option<Value>> {
+    fn valu_f32_rm(&mut self, name: &str, m: &Mods, u: &[Src], cur: impl FnOnce(&mut Self) -> Value) -> LResult<Option<Value>> {
         let z = self.c(0);
         let raw = |i: usize| u.get(i).map(|s| s.w()).unwrap_or(z);
         let (a, b, c) = (raw(0), raw(1), raw(2));
@@ -1125,9 +1132,10 @@ impl Lw {
                 self.sel(lz, fc, r)
             }
             "v_fmac_f32" | "v_fmac_legacy_f32" => {
-                let fcur = self.f(cur);
+                let old = cur(self);
+                let fcur = self.f(old);
                 let n = self.fmad(fa, fb, fcur);
-                let r = self.rm_fma(ba, bb, cur, n);
+                let r = self.rm_fma(ba, bb, old, n);
                 if name == "v_fmac_legacy_f32" {
                     let lz = legacy_zero(self, fa, fb);
                     self.sel(lz, fcur, r)
@@ -1150,9 +1158,10 @@ impl Lw {
                 self.rm_mad(ba, bb, bc, n)
             }
             "v_mac_f32" => {
-                let fcur = self.f(cur);
+                let old = cur(self);
+                let fcur = self.f(old);
                 let n = self.mad_nf(fa, fb, fcur);
-                self.rm_mad(ba, bb, cur, n)
+                self.rm_mad(ba, bb, old, n)
             }
             "v_madmk_f32" => {
                 let fk = self.f(b);

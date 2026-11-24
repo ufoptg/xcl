@@ -325,9 +325,17 @@ impl Lw {
                     return self.s.m.const_int(t, r & mask);
                 }
             }
+            if a == b {
+                match op {
+                    BinOp::And | BinOp::Or => return a,
+                    BinOp::Xor | BinOp::Sub => return self.s.m.const_int(t, 0),
+                    _ => {}
+                }
+            }
             match (op, cb) {
                 (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return a,
                 (BinOp::And, Some(m)) if m == mask => return a,
+                (BinOp::Or, Some(m)) if m == mask => return b,
                 (BinOp::And | BinOp::Mul, Some(0)) => return b,
                 (BinOp::Mul, Some(1)) => return a,
                 _ => {}
@@ -335,6 +343,7 @@ impl Lw {
             match (op, ca) {
                 (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0)) => return b,
                 (BinOp::And, Some(m)) if m == mask => return b,
+                (BinOp::Or, Some(m)) if m == mask => return a,
                 (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr, Some(0)) => return a,
                 (BinOp::Mul, Some(1)) => return b,
                 _ => {}
@@ -820,13 +829,25 @@ impl Lw {
         r
     }
 
+    /// Writes `val` to `var` in lanes where `cond` holds, skipping the read of
+    /// the old value (or the write altogether) when `cond` is a known constant.
+    pub fn wr_if(&mut self, var: u32, cond: Value, val: Value) {
+        match self.s.m.const_u64(cond) {
+            Some(1) => self.wr(var, val),
+            Some(0) => {}
+            _ => {
+                let old = self.rd(var);
+                let v = self.sel(cond, val, old);
+                self.wr(var, v);
+            }
+        }
+    }
+
     pub fn write32(&mut self, dst: &Dst, val: Value) {
         match *dst {
             Dst::V(n) => {
-                let old = self.vreg(n);
                 let a = self.act();
-                let v = self.sel(a, val, old);
-                self.wr(VAR_VGPR + n as u32, v);
+                self.wr_if(VAR_VGPR + n as u32, a, val);
             }
             Dst::S(n) => {
                 if n <= 127 && n != 125 {
@@ -841,11 +862,8 @@ impl Lw {
         match *dst {
             Dst::V(n) => {
                 let a = self.act();
-                let (o0, o1) = (self.vreg(n), self.vreg(n + 1));
-                let v0 = self.sel(a, lo, o0);
-                let v1 = self.sel(a, hi, o1);
-                self.wr(VAR_VGPR + n as u32, v0);
-                self.wr(VAR_VGPR + n as u32 + 1, v1);
+                self.wr_if(VAR_VGPR + n as u32, a, lo);
+                self.wr_if(VAR_VGPR + n as u32 + 1, a, hi);
             }
             Dst::S(n) => {
                 if n != 125 {

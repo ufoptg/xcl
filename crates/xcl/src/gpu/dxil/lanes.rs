@@ -190,26 +190,38 @@ impl Lw {
         } else {
             lo
         };
-        let l = self.lane31;
-        let sh = self.bin(BinOp::LShr, w, l);
-        let b = self.andc(sh, 1);
-        let v = self.nz(b);
+        let v = match self.s.m.const_u64(w) {
+            Some(0) => self.b(false),
+            Some(m) if m == u32::MAX as u64 => self.b(true),
+            _ => {
+                let l = self.lane31;
+                let sh = self.bin(BinOp::LShr, w, l);
+                let b = self.andc(sh, 1);
+                self.nz(b)
+            }
+        };
         self.exec_cache.insert(key, v);
         v
     }
 
     /// The bit of lane `l` (uniform or per-lane i32) of the mask (lo, hi).
     pub fn lanebit_at(&mut self, lo: Value, hi: Value, l: Value) -> Value {
-        let w = if self.wave64 {
+        let w = if self.wave64 && hi != lo {
             let up = self.cmpc(Pred::UGe, l, 32);
             self.sel(up, hi, lo)
         } else {
             lo
         };
-        let l31 = self.andc(l, 31);
-        let sh = self.bin(BinOp::LShr, w, l31);
-        let b = self.andc(sh, 1);
-        self.nz(b)
+        match self.s.m.const_u64(w) {
+            Some(0) => self.b(false),
+            Some(m) if m == u32::MAX as u64 => self.b(true),
+            _ => {
+                let l31 = self.andc(l, 31);
+                let sh = self.bin(BinOp::LShr, w, l31);
+                let b = self.andc(sh, 1);
+                self.nz(b)
+            }
+        }
     }
 
     /// Group barrier for the split form's exchanges.
