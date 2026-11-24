@@ -3946,11 +3946,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 
@@ -7594,6 +7607,38 @@ fn fspx_containers_translate_and_compile() {
     assert_eq!(ok, n);
 }
 
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
+}
+
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
 /// inner loops, loops whose end is an inner loop's – give the same state as structured code and as
 /// the block dispatcher (`structured: false`).
@@ -7729,4 +7774,55 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Raw buffer accesses (stride 0) whose offset wraps past 2^32 are past num_records: the direct
+/// DXIL backend reads 0 and drops the store and the atomic, as for any other offset past the
+/// end (#1893).
+#[test]
+fn gpu_direct_raw_buffer_offsets_that_wrap_are_out_of_range() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x20), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x20), ("OFFEN", 1)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // the instruction offset is what wraps: voff 0xFFFF_FFF0 + OFFSET 0x28 = 0x18 (returns the old value)
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 7), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x28), ("OFFEN", 1), ("GLC", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 256];
+    for (i, m) in mem.iter_mut().enumerate() {
+        *m = 0x1000 + i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x40, 0, 0x100, 0]); // V#: base 0x40, stride 0, 0x100 bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // lane 0 wraps, lane 1 is in range, the others are past the end
+        r[0] = [0xFFFF_FFF0, 4].get(l).copied().unwrap_or(0x200);
+        r[1] = [0xFFFF_FFFC, 4].get(l).copied().unwrap_or(0x200);
+        r[3] = 0xDEAD;
+        r[4] = 0xC0DE_0000 | l as u32;
+        r[5] = 0xDEAD;
+        r[6] = 5;
+        r[7] = 5;
+    }
+    let k = runner::direct_kernel_full(&code, true).unwrap();
+    let r = runner::run(&k.dxil, &st, &mem).unwrap();
+    // lane 0: 32-bit sums that wrap to 0x10 (+ 0x40 = 0x50) and to 0x3C
+    assert_eq!(r.vgpr[0][3], 0, "load at voff 0xFFFF_FFF0 + OFFSET 0x20");
+    assert_eq!(r.vgpr[0][5], 0, "load at voff 0xFFFF_FFFC");
+    assert_eq!(r.mem[0x50 / 4], 0x1000 + 0x50 / 4, "store at voff 0xFFFF_FFF0 + OFFSET 0x20 dropped");
+    assert_eq!(r.mem[0x3C / 4], 0x1000 + 0x3C / 4, "atomic at voff 0xFFFF_FFFC dropped");
+    // lane 1 is in range
+    assert_eq!(r.vgpr[1][3], 0x1000 + (0x40 + 4 + 0x20) / 4, "lane 1 load");
+    assert_eq!(r.mem[(0x40 + 4 + 0x20) / 4], 0xC0DE_0001, "lane 1 store");
+    assert_eq!(r.mem[(0x40 + 4) / 4], 0x1000 + (0x40 + 4) / 4 + 5, "lane 1 atomic");
+    // the atomic whose instruction offset wraps (voff + OFFSET): dropped, and it returns 0
+    assert_eq!(r.mem[0x58 / 4], 0x1000 + 0x58 / 4, "atomic at voff 0xFFFF_FFF0 + OFFSET 0x28 dropped");
+    assert_eq!(r.vgpr[0][7], 0, "dropped atomic returns 0");
+    // lane 1 is in range: it adds and returns the old value
+    assert_eq!(r.mem[0x6C / 4], 0x1000 + 0x6C / 4 + 5, "lane 1 atomic with OFFSET");
+    assert_eq!(r.vgpr[1][7], 0x1000 + 0x6C / 4, "lane 1 atomic returns the old value");
 }
