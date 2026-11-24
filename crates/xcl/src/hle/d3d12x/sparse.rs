@@ -1604,6 +1604,65 @@ pub fn forget_buffer(res: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn private_physical_pages_reach_the_gpu_on_mapping() {
+        // The option, device and sparse windows are process-wide.
+        const CHILD: &str = "XCL_TEST_PRIVATE_PHYSICAL_PAGES";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::sparse::tests::private_physical_pages_reach_the_gpu_on_mapping", "--nocapture"])
+                .env(CHILD, "1")
+                .env("XCL_DEFER_PRIVATE_HOME_TILES", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, write_physical_pages};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut device = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let device: ID3D12Device = device.unwrap();
+            let windows = init(&device);
+            if windows.is_empty() {
+                crate::gpu::recomp::runner::skip_test("no sparse windows");
+                return;
+            }
+            for (_, raw, _) in windows { drop(ID3D12Resource::from_raw(raw as *mut c_void)); }
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let mut pages = [0usize; 3];
+            let mut n = pages.len();
+            let null = std::ptr::null_mut();
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let first = vec![0xa7; TILE];
+            let last = vec![0x38; TILE];
+            let before = mapped_ranges();
+            assert!(write_physical_pages(&pages[..1], 0, &first));
+            assert!(write_physical_pages(&pages[2..], 0, &last));
+            assert_eq!(mapped_ranges(), before, "storage writes allocated GPU tiles");
+
+            // Expose one fully CPU-backed page first, then a mixed span of all three.
+            let first_home = MapTitlePhysicalPages(null, 1, 0, 4, pages.as_mut_ptr());
+            assert!(!first_home.is_null());
+            let home = MapTitlePhysicalPages(null, n, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_eq!(home, first_home as usize);
+            assert!(mapped_ranges().iter().any(|&(a, b)| a <= home && home + n * TILE <= b));
+            // A prior write-watch scan may have consumed the writes before the first submit.
+            assert_eq!(windows_sys::Win32::System::Memory::ResetWriteWatch(home as *const c_void, n * TILE), 0);
+            super::super::title_textures::refresh(queue.as_raw());
+            std::ptr::write_bytes(home as *mut u8, 0xdd, n * TILE);
+            readback_after_execute(&queue, &[(home, n * TILE)]);
+            let result = std::slice::from_raw_parts(home as *const u8, n * TILE);
+            assert_eq!(&result[..TILE], &first);
+            assert!(result[TILE..2 * TILE].iter().all(|&b| b == 0));
+            assert_eq!(&result[2 * TILE..], &last);
+            assert_eq!(FreeTitlePhysicalPages(null, n, pages.as_mut_ptr()), 1);
+        }
+    }
+
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
     /// waiting for (a list's `Reset` against an upload's allocator `Reset`, with `XCL_DRED=1`).

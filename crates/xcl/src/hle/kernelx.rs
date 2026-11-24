@@ -803,9 +803,14 @@ static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, u
 /// sparse window, the coherent one, or – without room there – plain reserved memory)
 static NEXT_PAGE_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SparseHome { CpuOnly, Exposed }
+
 /// Pages mapped away from home: address → page, and page → address.
 #[derive(Default)]
 struct Away {
+    /// CPU-only backing needs an upload when the title first maps it at home.
+    sparse_homes: std::collections::HashMap<usize, SparseHome>,
     at: std::collections::BTreeMap<usize, usize>,
     page: std::collections::HashMap<usize, usize>,
     /// homes in a sparse window whose pages went away in this call, given back at its end in
@@ -864,7 +869,7 @@ fn lazy_home(home: usize) -> bool {
 
 /// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
 /// Caller must hold `AWAY`.
-unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: usize, len: usize) -> Option<Vec<usize>> {
+unsafe fn resolve_physical_pages(away: &mut Away, pages: &[usize], offset: usize, len: usize) -> Option<Vec<usize>> {
     if offset >= PHYS_PAGE {
         return None;
     }
@@ -876,9 +881,9 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
     let mut addrs = Vec::with_capacity(need);
     for &p in &pages[..need] {
         let home = page_home(p)?;
-        let addr = match away.and_then(|a| a.page.get(&p).copied()) {
+        let addr = match away.page.get(&p).copied() {
             Some(at) => at,
-            None => home_again(home)?,
+            None => home_again(home, p, away)?,
         };
         addrs.push(addr);
     }
@@ -892,8 +897,8 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
     if dst.is_empty() {
         return offset < PHYS_PAGE;
     }
-    let g = AWAY.lock().unwrap();
-    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, dst.len()) else { return false };
+    let mut g = AWAY.lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.get_or_insert_with(Away::default), pages, offset, dst.len()) else { return false };
     let mut done = 0;
     let mut page_off = offset;
     for addr in addrs {
@@ -911,8 +916,8 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     if src.is_empty() {
         return offset < PHYS_PAGE;
     }
-    let g = AWAY.lock().unwrap();
-    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else { return false };
+    let mut g = AWAY.lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.get_or_insert_with(Away::default), pages, offset, src.len()) else { return false };
     let mut done = 0;
     let mut page_off = offset;
     for addr in addrs {
@@ -961,36 +966,60 @@ unsafe fn give_back_homes(away: &mut Away) {
     }
 }
 
+pub(crate) static DEFER_PRIVATE_HOME_TILES: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("XCL_DEFER_PRIVATE_HOME_TILES").is_ok_and(|v| v == "1"));
+
 /// The page's home, committed again if `move_home_away` gave it back (None: it could not be).
-unsafe fn home_again(home: usize) -> Option<usize> {
+unsafe fn home_again(home: usize, page: usize, away: &mut Away) -> Option<usize> {
     if lazy_home(home) && !committed_page(home) {
         if mem::VirtualAlloc(home as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             crate::xlog_warn!("physical page: its home {home:#x} could not be committed again");
             return None;
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(home)) {
-            crate::hle::d3d12x::sparse::committed(home, PHYS_PAGE);
+            if *DEFER_PRIVATE_HOME_TILES && away.sparse_homes.get(&page) != Some(&SparseHome::Exposed) {
+                away.sparse_homes.insert(page, SparseHome::CpuOnly);
+            } else {
+                crate::hle::d3d12x::sparse::committed(home, PHYS_PAGE);
+            }
         }
     }
     Some(home)
 }
 
 /// `n` pages from `home` committed (a sparse home is only reserved until it is used).
-unsafe fn commit_homes(home: usize, n: usize) -> bool {
+unsafe fn commit_homes(home: usize, pages: &[usize], away: &mut Away) -> bool {
+    let n = pages.len();
     let Some(u) = crate::gpu::uma::get() else { return false };
     if !lazy_home(home) {
         return true;
     }
     let len = n * PHYS_PAGE;
-    if committed_range(home, len) {
-        return true;
-    }
-    if mem::VirtualAlloc(home as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+    let ready = committed_range(home, len);
+    if !ready && mem::VirtualAlloc(home as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
         crate::xlog_warn!("physical pages: {n} at their home {home:#x} could not be committed");
         return false;
     }
     if u.is_sparse(home) {
-        crate::hle::d3d12x::sparse::committed(home, len);
+        let private = |page: &usize| away.sparse_homes.get(page) == Some(&SparseHome::CpuOnly);
+        let has_private = *DEFER_PRIVATE_HOME_TILES && pages.iter().any(private);
+        if !ready || has_private {
+            crate::hle::d3d12x::sparse::committed(home, len);
+        }
+        if has_private {
+            // A write-watch scan can consume a storage write before its GPU tile exists.
+            let mut addr = home;
+            for run in pages.chunk_by(|a, b| private(a) == private(b)) {
+                let bytes = run.len() * PHYS_PAGE;
+                if private(&run[0]) {
+                    crate::hle::d3d12x::title_textures::rescan_cpu_backing(addr, bytes);
+                }
+                addr += bytes;
+            }
+        }
+        if *DEFER_PRIVATE_HOME_TILES {
+            away.sparse_homes.extend(pages.iter().map(|&p| (p, SparseHome::Exposed)));
+        }
     }
     true
 }
@@ -1069,7 +1098,7 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         let own = page_home(page);
         let pending = away.gone.len();
         away.gone.retain(|&h| Some(h) != own);
-        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
+        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h, page, away)) };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
             #[cfg(test)]
@@ -1169,6 +1198,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
     if let Some(away) = AWAY.lock().unwrap().as_mut() {
         for i in 0..n {
+            away.sparse_homes.remove(&*arr.add(i));
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
                 note_mapping_at(at);
@@ -1228,7 +1258,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
             return std::ptr::null_mut();
         };
-        if !commit_homes(home, n) {
+        if !commit_homes(home, &pages, away) {
             fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
             return std::ptr::null_mut();
         }
@@ -2568,7 +2598,7 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            let mut away = Away::default();
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());

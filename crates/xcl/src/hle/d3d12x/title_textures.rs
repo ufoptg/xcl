@@ -683,6 +683,12 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+static INITIAL_CPU_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+pub(crate) fn rescan_cpu_backing(start: usize, bytes: usize) {
+    INITIAL_CPU_RANGES.lock().unwrap().push((start, bytes));
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -705,7 +711,17 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
         });
+        let watched = dirty.len();
+        if *crate::hle::kernelx::DEFER_PRIVATE_HOME_TILES {
+            let mut initial = INITIAL_CPU_RANGES.lock().unwrap();
+            for (start, size) in initial.drain(..) {
+                dirty.extend((start..start + size).step_by(page as usize));
+            }
+        }
         dirty.sort_unstable();
+        if dirty.len() > watched {
+            dirty.dedup();
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);

@@ -138,6 +138,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
   `XCL_PSO_TRACE=1` logs every driver compile.
+- `XCL_DEFER_PRIVATE_HOME_TILES=1` keeps sparse physical pages used only for storage I/O
+  in CPU memory. When the title maps those pages at their home address, XCL allocates their
+  GPU tiles and uploads the stored data before the next GPU submission. Off by default.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
