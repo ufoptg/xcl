@@ -167,8 +167,11 @@ impl Cfg {
             .iter()
             .filter_map(|b| b.ops.first().and_then(|op| match *op { CfgOp::Inst(i) => Some(insts[i].pc), _ => None }))
             .collect();
+        // Geometry mode: preserve the GS entry block boundary (`pc == gs_start`) so
+        // `kernel.rs` sees the ES -> GS phase switch in split wave64.
+        let pinned = setpc.flatten().and_then(|s| (0..blocks.len()).find(|&b| blocks[b].pc == s));
         if post.len() >= min_blocks {
-            if collapse_execz_regions(&insts, &mut blocks, &post, &headers, wave64, live_at_end) {
+            if collapse_execz_regions(&insts, &mut blocks, &post, &headers, wave64, live_at_end, pinned) {
                 (post, headers) = order(&blocks);
             }
         }
@@ -192,6 +195,7 @@ fn collapse_execz_regions(
     headers: &BTreeSet<usize>,
     wave64: bool,
     live_at_end: bool,
+    pinned: Option<usize>,
 ) -> bool {
     let n = blocks.len();
     let mut pos = vec![usize::MAX; n];
@@ -211,6 +215,9 @@ fn collapse_execz_regions(
     if let Some(&entry) = rpo.first() {
         pred_count[entry] = 1; // keep entry from being absorbed
     }
+    if let Some(p) = pinned {
+        pred_count[p] += 1; // keep GS entry boundary intact
+    }
     for &b in rpo {
         for t in succ_of(&blocks[b]) {
             pred_count[t] += 1;
@@ -222,7 +229,7 @@ fn collapse_execz_regions(
     for &b in rpo.iter().rev() {
         loop {
             match blocks[b].term {
-                Term::Jump(nxt) if nxt != b && pred_count[nxt] == 1 && !headers.contains(&nxt) && pos[nxt] > pos[b] => {
+                Term::Jump(nxt) if nxt != b && pred_count[nxt] == 1 && !headers.contains(&nxt) && pinned != Some(nxt) && pos[nxt] > pos[b] => {
                     let tail_ops = std::mem::take(&mut blocks[nxt].ops);
                     let tail_term = std::mem::replace(&mut blocks[nxt].term, Term::End);
                     blocks[b].ops.extend(tail_ops);
@@ -236,6 +243,7 @@ fn collapse_execz_regions(
                         && pos[fall] > pos[b]
                         && pred_count[fall] == 1
                         && !headers.contains(&fall)
+                        && pinned != Some(fall)
                         && blocks[fall].term == Term::Jump(target) =>
                 {
                     let Some(written_scalar) = analyze_execz_region(&blocks[fall].ops, insts, wave64) else {

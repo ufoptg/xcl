@@ -166,3 +166,122 @@ fn gpu_geometry_direct_records() {
         check(&format!("HLSL, split {split}"), &got);
     }
 }
+
+/// `branchy_program` extended with 70 forward `S_CBRANCH_EXECZ +1` diamonds right after
+/// GS EXEC initialization so `Cfg::build_geometry` crosses the EXECZ collapse threshold.
+fn branchy_program_over_execz_threshold() -> (Vec<u8>, GsInterface) {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    const V: u64 = 256;
+    let es = e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None);
+    let mut gs: Vec<Vec<u8>> = Vec::new();
+    gs.push(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
+    gs.push(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    for _ in 0..70 {
+        gs.push(e("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None));
+        gs.push(e("V_NOP", "ENC_VOP1", &[], None));
+    }
+    gs.push(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    gs.push(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
+    gs.push(e("V_AND_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 131), ("VSRC1", 2)], None)); // prim & 3
+    gs.push(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 130), ("VSRC1", 21)], None)); // + 2
+    gs.push(e("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 20), ("SRC1", 255), ("SRC2", 2)], Some(160)));
+    gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 52), ("SRC0", 242)], None)); // 1.0
+    gs.push(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)], None));
+    let top = gs.len();
+    gs.push(e("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 4), ("VSRC1", 21)], None));
+    gs.push(e("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 106)], None));
+    let execz = gs.len();
+    gs.push(Vec::new()); // s_cbranch_execz end
+    gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 4)], None));
+    gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 20), ("DATA1", 51), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+    gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 2), ("DATA1", 52), ("OFFSET0", 2), ("OFFSET1", 3)], None));
+    gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 21), ("DATA1", 20), ("OFFSET0", 4), ("OFFSET1", 5)], None));
+    gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 20), ("DATA1", 20), ("OFFSET0", 6), ("OFFSET1", 7)], None));
+    gs.push(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 50), ("SRC0", 160), ("VSRC1", 50)], None));
+    gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None)); // emit
+    gs.push(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 129)], None));
+    let skip = gs.len();
+    gs.push(Vec::new()); // s_cbranch_scc0 past the cut
+    gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)], None)); // cut
+    let after_cut = gs.len();
+    gs.push(e("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None));
+    let back = gs.len();
+    gs.push(Vec::new()); // s_branch top
+    let end = gs.len();
+    gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None));
+    gs.push(e("S_ENDPGM", "ENC_SOPP", &[], None));
+    let pc = |gs: &Vec<Vec<u8>>, i: usize| gs[..i].iter().map(|p| if p.is_empty() { 4 } else { p.len() }).sum::<usize>() as i64;
+    let br = |gs: &Vec<Vec<u8>>, name: &str, at: usize, to: usize| {
+        let rel = (pc(gs, to) - pc(gs, at) - 4) / 4;
+        e(name, "ENC_SOPP", &[("SIMM16", rel as i16 as u16 as u64)], None)
+    };
+    gs[execz] = br(&gs, "S_CBRANCH_EXECZ", execz, end);
+    gs[skip] = br(&gs, "S_CBRANCH_SCC0", skip, after_cut);
+    gs[back] = br(&gs, "S_BRANCH", back, top);
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3), sig("TEXCOORD", 0, 1, 1)],
+        max_vertex_count: 5,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend(gs.concat());
+    (code, g)
+}
+
+/// Collapsing 70 forward `S_CBRANCH_EXECZ` regions inside GS must preserve the `pc == gs_start`
+/// block boundary so split-wave64 geometry shaders still emit the ES -> GS phase switch.
+#[test]
+fn geometry_execz_collapse_preserves_gs_entry_boundary() {
+    let (code, g) = branchy_program_over_execz_threshold();
+    let gs_start = g.gs_start.unwrap();
+    let cfg = super::cfg::Cfg::build_geometry(&code, g.gs_start).unwrap();
+    // All 70 forward S_CBRANCH_EXECZ diamonds collapsed, while ES (pc=0) and GS entry (pc=gs_start) stayed separate!
+    assert!(cfg.rpo.len() < 16, "expected 70 EXECZ diamonds to collapse, got {} blocks", cfg.rpo.len());
+    assert!(
+        cfg.rpo.iter().any(|&b| cfg.blocks[b].pc == gs_start),
+        "GS entry block at pc={gs_start:#x} was merged into ES"
+    );
+    assert_eq!(cfg.blocks[cfg.rpo[0]].pc, 0);
+    for split in [false, true] {
+        let k = translate_geometry(&code, opts(split, 1), &g).unwrap_or_else(|e| panic!("split {split}: {e}"));
+        if let Err(err) = super::validate::validate(&k.dxil) {
+            panic!("split {split} DXIL validation failed: {err}");
+        }
+    }
+}
+
+/// GPU regression test for `branchy_program_over_execz_threshold` in split wave64 (72 vertices / 5 triangles for group 0).
+#[test]
+fn gpu_geometry_collapsed_execz_preserves_gs_entry() {
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || dxc::location().is_err() || runner::mesh_shaders_supported() != Ok(true) {
+        runner::skip_test("no GPU / DXC / mesh shaders");
+        return;
+    }
+    let (code, g) = branchy_program_over_execz_threshold();
+    let rec = g.record();
+    let msb = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+    let ps_src = "struct V { float4 pos : SV_Position; nointerpolation uint4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, (float)v.p0.y, 0.0, 1.0); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let prims = 25;
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = prims as u32;
+    let mem = vec![0u32; 64];
+    let want = expected_records(&g, prims);
+    assert_eq!((want[0], want[1]), (72, 5));
+    let direct = translate_geometry(&code, opts(true, 1), &g).unwrap().dxil;
+    let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
+    let rd = rec.record_dwords();
+    let (vd, maxv) = (rec.vert_dwords(), rec.max_vertices as usize);
+    let diff: Vec<usize> = (0..want.len())
+        .filter(|&i| {
+            let (grp, o) = (i / rd, i % rd);
+            let r = &want[grp * rd..];
+            let used = o < MESH_HEADER || (o < MESH_HEADER + maxv * vd && (o - MESH_HEADER) / vd < r[0] as usize) || (o >= MESH_HEADER + maxv * vd && o - MESH_HEADER - maxv * vd < r[1] as usize);
+            used && want[i] != got[i]
+        })
+        .take(16)
+        .collect();
+    assert!(diff.is_empty(), "split-wave64 collapsed-EXECZ geometry records differ at {diff:?}: got {:?}, want {:?}", diff.iter().map(|&i| got[i]).collect::<Vec<_>>(), diff.iter().map(|&i| want[i]).collect::<Vec<_>>());
+}
