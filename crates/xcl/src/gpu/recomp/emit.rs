@@ -2293,9 +2293,8 @@ impl Em {
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
-            // gather4_l / _l_o: the 2x2 footprint of the (rounded, clamped) mip `lod` names. HLSL's
-            // Gather has no level, so each texel is read at its centre with SampleLevel (compare
-            // forms keep the mip-0 GatherCmp: SampleCmpLevel needs SM 6.7)
+            // gather4_l / _l_o: the 2x2 footprint of the mip the S# and `lod` name. HLSL's Gather has no
+            // level, so the four texels are Loads (compare forms keep the mip-0 GatherCmp)
             let glod = base.starts_with("gather4") && lod.is_some() && !has_c;
             if glod && !matches!(dim, 1 | 5) {
                 return Err("gather4 explicit LOD (not 2D)");
@@ -2318,20 +2317,41 @@ impl Em {
                 match &cmp {
                     _ if glod => {
                         let l = lod.clone().unwrap_or_default();
+                        let [w0, w1, w2, w3] = match self.static_ss.get(&d.pc) {
+                            Some(w) => w.map(|x| format!("{x}u")),
+                            None => [self.sreg(ssamp), self.sreg(ssamp + 1), self.sreg(ssamp + 2), s3.clone()],
+                        };
                         let dims = |lv: &str| if dim == 5 { format!("{t}_T.GetDimensions({lv}, {t}_gw, {t}_gh, {t}_gz, {t}_gn);") } else { format!("{t}_T.GetDimensions({lv}, {t}_gw, {t}_gh, {t}_gn);") };
                         self.line(&format!("uint {t}_gw = 1u, {t}_gh = 1u, {t}_gz = 1u, {t}_gn = 1u; {}", dims("0u")));
-                        self.line(&format!("uint {t}_gl = min((uint)max(round({l}), 0.0f), max({t}_gn, 1u) - 1u); {}", dims(&format!("{t}_gl"))));
-                        self.line(&format!("float2 {t}_gs = float2((float){t}_gw, (float){t}_gh);"));
-                        let o = offset.as_ref().map(|o| format!(" + float2((float)(((int)({o} << 26)) >> 26), (float)(((int)({o} << 18)) >> 26))")).unwrap_or_default();
-                        self.line(&format!("float2 {t}_gp = floor(float2({}, {}) * {t}_gs - 0.5f){o};", coords_unmoved[0], coords_unmoved[1]));
-                        let c = ["r", "g", "b", "a"][comps[0] as usize];
-                        // D3D Gather order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)
-                        let tap = |dx: &str, dy: &str| {
-                            let uv = format!("({t}_gp + float2({dx}, {dy})) / {t}_gs");
-                            let at = if dim == 5 { format!("float3({uv}, round({}))", coords_unmoved[2]) } else { uv };
-                            format!("{t}_T.SampleLevel({t}_S, {at}, {t}_gl).{c}")
+                        // S# level: LOD + bias, clamped to MIN_LOD..MAX_LOD (u4.8), rounded half up; MIP_FILTER none
+                        // reads level 0 of the view (shortcut: how the T# MIN_LOD / BASE_LEVEL relate is unknown)
+                        self.line(&format!(
+                            "uint {t}_gl = (({w2} >> 26) & 3u) == 0u ? 0u : min((uint)floor(clamp({l} + (float)(((int)({w2} << 18)) >> 18) / 256.0f, (float)({w1} & 0xFFFu) / 256.0f, (float)(({w1} >> 12) & 0xFFFu) / 256.0f) + 0.5f), max({t}_gn, 1u) - 1u); {}",
+                            dims(&format!("{t}_gl"))
+                        ));
+                        let o = offset.as_ref().map(|o| format!(" + int2(((int)({o} << 26)) >> 26, ((int)({o} << 18)) >> 26)")).unwrap_or_default();
+                        self.line(&format!("int2 {t}_gs = int2((int){t}_gw, (int){t}_gh);"));
+                        self.line(&format!("int2 {t}_gp = int2(floor(float2({}, {}) * float2({t}_gs) - 0.5f)){o};", coords_unmoved[0], coords_unmoved[1]));
+                        // integer taps: the S# addressing is applied here, so no sampler LOD clamp / bias can change the level
+                        self.line(&format!(
+                            "int4 {t}_ga = int4(gat_ax({t}_gp.x, {t}_gs.x, {w0} & 7u), gat_ax({t}_gp.x + 1, {t}_gs.x, {w0} & 7u), gat_ax({t}_gp.y, {t}_gs.y, ({w0} >> 3) & 7u), gat_ax({t}_gp.y + 1, {t}_gs.y, ({w0} >> 3) & 7u));"
+                        ));
+                        let ci = comps[0] as usize;
+                        let border = if ci == 3 { format!("((({w3} >> 30) - 1u) < 2u ? 1.0f : 0.0f)") } else { format!("(({w3} >> 30) == 2u ? 1.0f : 0.0f)") };
+                        let c = ["r", "g", "b", "a"][ci];
+                        let layer = if dim == 5 {
+                            self.line(&format!("int {t}_gk = min(max((int)round({}), 0), (int){t}_gz - 1);", coords_unmoved[2]));
+                            format!(", {t}_gk")
+                        } else {
+                            String::new()
                         };
-                        format!("float4({}, {}, {}, {})", tap("0.5f", "1.5f"), tap("1.5f", "1.5f"), tap("1.5f", "0.5f"), tap("0.5f", "0.5f"))
+                        let ld = if dim == 5 { "int4" } else { "int3" };
+                        // D3D Gather order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)
+                        let tap = |x: &str, y: &str| {
+                            let (x, y) = (format!("{t}_ga.{x}"), format!("{t}_ga.{y}"));
+                            format!("(({x} < 0 || {y} < 0) ? {border} : {t}_T.Load({ld}({x}, {y}{layer}, (int){t}_gl)).{c})")
+                        };
+                        format!("float4({}, {}, {}, {})", tap("x", "w"), tap("y", "w"), tap("y", "z"), tap("x", "z"))
                     }
                     Some(z) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
                     None => format!("{t}_T.Gather{ch}({t}_S, {coord})"),
@@ -5382,6 +5402,12 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+// gather4_l texel index i of an n-texel axis under S# address mode m (0 wrap, 1 mirror, 2 clamp, 3 mirror once, 4/6 clamp border, 5/7 mirror-once border); -1: the border colour
+int gat_ax(int i, int n, uint m) {
+    uint t = i < 0 ? (uint)~i : (uint)i; uint r = t % (m == 1u ? 2u * (uint)n : (uint)n);
+    int v = m == 0u ? (i < 0 ? n - 1 - (int)r : (int)r) : m == 1u ? (r < (uint)n ? (int)r : 2 * n - 1 - (int)r) : (m & 1u) == 0u ? clamp(i, 0, n - 1) : (int)min(t, (uint)n - 1u);
+    return (((m & 5u) == 4u && (i < 0 || i >= n)) || ((m & 5u) == 5u && t >= (uint)n)) ? -1 : v;
 }
 uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {

@@ -34,6 +34,44 @@ impl Lw {
             }
         }
     }
+    /// gather4_l texel index `i` of an `n`-texel axis under S# address mode `m` (0 wrap, 1 mirror, 2 clamp,
+    /// 3 mirror once, 4 / 6 clamp border, 5 / 7 mirror-once border); -1: the border colour.
+    fn gather_axis(&mut self, i: Value, n: Value, m: Value) -> Value {
+        let neg = self.cmpc(Pred::SLt, i, 0);
+        let ni = self.not(i);
+        let t = self.sel(neg, ni, i);
+        let one = self.c(1);
+        let n1 = self.sub(n, one);
+        let n2 = self.shlc(n, 1);
+        let is1 = self.cmpc(Pred::Eq, m, 1);
+        let d = self.sel(is1, n2, n);
+        let (_, r) = self.s.udiv_rem(t, d);
+        let wrap = self.sub(n1, r);
+        let wrap = self.sel(neg, wrap, r);
+        let mirror = self.sub(n2, one);
+        let mirror = self.sub(mirror, r);
+        let low = self.cmp(Pred::ULt, r, n);
+        let mirror = self.sel(low, r, mirror);
+        let z = self.c(0);
+        let clamp = self.imax(i, z);
+        let clamp = self.imin(clamp, n1);
+        let once = self.umin(t, n1);
+        let odd = self.andc(m, 1);
+        let even = self.cmpc(Pred::Eq, odd, 0);
+        let v = self.sel(even, clamp, once);
+        let is0 = self.cmpc(Pred::Eq, m, 0);
+        let v = self.sel(is1, mirror, v);
+        let v = self.sel(is0, wrap, v);
+        let k = self.andc(m, 5);
+        let (clamp_b, once_b) = (self.cmpc(Pred::Eq, k, 4), self.cmpc(Pred::Eq, k, 5));
+        let past = self.cmp(Pred::SGe, i, n);
+        let out_c = self.or(neg, past);
+        let out_c = self.and(clamp_b, out_c);
+        let past_t = self.cmp(Pred::UGe, t, n);
+        let out_o = self.and(once_b, past_t);
+        let out = self.or(out_c, out_o);
+        self.selc(out, u32::MAX, v)
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -504,9 +542,8 @@ impl Lw {
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
             let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
-            // gather4_l / _l_o: the 2x2 footprint of the (rounded, clamped) mip `lod` names, read as
-            // four SampleLevel taps at the texel centres (as the HLSL path; compare forms keep the
-            // mip-0 gather)
+            // gather4_l / _l_o: the 2x2 footprint of the mip the S# and `lod` name, read as four texel
+            // Loads (as the HLSL path; compare forms keep the mip-0 gather)
             let glod = gather && lod.is_some() && !has_c;
             if glod && !matches!(dim, 1 | 5) {
                 return err(d, "gather4 explicit LOD (not 2D)");
@@ -576,44 +613,95 @@ impl Lw {
                 }
                 match cmp {
                     _ if glod => {
+                        let ws: [Value; 4] = match self.static_samplers.get(&d.pc).copied() {
+                            Some(w) => w.map(|x| self.c(x)),
+                            None => [self.sreg(ssamp), self.sreg(ssamp + 1), self.sreg(ssamp + 2), s3],
+                        };
                         let z = self.c(0);
                         let levels = self.s.get_dimensions(tex.handle, Some(z));
                         let n = self.s.m.extract(levels, 3);
-                        let l = lod.unwrap_or(z);
-                        let r = self.un(op::ROUND_NE, l);
-                        let zf = self.fc(0.0);
-                        let r = self.fmax(r, zf);
-                        let lv = self.ftoui(r);
+                        // S# level: LOD + bias, clamped to MIN_LOD..MAX_LOD (u4.8), rounded half up; MIP_FILTER none
+                        // reads level 0 of the view (shortcut: how the T# MIN_LOD / BASE_LEVEL relate is unknown)
+                        let k256 = self.fc(1.0 / 256.0);
+                        let bias = self.shlc(ws[2], 18);
+                        let bias = self.ashrc(bias, 18);
+                        let bias = self.sitof(bias);
+                        let bias = self.fmul(bias, k256);
+                        let lo = self.andc(ws[1], 0xFFF);
+                        let lo = self.uitof(lo);
+                        let lo = self.fmul(lo, k256);
+                        let hi = self.lshrc(ws[1], 12);
+                        let hi = self.andc(hi, 0xFFF);
+                        let hi = self.uitof(hi);
+                        let hi = self.fmul(hi, k256);
+                        let x = self.fadd(lod.unwrap_or(lo), bias);
+                        let x = self.fmax(x, lo);
+                        let x = self.fmin(x, hi);
+                        let half = self.fc(0.5);
+                        let x = self.fadd(x, half);
+                        let x = self.un(op::ROUND_NI, x);
+                        let lv = self.ftoui(x);
                         let one = self.c(1);
                         let last = self.umax(n, one);
                         let last = self.sub(last, one);
                         let lv = self.umin(lv, last);
+                        let mip = self.lshrc(ws[2], 26);
+                        let mip = self.andc(mip, 3);
+                        let none = self.cmpc(Pred::Eq, mip, 0);
+                        let lv = self.selc(none, 0, lv);
                         let dims = self.s.get_dimensions(tex.handle, Some(lv));
-                        let (w, hh) = (self.s.m.extract(dims, 0), self.s.m.extract(dims, 1));
-                        let (wf, hf) = (self.uitof(w), self.uitof(hh));
+                        let size = [self.s.m.extract(dims, 0), self.s.m.extract(dims, 1)];
                         let half = self.fc(0.5);
-                        let mut p = [wf, hf];
+                        let m0 = self.andc(ws[0], 7);
+                        let m1 = self.lshrc(ws[0], 3);
+                        let m1 = self.andc(m1, 7);
+                        // taps x, x+1 / y, y+1 after the S# addressing (-1: the border colour)
+                        let mut ax = [[z; 2]; 2];
                         for k in 0..2 {
-                            let x = self.fmul(coords[k], p[k]);
+                            let sf = self.uitof(size[k]);
+                            let x = self.fmul(coords[k], sf);
                             let x = self.fsub(x, half);
-                            p[k] = self.un(op::ROUND_NI, x);
+                            let x = self.un(op::ROUND_NI, x);
+                            let mut p = self.ftosi(x);
                             if let Some(o) = ovgpr {
                                 let x = self.shlc(o, [26, 18][k]);
                                 let x = self.ashrc(x, 26);
-                                let xf = self.sitof(x);
-                                p[k] = self.fadd(p[k], xf);
+                                p = self.add(p, x);
+                            }
+                            for (j, a) in ax[k].iter_mut().enumerate() {
+                                let i = self.addc(p, j as u32);
+                                *a = self.gather_axis(i, size[k], [m0, m1][k]);
                             }
                         }
-                        let layer = (dim == 5).then(|| self.un(op::ROUND_NE, coords[2]));
-                        let fl = self.uitof(lv);
-                        let mut out = [fl; 4];
+                        let layer = (dim == 5).then(|| {
+                            let r = self.un(op::ROUND_NE, coords[2]);
+                            let zf = self.fc(0.0);
+                            let r = self.fmax(r, zf);
+                            let r = self.ftoui(r);
+                            let layers = self.s.m.extract(dims, 2);
+                            let layers = self.umax(layers, one);
+                            let last = self.sub(layers, one);
+                            self.umin(r, last)
+                        });
+                        let b = self.lshrc(ws[3], 30);
+                        let is_border = if comps[0] == 3 {
+                            let b = self.sub(b, one);
+                            self.cmpc(Pred::ULt, b, 2)
+                        } else {
+                            self.cmpc(Pred::Eq, b, 2)
+                        };
+                        let (f1, f0) = (self.fc(1.0), self.fc(0.0));
+                        let border = self.sel(is_border, f1, f0);
+                        let mut out = [border; 4];
                         // D3D Gather order: (x, y+1), (x+1, y+1), (x+1, y), (x, y)
-                        for (k, (dx, dy)) in [(0.5f32, 1.5f32), (1.5, 1.5), (1.5, 0.5), (0.5, 0.5)].into_iter().enumerate() {
-                            let (cx, cy) = (self.fc(dx), self.fc(dy));
-                            let (u, v) = (self.fadd(p[0], cx), self.fadd(p[1], cy));
-                            let mut c = vec![self.fdiv(u, wf), self.fdiv(v, hf)];
+                        for (k, (i, j)) in [(0, 1), (1, 1), (1, 0), (0, 0)].into_iter().enumerate() {
+                            let (x, y) = (ax[0][i], ax[1][j]);
+                            let mut c = vec![x, y];
                             c.extend(layer);
-                            out[k] = self.s.sample_level(tex, smp, &c, &[], fl)[comps[0] as usize];
+                            let v = self.s.texture_load(tex, Some(lv), &c, &[])[comps[0] as usize];
+                            let (nx, ny) = (self.cmpc(Pred::SLt, x, 0), self.cmpc(Pred::SLt, y, 0));
+                            let oob = self.or(nx, ny);
+                            out[k] = self.sel(oob, border, v);
                         }
                         out
                     }
