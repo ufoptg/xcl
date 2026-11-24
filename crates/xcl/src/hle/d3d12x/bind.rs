@@ -27,7 +27,7 @@ struct State {
     args_gfx: Vec<u8>,
     /// the title's graphics root signature (a PC object), bound before a draw with an
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
-    rs_gfx: usize,
+    rs_gfx: Option<ID3D12RootSignature>,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -81,7 +81,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
-        s.rs_gfx = 0;
+        s.rs_gfx = None;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -96,7 +96,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
-        s.rs_gfx = 0;
+        s.rs_gfx = None;
     });
 }
 
@@ -105,7 +105,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx.clone(), s.pso)
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
@@ -174,10 +174,15 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
+    let retained = if super::real::is_adopted(rs) {
+        ID3D12RootSignature::from_raw_borrowed(&rs).cloned()
+    } else {
+        None
+    };
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout_gfx = layout;
-        s.rs_gfx = rs as usize;
+        s.rs_gfx = retained;
     });
 }
 
@@ -282,10 +287,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         }
-        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
-            list.SetGraphicsRootSignature(r);
+        // a PC pipeline: the title's graphics root signature, as for a draw (`graphics_bound`),
+        // only on graphics-capable lists and non-dispatch indirect signatures.
+        if !signature_dispatches(sig) {
+            if let Some(r) = with(this, |s| s.rs_gfx.clone()) {
+                if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) {
+                    if list.GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE {
+                        list.SetGraphicsRootSignature(&r);
+                    }
+                }
+            }
         }
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
@@ -516,9 +527,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
-            list.SetGraphicsRootSignature(r);
+        if let Some(r) = with(this, |s| s.rs_gfx.clone()) {
+            list.SetGraphicsRootSignature(&r);
         }
         return Some(list);
     }
@@ -1529,6 +1539,80 @@ void main(uint t : SV_GroupIndex) {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn graphics_root_signature_is_retained_and_skipped_on_compute_ei() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None)
+                .expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let rs_raw = rs.as_raw();
+            crate::hle::d3d12x::real::adopt(rs_raw, crate::hle::d3d12x::real::Kind::RootSignature);
+
+            let list_key = 0x7400_0001usize as *mut c_void;
+            let split_key = 0x7400_0002usize as *mut c_void;
+            reset(list_key, 0, 0);
+            set_graphics_root_signature(list_key, rs_raw);
+            drop(rs);
+
+            // Retained inside `State.rs_gfx`: live refcount is 1 even after the caller dropped `rs`.
+            let kept = with(list_key, |s| s.rs_gfx.clone()).expect("rs_gfx must be retained");
+            assert_eq!(kept.as_raw(), rs_raw);
+            drop(kept);
+
+            // `inherit_for_split` retains a second reference for the split list.
+            inherit_for_split(list_key, split_key, 0);
+            assert!(with(split_key, |s| s.rs_gfx.is_some()));
+
+            // On a COMPUTE command list, `execute_indirect` must not call `SetGraphicsRootSignature`.
+            unsafe extern "system" fn fake_get_type_compute(_this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+                D3D12_COMMAND_LIST_TYPE_COMPUTE
+            }
+            unsafe extern "system" fn fake_ei_noop(
+                _this: *mut c_void, _sig: usize, _max: u32, _args: usize, _args_off: u64, _cnt: usize, _cnt_off: u64,
+            ) {}
+            let mut orig_vt = [0usize; 64];
+            orig_vt[8] = fake_get_type_compute as usize;
+            orig_vt[59] = fake_ei_noop as usize;
+            let mut ext_vt = vec![0usize; 65];
+            ext_vt[0] = orig_vt.as_ptr() as usize;
+            ext_vt[1..].copy_from_slice(&orig_vt);
+            let mut fake_vt = ext_vt.as_ptr().add(1);
+            let fake_list = (&raw mut fake_vt) as *mut c_void;
+            reset(fake_list, 0, 0);
+            set_graphics_root_signature(fake_list, rs_raw);
+            execute_indirect(fake_list, 0x7400_00F0, 1, 0, 0, 0, 0);
+            forget(fake_list);
+
+            // `clear_state` and `forget` drop the retained references cleanly.
+            clear_state(list_key, 0);
+            assert!(with(list_key, |s| s.rs_gfx.is_none()));
+            forget(split_key);
+            forget(list_key);
         }
     }
 }
