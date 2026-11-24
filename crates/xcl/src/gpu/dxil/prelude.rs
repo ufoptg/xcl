@@ -36,11 +36,21 @@ impl Lw {
     /// MODE[3:2] the software conversion with the current mode.
     pub fn to_f16(&mut self, e: Value) -> Value {
         if self.dyn_rm {
-            let rm = self.rd(super::lower::VAR_FP16_RM);
-            return self.f32_to_f16_rm(e, rm);
+            return self.to_f16_rounded(e);
         }
         let h = self.s.f32_to_f16(e);
         self.andc(h, 0xFFFF)
+    }
+    /// Round an exact binary32 input to binary16 in the selected RDNA mode
+    /// (`recomp/emit.rs` `to_f16_rounded_expr`). Legacy `f32tof16` uses
+    /// round-toward-zero; the default RDNA mode is round-to-nearest-even.
+    pub fn to_f16_rounded(&mut self, e: Value) -> Value {
+        if self.dyn_rm {
+            let rm = self.rd(super::lower::VAR_FP16_RM);
+            self.f32_to_f16_rm(e, rm)
+        } else {
+            self.f32_to_f16_rne(e)
+        }
     }
     /// `f16_rtz`: binary16 rounded toward zero.
     pub fn f16_rtz(&mut self, f: Value) -> Value {

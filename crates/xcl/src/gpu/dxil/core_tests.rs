@@ -437,3 +437,85 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+/// Without a program-set `MODE[3:2]`, `v_cvt_f16_f32`, `v_mul_f16` and `v_pk_mul_f16`
+/// must round to nearest-even (matching RDNA2 and the HLSL path) rather than using
+/// `dx.op.legacyF32ToF16` (which rounds toward zero / flushes below the smallest f16 denormal).
+#[test]
+fn f16_conversions_and_products_default_to_round_to_nearest_even() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+    ]);
+    let w32_dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let split_dxil = translate(&code, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let w64_dxil = translate(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    if let Ok(dis) = super::validate::disassemble(&w32_dxil) {
+        assert!(!dis.contains("legacyF32ToF16"), "default RNE f16 ops should not emit legacyF32ToF16:\n{dis}");
+    }
+
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no wave32 or wave64 GPU");
+    }
+
+    let cvt_cases: [(f32, u16); 8] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0000), 0x0000),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    // Lane 0: 3072 * (1 + 2^-10) = 3075.0 (exact midpoint -> 0x6A02 / 0xEA02).
+    // Lane 1: 2^-24 * (0.5 + 2^-11) = 2^-25 + 2^-35 (above half smallest f16 denormal -> 0x0001 / 0x8001).
+    let mul_cases: [(u32, u32, u16, u32); 2] = [
+        (0xEA00_6A00, 0x3C01_3C01, 0x6A02, 0xEA02_6A02),
+        (0x8001_0001, 0x3801_3801, 0x0001, 0x8001_0001),
+    ];
+
+    let mut runs: Vec<(&str, &[u8], bool)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", &w32_dxil, false));
+        runs.push(("split-wave64", &split_dxil, true));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", &w64_dxil, true));
+    }
+    for (label, dxil, wave64) in runs {
+        let mut st = KernelState::default();
+        if !wave64 {
+            st.sgpr[127] = 0;
+        }
+        let bases: &[usize] = if wave64 { &[0, 32] } else { &[0] };
+        for &base in bases {
+            for (i, &(value, _)) in cvt_cases.iter().enumerate() {
+                st.vgpr[base + i][0] = value.to_bits();
+            }
+            for (i, &(a, b, _, _)) in mul_cases.iter().enumerate() {
+                st.vgpr[base + i][1] = a;
+                st.vgpr[base + i][2] = b;
+            }
+        }
+        let r = runner::run(dxil, &st, &[]).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for &base in bases {
+            let actual: [u16; 8] = std::array::from_fn(|i| r.vgpr[base + i][10] as u16);
+            let expected = cvt_cases.map(|(_, bits)| bits);
+            assert_eq!(actual, expected, "{label} base {base}: v_cvt_f16_f32 {actual:04x?} != {expected:04x?}");
+            for (i, &(_, _, want_mul, want_pk)) in mul_cases.iter().enumerate() {
+                let got_mul = r.vgpr[base + i][11] as u16;
+                let got_pk = r.vgpr[base + i][12];
+                assert_eq!(got_mul, want_mul, "{label} lane {}: v_mul_f16 {got_mul:04x} != {want_mul:04x}", base + i);
+                assert_eq!(got_pk, want_pk, "{label} lane {}: v_pk_mul_f16 {got_pk:08x} != {want_pk:08x}", base + i);
+            }
+        }
+    }
+}

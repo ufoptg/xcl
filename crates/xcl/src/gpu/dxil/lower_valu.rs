@@ -466,7 +466,7 @@ impl Lw {
                 } else {
                     x
                 };
-                let h = self.to_f16(x);
+                let h = self.to_f16_rounded(x);
                 if m.opsel >> 3 & 1 == 1 {
                     let l = self.andc(cur, 0xFFFF);
                     let hh = self.shlc(h, 16);
