@@ -344,14 +344,52 @@ impl Module {
         idom
     }
 
+    /// Replace phis whose incoming values are only themselves and one other value. Repeat
+    /// because resolving one phi may make another trivial, including across loop backedges.
+    fn simplify_phis(&self, order: &[u32], repl: &mut [Option<Value>]) {
+        loop {
+            let mut changed = false;
+            for &b in order {
+                for &i in &self.blocks[b as usize] {
+                    let i = i as usize;
+                    if repl[i].is_some() {
+                        continue;
+                    }
+                    let Op::Phi(inc) = &self.insts[i].op else { break };
+                    let me = Value::Inst(i as u32);
+                    let mut same: Option<Value> = None;
+                    let mut trivial = true;
+                    for &(v, _) in inc {
+                        let v = resolve(repl, v);
+                        if v == me || Some(v) == same {
+                            continue;
+                        }
+                        if same.is_some() {
+                            trivial = false;
+                            break;
+                        }
+                        same = Some(v);
+                    }
+                    if let (true, Some(v)) = (trivial, same) {
+                        repl[i] = Some(v);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,cfg,dce` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
-        let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+        let mut order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
         // malformed IR (a use before its definition or of a void result) is left for the
         // writer to report, not cleaned away
         if !self.uses_well_formed(&order) {
@@ -379,38 +417,8 @@ impl Module {
         let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
 
         // trivial phis (all incoming values the phi itself or one value), to a fixed point
-        while !skip("phi") {
-            let mut changed = false;
-            for &b in &order {
-                for &i in &self.blocks[b as usize] {
-                    let i = i as usize;
-                    if repl[i].is_some() {
-                        continue;
-                    }
-                    let Op::Phi(inc) = &self.insts[i].op else { break };
-                    let me = Value::Inst(i as u32);
-                    let mut same: Option<Value> = None;
-                    let mut trivial = true;
-                    for &(v, _) in inc {
-                        let v = resolve(&mut repl, v);
-                        if v == me || Some(v) == same {
-                            continue;
-                        }
-                        if same.is_some() {
-                            trivial = false;
-                            break;
-                        }
-                        same = Some(v);
-                    }
-                    if let (true, Some(v)) = (trivial, same) {
-                        repl[i] = Some(v);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
+        if !skip("phi") {
+            self.simplify_phis(&order, &mut repl);
         }
 
         // CSE along the dominator tree (preorder walk with a scoped table)
@@ -479,38 +487,62 @@ impl Module {
         }
         // second trivial-phi fixed point if CSE/simplification collapsed incoming values
         if cse_replaced && !skip("phi") {
-            loop {
-                let mut changed = false;
-                for &b in &order {
-                    for &i in &self.blocks[b as usize] {
-                        let i = i as usize;
-                        if repl[i].is_some() {
-                            continue;
-                        }
-                        let Op::Phi(inc) = &self.insts[i].op else { break };
-                        let me = Value::Inst(i as u32);
-                        let mut same: Option<Value> = None;
-                        let mut trivial = true;
-                        for &(v, _) in inc {
-                            let v = resolve(&mut repl, v);
-                            if v == me || Some(v) == same {
-                                continue;
-                            }
-                            if same.is_some() {
-                                trivial = false;
-                                break;
-                            }
-                            same = Some(v);
-                        }
-                        if let (true, Some(v)) = (trivial, same) {
-                            repl[i] = Some(v);
-                            changed = true;
+            self.simplify_phis(&order, &mut repl);
+        }
+        // CSE and algebraic simplification can make a terminator constant. Fold it before
+        // DCE, then rebuild reachability and predecessor edges: a predecessor block can stay
+        // reachable while one of its edges disappears, and that edge's phi input must go.
+        let mut cfg_folded = false;
+        if !skip("cfg") {
+            for &b in &order {
+                let Some(&i) = self.blocks[b as usize].last() else { continue };
+                let replacement = match self.insts[i as usize].op.clone() {
+                    Op::CondBr(c, t, f) => match self.const_u64(c) {
+                        Some(0) => Some(Op::Br(f)),
+                        Some(1) => Some(Op::Br(t)),
+                        _ => None,
+                    },
+                    Op::Switch(v, default, cases) => self.const_u64(v).map(|needle| {
+                        let target = cases.iter().find_map(|(case, target)| (self.const_u64(*case) == Some(needle)).then_some(*target)).unwrap_or(default);
+                        Op::Br(target)
+                    }),
+                    _ => None,
+                };
+                if let Some(op) = replacement {
+                    self.insts[i as usize].op = op;
+                    cfg_folded = true;
+                }
+            }
+        }
+        if cfg_folded {
+            order = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let mut reach = vec![false; self.blocks.len()];
+            // CFG blocks normally have very few predecessors, so compact vectors avoid one
+            // hash-table allocation per block on the giant programs this pass targets.
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); self.blocks.len()];
+            for &b in &order {
+                reach[b as usize] = true;
+                for succ in self.successors(b as usize) {
+                    if let Some(p) = preds.get_mut(succ.0 as usize) {
+                        if !p.contains(&b) {
+                            p.push(b);
                         }
                     }
                 }
-                if !changed {
-                    break;
+            }
+            for (b, r) in reach.iter().enumerate() {
+                if !r {
+                    self.blocks[b].clear();
                 }
+            }
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
+                    let Op::Phi(inc) = &mut self.insts[i as usize].op else { break };
+                    inc.retain(|p| preds[b as usize].contains(&p.1 .0));
+                }
+            }
+            if !skip("phi") {
+                self.simplify_phis(&order, &mut repl);
             }
         }
         // phis may name values defined later (back edges): resolve once more
@@ -570,4 +602,127 @@ fn resolve(repl: &mut [Option<Value>], v: Value) -> Value {
         }
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_conditional_removes_edge_and_trivial_phi() {
+        let mut m = Module::new();
+        let entry = m.entry_block();
+        let yes = m.new_block();
+        let no = m.new_block();
+        let join = m.new_block();
+        let i32 = m.i32();
+        let slot = m.alloca(i32, 4);
+        let one = m.i32c(1);
+        let cond = m.cmp(Pred::Eq, one, one);
+        m.cond_br(cond, yes, no);
+        m.set_block(yes);
+        let live = m.i32c(7);
+        m.br(join);
+        m.set_block(no);
+        let dead = m.i32c(9);
+        m.br(join);
+        m.set_block(join);
+        let phi = m.phi(i32);
+        m.add_incoming(phi, live, yes);
+        m.add_incoming(phi, dead, no);
+        m.store(slot, phi, 4);
+        m.ret();
+
+        m.optimize();
+
+        assert!(matches!(m.insts[*m.blocks[entry.0 as usize].last().unwrap() as usize].op, Op::Br(b) if b == yes));
+        assert!(m.blocks[no.0 as usize].is_empty());
+        assert!(!m.blocks[join.0 as usize].iter().any(|&i| matches!(m.insts[i as usize].op, Op::Phi(_))));
+    }
+
+    #[test]
+    fn constant_switch_keeps_only_the_selected_predecessor() {
+        let mut m = Module::new();
+        let entry = m.entry_block();
+        let default = m.new_block();
+        let selected = m.new_block();
+        let join = m.new_block();
+        let one = m.i32c(1);
+        let two = m.i32c(2);
+        let selector = m.bin(BinOp::Add, one, one);
+        m.switch(selector, default, &[(two, selected)]);
+        m.set_block(default);
+        m.br(join);
+        m.set_block(selected);
+        m.br(join);
+        m.set_block(join);
+        m.ret();
+
+        m.optimize();
+
+        assert!(matches!(m.insts[*m.blocks[entry.0 as usize].last().unwrap() as usize].op, Op::Br(b) if b == selected));
+        assert!(m.blocks[default.0 as usize].is_empty());
+        assert!(!m.blocks[selected.0 as usize].is_empty());
+    }
+
+    #[test]
+    fn unreachable_double_conversion_does_not_set_extension_flag() {
+        let mut m = Module::new();
+        let live = m.new_block();
+        let dead = m.new_block();
+        let one = m.i32c(1);
+        let always = m.cmp(Pred::Eq, one, one);
+        m.cond_br(always, live, dead);
+        m.set_block(dead);
+        let f64 = m.f64();
+        m.cast(CastOp::SIToFP, one, f64);
+        m.ret();
+        m.set_block(live);
+        m.ret();
+
+        assert!(m.uses_double_extensions());
+        m.optimize();
+
+        assert!(m.blocks[dead.0 as usize].is_empty());
+        assert!(!m.uses_double_extensions());
+    }
+
+    #[test]
+    fn edge_trim_keeps_a_loop_phi_backedge() {
+        let mut m = Module::new();
+        let entry = m.entry_block();
+        let dead = m.new_block();
+        let lp = m.new_block();
+        let exit = m.new_block();
+        let i32 = m.i32();
+        let i1 = m.i1();
+        let result = m.alloca(i32, 4);
+        let loop_cond = m.alloca(i1, 1);
+        let zero = m.i32c(0);
+        let one = m.i32c(1);
+        let always = m.cmp(Pred::Eq, one, one);
+        m.cond_br(always, lp, dead);
+        m.set_block(dead);
+        let discarded = m.i32c(99);
+        m.br(lp);
+        m.set_block(lp);
+        let phi = m.phi(i32);
+        m.add_incoming(phi, zero, entry);
+        m.add_incoming(phi, discarded, dead);
+        let next = m.bin(BinOp::Add, phi, one);
+        m.add_incoming(phi, next, lp);
+        let again = m.load(loop_cond, 1);
+        m.cond_br(again, lp, exit);
+        m.set_block(exit);
+        m.store(result, phi, 4);
+        m.ret();
+
+        m.optimize();
+
+        assert!(m.blocks[dead.0 as usize].is_empty());
+        let incoming = m.phi_incoming(phi);
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.iter().any(|p| p.1 == entry));
+        assert!(incoming.iter().any(|p| p.1 == lp));
+    }
 }

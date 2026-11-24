@@ -1393,11 +1393,14 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
-            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
-            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
-            Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
-            _ => false,
+        self.blocks.iter().flatten().any(|&i| {
+            let d = &self.insts[i as usize];
+            match &d.op {
+                Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
+                Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+                Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
+                _ => false,
+            }
         })
     }
     pub fn insts_use_type(&self, t: Ty) -> bool {
