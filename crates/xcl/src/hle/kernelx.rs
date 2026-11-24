@@ -225,6 +225,7 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
+    crate::hle::d3d12x::sparse_cool::warm(a, n);
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
@@ -467,6 +468,7 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    crate::hle::d3d12x::sparse_cool::warm(addr as usize, size);
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 

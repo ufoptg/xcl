@@ -88,6 +88,8 @@ pub fn ensure(p: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // sparse tiles made read-only (left out of the write-watch look) are writable again too
+    crate::hle::d3d12x::sparse_cool::warm(p, len);
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
