@@ -103,7 +103,10 @@ impl Config {
         }
         if self.title_id.is_empty() {
             if let Some(t) = manifest.and_then(|m| m.title_id.clone()) {
-                from.push(format!("TitleId {t}"));
+                from.push(match parse_title_id(&t) {
+                    Some(_) => format!("TitleId {t}"),
+                    None => format!("TitleId {t:?} (not a nonzero 32-bit hex title id: the title gets none)"),
+                });
                 self.title_id = t;
             }
         }
@@ -245,6 +248,24 @@ impl Config {
         let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
         parse_raytracing_tier(mode)
     }
+
+    /// The title id the runtime hands the title (`XGameGetXboxTitleId`, and as text
+    /// `XPackageEnumeratePackages`): `title_id` read by `parse_title_id`.
+    pub fn title_id_value(&self) -> Option<u32> {
+        parse_title_id(&self.title_id)
+    }
+}
+
+/// A title id as MicrosoftGame.Config or xcl.toml writes it: hex, with or without a `0x` /
+/// `0X` prefix, spaces around it ignored. None when it is empty, not hex, wider than 32 bits
+/// or 0 – the title then gets 0 from `XGameGetXboxTitleId` and no title id in its package.
+pub fn parse_title_id(s: &str) -> Option<u32> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(t, 16).ok().filter(|&v| v != 0)
 }
 
 pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
@@ -361,6 +382,39 @@ mod tests {
             c.resolve(m);
             assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
         }
+    }
+
+    #[test]
+    fn a_title_id_is_read_one_way() {
+        for (text, value) in [
+            ("1234ABCD", Some(0x1234_ABCD)),
+            ("1234abcd", Some(0x1234_ABCD)),
+            ("0x1234abcd", Some(0x1234_ABCD)),
+            ("0X1234ABCD", Some(0x1234_ABCD)),
+            ("  1234ABCD\n", Some(0x1234_ABCD)),
+            ("ABCD", Some(0xABCD)),
+            ("", None),
+            ("0x", None),
+            ("XYZ123", None),
+            ("+1234", None),
+            ("123456789", None),
+            ("00000000", None),
+        ] {
+            assert_eq!(parse_title_id(text), value, "{text:?}");
+        }
+        // the start-up line says when the manifest's id is not one the title gets
+        let manifest = |id: &str| crate::manifest::Manifest { title_id: Some(id.into()), ..Default::default() };
+        let mut c = Config::default();
+        assert!(c.resolve(Some(&manifest("1234ABCD"))).contains(&"TitleId 1234ABCD".to_string()));
+        assert_eq!(c.title_id_value(), Some(0x1234_ABCD));
+        let mut c = Config::default();
+        let from = c.resolve(Some(&manifest("XYZ123")));
+        assert!(from.iter().any(|f| f.starts_with("TitleId \"XYZ123\" (not a nonzero 32-bit hex title id")), "{from:?}");
+        assert_eq!(c.title_id_value(), None);
+        // xcl.toml's id wins over the manifest's
+        let mut c = Config { title_id: "CAFE0001".into(), ..Config::default() };
+        c.resolve(Some(&manifest("1234ABCD")));
+        assert_eq!(c.title_id_value(), Some(0xCAFE_0001));
     }
 
     #[test]

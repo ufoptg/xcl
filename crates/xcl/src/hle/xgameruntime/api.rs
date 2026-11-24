@@ -1150,7 +1150,8 @@ unsafe extern "system" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c
     let c = |s: String| std::ffi::CString::new(s).unwrap_or_default();
     let id = c(package_identifier());
     let title = c(crate::state::boot().map(|b| b.title.clone()).unwrap_or_default());
-    let title_id = c(crate::state::config().title_id.trim_start_matches("0x").to_ascii_uppercase());
+    // the number XGameGetXboxTitleId gives, as 8 hex digits; none where it gives 0
+    let title_id = c(crate::state::config().title_id_value().map(|v| format!("{v:08X}")).unwrap_or_default());
     let empty = c(String::new());
     let d = PackageDetails {
         package_identifier: id.as_ptr() as *const u8,
@@ -1335,10 +1336,14 @@ pub unsafe extern "system" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
-    let t = &crate::state::config().title_id;
-    *out = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
+    let config = crate::state::config();
+    *out = config.title_id_value().unwrap_or(0);
     if *out == 0 {
-        crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+        if config.title_id.trim().is_empty() {
+            crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
+        } else {
+            crate::xlog_warn!("XGameGetXboxTitleId: TitleId {:?} (MicrosoftGame.Config / xcl.toml) is not a nonzero 32-bit hex title id → 0", config.title_id);
+        }
     }
     S_OK
 }
