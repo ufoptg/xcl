@@ -58,19 +58,25 @@ fn fname(what: &ImportName) -> String {
     what.to_string()
 }
 
-/// Real Windows module handle (cached). Never maps through our loader.
+/// Real Windows module handle. Never maps through our loader. Bare names are cached by
+/// `dll_key`; a name with a directory loads that path, as Windows does, and failures are not
+/// cached (a later load may succeed).
 pub fn system_module(dll: &str) -> Option<usize> {
     use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    if dll.contains(['\\', '/', ':']) {
+        let h = unsafe { LoadLibraryW(wide(dll).as_ptr()) } as usize;
+        return (h != 0).then_some(h);
+    }
     let key = dll_key(dll);
-    {
-        let g = SYS_CACHE.lock().unwrap();
-        if let Some(&h) = g.as_ref().and_then(|m| m.get(&key)) {
-            return (h != 0).then_some(h);
-        }
+    if let Some(&h) = SYS_CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return Some(h);
     }
     let h = unsafe { LoadLibraryW(wide(dll).as_ptr()) } as usize;
+    if h == 0 {
+        return None;
+    }
     SYS_CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, h);
-    (h != 0).then_some(h)
+    Some(h)
 }
 
 pub fn system_proc_in(h: usize, what: &ImportName) -> Option<usize> {
@@ -608,5 +614,35 @@ mod tests {
             stubs::info_of_stub(stub_addr).map(|i| i.ret),
             Some(crate::util::E_NOTIMPL as u32 as u64)
         );
+    }
+
+    fn module_path(h: usize) -> String {
+        let mut buf = [0u16; 520];
+        let n = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(h as _, buf.as_mut_ptr(), 520) };
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    /// A failed LoadLibrary of a path does not make a later load of the bare name fail.
+    #[test]
+    fn failed_system_load_by_path_is_not_cached() {
+        let missing = std::env::temp_dir().join(format!("xcl_resolver_missing_{}", std::process::id())).join("msimg32.dll");
+        assert_eq!(load_library(missing.to_str().unwrap()), None);
+        let h = load_library("msimg32.dll").expect("LoadLibrary(msimg32.dll) after a failed load by path");
+        assert!(module_path(h).to_ascii_lowercase().ends_with("\\system32\\msimg32.dll"), "{}", module_path(h));
+    }
+
+    /// LoadLibrary of a path loads that file, not the System32 module cached under its name.
+    #[test]
+    fn system_load_by_path_loads_that_path() {
+        let sys = load_library("version.dll").expect("LoadLibrary(version.dll)");
+        let dir = std::env::temp_dir().join(format!("xcl_resolver_bypath_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("version.dll");
+        std::fs::copy(module_path(sys), &copy).unwrap();
+        let h = load_library(copy.to_str().unwrap()).expect("LoadLibrary(<temp>\\version.dll)");
+        assert_ne!(h, sys);
+        assert!(module_path(h).eq_ignore_ascii_case(copy.to_str().unwrap()), "{}", module_path(h));
+        // the bare name still gives the System32 module
+        assert_eq!(load_library("version.dll"), Some(sys));
     }
 }
