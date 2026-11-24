@@ -67,6 +67,7 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
     let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    super::diff_kernel::pair(&dxil, code, wave64, || runner::direct_kernel_full(code, wave64));
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
@@ -75,7 +76,10 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
     let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
-    if !runner::direct_dxil() || !windows {
+    // `XCL_DXIL_DIFF=1`: a kernel or compute program is paired with its direct translation
+    // (`diff_kernel::pair`)
+    let diff = super::diff_kernel::enabled() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_)) && !hlsl.is_empty();
+    if !(runner::direct_dxil() || diff) || !windows {
         return hlsl;
     }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
@@ -83,6 +87,14 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     let mem_windows = if opt.heap_windows && opt.mem_windows > 1 { opt.mem_windows | super::HEAP_WINDOWS } else { opt.mem_windows };
     let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
+        Mode::Kernel if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || crate::gpu::dxil::kernel::translate_full(code, o));
+            hlsl
+        }
+        Mode::Compute(cs) if diff => {
+            super::diff_kernel::pair(&hlsl, code, opt.wave64, || translate_compute(code, o, cs));
+            hlsl
+        }
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
         Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
@@ -96,6 +108,13 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
 /// through the direct DXIL translator (and its validator check).
 fn direct_check(code: &[u8], opt: &Options) {
     let _ = direct_or(code, opt, Vec::new());
+}
+
+/// `XCL_DXIL_DIFF=1`: a container the test compiled itself is paired as `direct_or` pairs it.
+fn diff_pair(code: &[u8], opt: &Options, hlsl: &[u8]) {
+    if super::diff_kernel::enabled() {
+        let _ = direct_or(code, opt, hlsl.to_vec());
+    }
 }
 
 /// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
@@ -3946,11 +3965,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 
@@ -6286,9 +6318,11 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
         let lanes = if wave64 { 64 } else { 32 };
         let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
-        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        diff_pair(&p, &opt, &dxil);
         let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
@@ -7511,12 +7545,14 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
     for wave64 in [true, false] {
-        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() });
+        let t = translate(&p_all, &opt).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
         if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        diff_pair(&p_all, &opt, &dxil);
         let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
         for tid in 0..128usize {
             let want = ((tid ^ 96) + 0x101) as u32;
@@ -7592,6 +7628,38 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
 }
 
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of

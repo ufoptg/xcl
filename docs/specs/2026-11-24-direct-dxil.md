@@ -90,6 +90,15 @@ in scratch memory. The direct backend therefore uses a per-lane model:
   tests (≈6k lines, `runner::run`) take DXIL bytes. Every test runs the same
   RDNA program through both backends, which must give identical final
   registers and memory.
+  `XCL_DXIL_DIFF=1` does this for every kernel test that goes through
+  `runner::run_code` / `run_code_with` / `run_program` or the tests'
+  `kernel_wave` / kernel- and compute-mode `direct_or` (`recomp::diff_kernel`; a
+  compute dispatch compares the flat memory): both
+  backends run, any difference is an error, a program the direct
+  translator refuses keeps the HLSL result.
+  With `XCL_DXIL_DIFF_TABLE=<path>` each paired program also appends a
+  line (test, program hash, outcome, its opcodes) to `<path>`;
+  `recomp::diff_table` turns the file into the per-opcode parity table.
 - Corpus sweep: translate the bounded validation corpus (9,282 programs)
   and record per-program direct/fallback status and validator results, on
   small samples per the project's time constraints.
