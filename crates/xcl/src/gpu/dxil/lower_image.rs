@@ -857,8 +857,13 @@ impl Lw {
                 let dims = lw.s.get_dimensions(tex.handle, None);
                 let count = lw.s.m.extract(dims, 3);
                 for (si, &sv) in samples.iter().enumerate() {
-                    let r = lw.s.texture_load_sample(tex, sv, &coords);
+                    // load only a sample the resource has (sample 0 in place of one at or
+                    // past its count: an out-of-range `ld2dms` index is undefined and faults
+                    // on RDNA4); the result is still zeroed below
                     let inside = lw.cmp(Pred::ULt, sv, count);
+                    let first = lw.c(0);
+                    let loaded = lw.sel(inside, sv, first);
+                    let r = lw.s.texture_load_sample(tex, loaded, &coords);
                     for k in 0..4 {
                         let b = lw.bits(r[k]);
                         let zz = lw.c(0);
