@@ -7594,6 +7594,38 @@ fn fspx_containers_translate_and_compile() {
     assert_eq!(ok, n);
 }
 
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
+}
+
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
 /// inner loops, loops whose end is an inner loop's – give the same state as structured code and as
 /// the block dispatcher (`structured: false`).
@@ -7729,4 +7761,63 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+#[test]
+fn gpu_large_compute_shares_wave_and_window_helpers() {
+    if !gpu_ready() {
+        return;
+    }
+    let opt = Options { mem_windows: 2, split_wave64: runner::graphics_wave32(), ..Default::default() };
+    let load = encode("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 0), ("SADDR", 0x7D)], None).unwrap();
+    let add = encode("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 12), ("VSRC1", 2)], None).unwrap();
+    let store = encode("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("DATA", 3), ("ADDR", 0), ("SADDR", 0x7D)], None).unwrap();
+    let end = encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    let small = translate(&[load.as_slice(), &end].concat(), &opt).unwrap();
+    assert!(!small.hlsl.contains("[noinline]"));
+
+    // Padding exercises the large-program path without making an expensive test shader.
+    let mut code = encode("S_NOP", "ENC_SOPP", &[], None).unwrap().repeat(1024);
+    let mut expected = std::array::from_fn::<u32, 64, _>(|lane| lane as u32 + 1);
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let mut state = KernelState::default();
+    let vector_base = arena.window(1).0 + 0x8000;
+    state.sgpr[40..44].copy_from_slice(&[vector_base as u32, ((vector_base >> 32) as u32 & 0xFFFF) | (16 << 16), 64, 0]);
+    let address = |lane: usize| arena.window(lane % 2).0 + 4096 + 4 * lane;
+    for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+        let addr = address(lane);
+        unsafe { *(addr as *mut u32) = expected[lane] };
+        regs[0] = addr as u32;
+        regs[1] = (addr >> 32) as u32;
+        regs[8] = lane as u32;
+        for component in 0..4 {
+            unsafe { *((vector_base + 16 * lane + 4 * component) as *mut u32) = 10_000 + 10 * lane as u32 + component as u32 };
+        }
+    }
+    for round in 0..32 {
+        let lane = if round % 2 == 0 { 37 } else { 4 };
+        let selected = expected[lane];
+        expected.iter_mut().for_each(|v| *v = v.wrapping_add(selected));
+        code.extend_from_slice(&load);
+        code.extend(encode("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128 + lane as u64)], None).unwrap());
+        code.extend_from_slice(&add);
+        code.extend_from_slice(&store);
+    }
+    code.extend(encode("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 20), ("VADDR", 8), ("SRSRC", 10), ("SOFFSET", 128), ("IDXEN", 1)], None).unwrap());
+    code.extend_from_slice(&end);
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete());
+    assert!(t.hlsl.contains("[noinline] uint xcl_mLoad"));
+    assert!(t.hlsl.contains("[noinline] void xcl_loadx4_shared"));
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let inline = super::dxc::compile(&t.hlsl.replace("[noinline] ", ""), "main", "cs_6_6", &[]).unwrap();
+    assert!(dxil.len() < inline.len(), "outlined {} bytes, inline {}", dxil.len(), inline.len());
+    let result = runner::run_in_arena(&dxil, &state, &arena).unwrap();
+    for (lane, expected) in expected.into_iter().enumerate() {
+        assert_eq!(result.vgpr[lane][3], expected, "lane {lane}");
+        assert_eq!(unsafe { *(address(lane) as *const u32) }, expected, "window {}, lane {lane}", lane % 2);
+        for component in 0..4 {
+            assert_eq!(result.vgpr[lane][20 + component], 10_000 + 10 * lane as u32 + component as u32, "vector lane {lane}, component {component}");
+        }
+    }
 }
