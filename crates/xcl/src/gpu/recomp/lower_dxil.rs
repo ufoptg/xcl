@@ -230,6 +230,7 @@ impl Ir for DxilIr {
         if self.lw.split {
             // this half's word from the hardware, the other's through the exchange
             let (lo, hi) = self.lw.ballot(c);
+            self.tails[self.cur] = self.lw.cur();
             return [lo, hi];
         }
         let w = self.lw.s.wave_ballot(c);
@@ -282,7 +283,9 @@ impl Ir for DxilIr {
         if self.lw.split {
             // the lowering's lane reads take the same lane in every lane (readlane,
             // readfirstlane, writelane's source)
-            return self.lw.read_lane_uniform(v, lane);
+            let r = self.lw.read_lane_uniform(v, lane);
+            self.tails[self.cur] = self.lw.cur();
+            return r;
         }
         self.lw.s.wave_read_lane_at(v, lane)
     }
@@ -767,5 +770,86 @@ mod tests {
             }
         }
         assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
+    }
+
+    /// Split wave64 compute with >64 threads (`Partner::Spin`): `DxilIr::ballot` and
+    /// `DxilIr::read_lane` call `Lw::spin_exchange`, which creates DXIL basic blocks and advances
+    /// `self.lw.cur()`. `self.tails[self.cur]` must track that tail so PHIs in successor blocks
+    /// (diamonds and loop headers) reference the post-exchange predecessor block (#1889).
+    #[test]
+    fn split_wave64_spin_exchange_updates_block_tails() {
+        // 1) Whole-wave ballot (`s_bcnt1_i32_b64`) in a uniform branch arm feeding a join PHI
+        const BALLOT_DIAMOND: &[I] = &[
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)]),
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]),
+            ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 135)]),
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 4), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        // 2) Cross-half `v_readlane_b32` (lane 37) in a uniform branch arm feeding a join PHI
+        const READLANE_DIAMOND: &[I] = &[
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 165)]),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 137)]),
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 4), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        // 3) `v_readfirstlane_b32` (ballot + read_lane) inside a uniform loop feeding back-edge PHIs
+        const READFIRSTLANE_LOOP: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 5), ("VSRC1", 0)]),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 6)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 129)]),
+            ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 5), ("SSRC1", 131)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", (-6i16) as u16 as u64)]),
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 4), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+
+        let cs = crate::gpu::recomp::CsInterface { threads: [128, 1, 1], ..compute_cs() };
+        let cases: [(&str, &[I], [u32; 3]); 3] = [
+            ("ballot diamond", BALLOT_DIAMOND, [40, 64, 7]),
+            ("readlane diamond", READLANE_DIAMOND, [37, 165, 9]),
+            ("readfirstlane loop", READFIRSTLANE_LOOP, [3, 259, 3]),
+        ];
+        let compiled: Vec<(&str, &[I], [u32; 3], Vec<u8>)> = cases
+            .into_iter()
+            .map(|(name, lines, spot)| {
+                let dxil = super::compute_split(&decode(lines), &cs).unwrap_or_else(|e| panic!("{name}: {e}"));
+                (name, lines, spot, dxil)
+            })
+            .collect();
+        if !gpu() {
+            return;
+        }
+        let mem = vec![0u32; 256];
+        for (name, lines, [w0, w1, g1], dxil) in compiled {
+            let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let cpu = run_compute_waves(lines, &cs, true, 2, &[100, 0], &mem);
+            assert_eq!([cpu[0], cpu[64], cpu[128]], [w0, w1, g1], "{name}: expected spot values");
+            assert_eq!(&gpu[..256], &cpu[..256], "{name}");
+        }
     }
 }
