@@ -157,6 +157,47 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+## Reproduce a world-entry smoke run
+
+Use the same local game copy and a checkpoint of its XCL data root for both builds. The checkpoint
+should contain the title's save data and settings. Choose an input schedule that reaches the intended
+scene on your copy. Time alone and a count of presented frames cannot identify that scene.
+
+Build `xcl` from each checkout before running its copy of the script. Use a new trial directory for
+each checkout and keep both the trials and artifacts outside the repository. This example shows the
+two runs for `main`. Repeat from the PR checkout with a different `$trial` and the same game, duration,
+label and input schedule.
+
+```powershell
+cargo build --release -p xcl
+$game = 'D:\Games\MyTitle'
+$checkpoint = 'D:\XCL\saved-checkpoint'
+$trial = Join-Path $env:LOCALAPPDATA 'XCLWorldRuns\main'
+$artifacts = Join-Path $env:LOCALAPPDATA 'XCLWorldRuns\artifacts'
+New-Item -ItemType Directory -Path $trial | Out-Null  # use a directory that does not exist yet
+$env:XCL_PRESS_AT = '14:A,18.5:DOWN,20:A'              # replace with your title's schedule
+$env:XCL_DXIL_CACHE = Join-Path $trial 'dxil'
+Remove-Item Env:XCL_PRESS_A_AT -ErrorAction SilentlyContinue
+$options = @{ Game = $game; Seconds = 180; Title = 'world-entry'; ArtifactsDir = $artifacts }
+
+$env:XCL_DATA_ROOT = Join-Path $trial 'first-data'
+Copy-Item -LiteralPath $checkpoint -Destination $env:XCL_DATA_ROOT -Recurse
+.\scripts\smoke.ps1 @options -CacheState fresh
+
+$env:XCL_DATA_ROOT = Join-Path $trial 'second-data'
+Copy-Item -LiteralPath $checkpoint -Destination $env:XCL_DATA_ROOT -Recurse
+.\scripts\smoke.ps1 @options -CacheState seeded
+```
+
+The second run reuses the first run's XCL DXIL and pipeline cache and starts from a fresh checkpoint
+copy. `-CacheState` labels the run in its manifest. The script does not clear caches or reset the GPU
+driver's system cache. Each invocation creates a separate artifacts subdirectory with `xcl.log`,
+`report.json` if produced, and `manifest.json` with build, GPU, input and cache settings. The
+`xcl-smoke v1` block remains the output for the PR. Keep the saved run artifacts local.
+
+Use a separate capture run with the same checkpoint and inputs to record the last scene you can
+visually confirm. If you use `XCL_FRAME_DUMP`, keep it disabled for the four timed runs.
+
 ## Tests
 
 ```powershell
