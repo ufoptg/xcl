@@ -823,9 +823,14 @@ mod tests {
     const V: u64 = 256;
     type I = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
 
-    fn program(lines: &[I]) -> Vec<Decoded> {
+    fn code(lines: &[I]) -> Vec<u8> {
         let mut bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect();
         bytes.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        bytes
+    }
+
+    fn program(lines: &[I]) -> Vec<Decoded> {
+        let bytes = code(lines);
         let mut out = Vec::new();
         let mut off = 0usize;
         while off < bytes.len() {
@@ -859,6 +864,8 @@ mod tests {
     #[test]
     fn a_whole_wave_reduction_reads_its_identity() {
         assert_eq!(reads(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE]), vec![Read::Const(u32::MAX)]);
+        assert!(super::super::needs_upper_lanes(&code(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE])));
+        assert!(!super::super::needs_upper_lanes(&code(&[])));
     }
 
     #[test]

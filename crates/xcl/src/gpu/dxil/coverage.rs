@@ -123,12 +123,23 @@ pub struct Report {
     pub times_us: Vec<u64>,
     /// (direct DXIL bytes, HLSL-path DXIL bytes) for programs both paths produced
     pub sizes: Vec<(usize, usize)>,
+    /// the slowest programs: (microseconds, program), slowest first, at most [`SLOWEST`]
+    pub slowest: Vec<(u64, String)>,
 }
+
+/// How many of the slowest programs a [`Report`] keeps.
+pub const SLOWEST: usize = 10;
 
 impl Report {
     pub fn add(&mut self, name: &str, s: &Sample) {
         let c = self.stages.entry(s.stage).or_default();
-        self.times_us.push(s.time.as_micros() as u64);
+        let us = s.time.as_micros() as u64;
+        self.times_us.push(us);
+        if self.slowest.len() < SLOWEST || self.slowest.last().is_some_and(|l| l.0 < us) {
+            let at = self.slowest.partition_point(|l| l.0 >= us);
+            self.slowest.insert(at, (us, name.to_string()));
+            self.slowest.truncate(SLOWEST);
+        }
         match &s.result {
             Ok(size) => {
                 c.translated += 1;
@@ -186,6 +197,10 @@ impl Report {
         row(&mut s, "all", &self.total());
         let (p50, p95, max) = self.time_percentiles();
         s.push_str(&format!("  translation time per program: p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms\n", p50 as f64 / 1e3, p95 as f64 / 1e3, max as f64 / 1e3));
+        for (us, name) in &self.slowest {
+            s.push_str(&format!("    slow: {:>9.2} ms  {name}
+", *us as f64 / 1e3));
+        }
         if !self.sizes.is_empty() {
             let (d, h): (usize, usize) = self.sizes.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
             s.push_str(&format!("  DXIL size, {} programs: direct {} B, HLSL+DXC {} B (direct/HLSL {:.2})\n", self.sizes.len(), d, h, d as f64 / h.max(1) as f64));
@@ -233,13 +248,22 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 /// own thread) come back as `"panic: …"`; `validate` runs DXC's validator on the result
 /// (the translator itself only validates in debug / test builds).
 pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<Vec<u8>, String> {
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
-        Mode::Kernel => kernel::translate_full(code, o),
-        Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
-        Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
-        Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
-        Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
-        Mode::Geometry(_) => Err("geometry mode (ES+GS): not supported by the direct translator".into()),
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if o.wave64
+            && o.split
+            && matches!(mode, Mode::Vertex(_) | Mode::Pixel(_))
+            && crate::gpu::recomp::needs_upper_lanes(code)
+        {
+            return Err("wave64 VS / PS in 32-lane waves needs upper-lane emulation".into());
+        }
+        match mode {
+            Mode::Kernel => kernel::translate_full(code, o),
+            Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
+            Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
+            Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
+            Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
+            Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
+        }
     }));
     let k = match r {
         Ok(r) => r?,
@@ -394,8 +418,35 @@ mod tests {
             r.add(name, &Sample { stage: stage_name(&mode), result: res, time: t0.elapsed(), hlsl_size: None });
         }
         assert_eq!(r.stages["kernel"].translated, 1, "{}", r.text(5));
-        assert_eq!(r.stages["GS"].unsupported, 1);
-        assert!(r.ranked()[0].0.starts_with("geometry mode"));
+        assert_eq!(r.stages["GS"].translated, 1, "{}", r.text(5));
+    }
+
+    #[test]
+    fn split_wave64_graphics_refuses_upper_lane_read() {
+        let mut code = rdna2::encode("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 20), ("SRC1", 128 + 32)], None).expect("encode");
+        code.extend(rdna2::encode("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 256 + 6), ("SRC1", 128 + 32)], None).expect("encode"));
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).expect("encode"));
+        assert!(crate::gpu::recomp::needs_upper_lanes(&code));
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        for mode in [Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+            let err = translate_mode(&code, &mode, o, false).unwrap_err();
+            assert!(err.contains("upper-lane emulation"), "{mode:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn split_wave64_graphics_refuses_incomplete_decode() {
+        let unknown = 0x0000_003fu32.to_le_bytes();
+        let mut truncated = rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).expect("encode");
+        truncated.extend([1, 2]);
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        for code in [&unknown[..], &truncated[..]] {
+            assert!(crate::gpu::recomp::needs_upper_lanes(code));
+            for mode in [Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+                let err = translate_mode(code, &mode, o, false).unwrap_err();
+                assert!(err.contains("upper-lane emulation"), "{mode:?}: {err}");
+            }
+        }
     }
 
     #[test]
