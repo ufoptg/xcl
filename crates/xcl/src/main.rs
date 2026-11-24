@@ -41,6 +41,12 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+      --explain [--hash H[,H] | --sample N --seed S] [--path both|hlsl|direct] [--windows W]
+          [--split 0|1] [--heap] [--opt auto|O0|O1|O3] [--timeout S] [--mem-gb N]
+          [--dxc-timeout S]: compile-cost report per console program: the guest program, the
+          HLSL path (HLSL by instruction, DXC per pass) and the direct translator's DXIL; each
+          dxc.exe and this process are capped at N GB of commit (default 8), DXC is stopped
+          after S s (default 600).
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
