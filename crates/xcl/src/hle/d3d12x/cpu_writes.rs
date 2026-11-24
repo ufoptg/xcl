@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
@@ -39,10 +39,11 @@ struct Job {
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
 unsafe impl Send for Job {}
 
-/// queue → its fence and the last value signalled
+/// queue → its fence, last value signalled, and dedicated FIFO worker channel
 struct QueueFence {
     fence: ID3D12Fence,
     value: u64,
+    tx: mpsc::Sender<Job>,
 }
 
 unsafe impl Send for QueueFence {}
@@ -53,14 +54,20 @@ static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 /// queue that never gets there)
 const WAIT_MS: u32 = 10_000;
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+fn spawn_worker() -> Option<mpsc::Sender<Job>> {
+    let event = unsafe { th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if event.is_null() {
+        crate::xlog_error!("D3D12.X: CreateEventW failed for cpu_writes worker");
+        return None;
+    }
+    let event_raw = event as usize;
+    let (tx, rx) = mpsc::channel::<Job>();
+    let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
+        let event = event_raw as *mut c_void;
+        for job in rx {
+            if job.fence.GetCompletedValue() < job.value {
+                th::ResetEvent(event);
+                if job.fence.SetEventOnCompletion(job.value, HANDLE(event)).is_ok() {
                     th::WaitForSingleObject(event, WAIT_MS);
                     if job.fence.GetCompletedValue() < job.value {
                         static LATE: AtomicU64 = AtomicU64::new(0);
@@ -70,32 +77,53 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         }
                     }
                 }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
-                        }
+            }
+            for w in &job.writes {
+                match w {
+                    Write::Immediate(va, words) => write_now(*va, words),
+                    Write::ReadbackU64 { va, src, .. } => {
+                        let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                        write_u64_now(*va, value);
                     }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
         }
-        Mutex::new(tx)
-    })
+        windows_sys::Win32::Foundation::CloseHandle(event);
+    });
+    if let Err(e) = spawned {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+        crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
+        return None;
+    }
+    Some(tx)
+}
+
+fn is_region_writable(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    let Some(end) = va.checked_add(bytes) else { return false };
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.State != MEM_COMMIT {
+        return false;
+    }
+    m.Protect & PAGE_GUARD == 0
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
+/// An 8-byte aligned 64-bit immediate (`words.len() == 2`) is stored with a single 64-bit
+/// atomic write so spinning CPU readers never observe a torn half-written value.
 unsafe fn write_now(va: usize, words: &[u32]) {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+    let Some(bytes) = words.len().checked_mul(4) else { return };
+    if bytes == 0 {
         return;
     }
-    if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 4 * words.len() {
+    if words.len() == 2 && va.is_multiple_of(8) {
+        let value = (words[0] as u64) | ((words[1] as u64) << 32);
+        write_u64_now(va, value);
+        return;
+    }
+    if !va.is_multiple_of(4) || !is_region_writable(va, bytes) {
         return;
     }
     for (i, &w) in words.iter().enumerate() {
@@ -105,13 +133,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
 
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
-    let Some(end) = va.checked_add(8) else { return };
-    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-        return;
-    }
-    if m.Protect & PAGE_GUARD != 0 || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize).saturating_add(m.RegionSize) < end {
+    if !va.is_multiple_of(8) || !is_region_writable(va, 8) {
         return;
     }
     (*(va as *const AtomicU64)).store(value, Ordering::Release);
@@ -120,13 +142,7 @@ unsafe fn write_u64_now(va: usize, value: u64) {
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
     crate::hle::kernelx::lazy::ensure(va, bytes);
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    is_region_writable(va, bytes)
 }
 
 /// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
@@ -135,7 +151,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    let (tx, job) = {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -147,18 +163,28 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                let Some(tx) = spawn_worker() else { return };
+                v.insert(QueueFence { fence, value: 0, tx })
             }
         };
-        entry.value += 1;
-        if q.Signal(&entry.fence, entry.value).is_err() {
+        let next = entry.value + 1;
+        if q.Signal(&entry.fence, next).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        entry.value = next;
+        (entry.tx.clone(), Job { fence: entry.fence.clone(), value: next, writes })
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+    let _ = tx.send(job);
+}
+
+/// Remove a released command queue from `FENCES`, dropping its sender so its worker exits
+/// cleanly and preventing stale fence reuse if the queue address is later reallocated.
+pub(super) fn on_queue_release(queue: usize) {
+    if let Some(m) = FENCES.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +192,13 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Dxgi::*;
+
+    struct QueueCleanup(usize);
+    impl Drop for QueueCleanup {
+        fn drop(&mut self) {
+            on_queue_release(self.0);
+        }
+    }
 
     /// The value lands after the queue has done what came before it.
     #[test]
@@ -179,6 +212,7 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let _cleanup = QueueCleanup(q.as_raw() as usize);
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
@@ -213,6 +247,7 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let _cleanup = QueueCleanup(q.as_raw() as usize);
             let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
             let rd = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -243,5 +278,87 @@ mod tests {
             }
             assert_eq!(*dst, expected);
         }
+    }
+
+    #[test]
+    fn independent_queues_do_not_hol_block_each_other() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let q_a: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q_b: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let _cleanup_a = QueueCleanup(q_a.as_raw() as usize);
+            let _cleanup_b = QueueCleanup(q_b.as_raw() as usize);
+            let blocker: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            // Block queue A on `blocker` so its bottom-of-pipe fence stays unsignaled.
+            q_a.Wait(&blocker, 1).unwrap();
+            let cell_a = Box::new(0u64);
+            let cell_b = Box::new(0u64);
+            let va_a = cell_a.as_ref() as *const u64 as usize;
+            let va_b = cell_b.as_ref() as *const u64 as usize;
+            let t_a = std::time::Instant::now();
+            after(q_a.as_raw(), vec![Write::Immediate(va_a, vec![1, 0])]);
+            after(q_b.as_raw(), vec![Write::Immediate(va_b, vec![0x1122_3344, 0x5566_7788])]);
+
+            // Queue B must complete well before WAIT_MS (10_000 ms) while queue A is still blocked.
+            let t = std::time::Instant::now();
+            while (*(va_b as *const AtomicU64)).load(Ordering::Acquire) != 0x5566_7788_1122_3344 {
+                assert!(t.elapsed().as_secs() < 3, "queue B was HOL-blocked behind queue A");
+                std::thread::yield_now();
+            }
+            if t_a.elapsed() < std::time::Duration::from_millis(WAIT_MS as u64) {
+                assert_eq!((*(va_a as *const AtomicU64)).load(Ordering::Acquire), 0);
+            }
+
+            // Unblock queue A and confirm its write lands cleanly too.
+            blocker.Signal(1).unwrap();
+            let t = std::time::Instant::now();
+            while (*(va_a as *const AtomicU64)).load(Ordering::Acquire) != 1 {
+                assert!(t.elapsed().as_secs() < 5, "queue A never wrote after unblock");
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[test]
+    fn write_now_stores_64bit_immediates_atomically() {
+        let cell = Box::new(0u64);
+        let va = cell.as_ref() as *const u64 as usize;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_r = stop.clone();
+        let reader = std::thread::spawn(move || unsafe {
+            let ptr = va as *const AtomicU64;
+            while !stop_r.load(Ordering::Relaxed) {
+                let v = (*ptr).load(Ordering::Acquire);
+                if v != 0 {
+                    let lo = v as u32;
+                    let hi = (v >> 32) as u32;
+                    assert_eq!(hi, !lo, "observed torn 64-bit immediate write: {v:#018x}");
+                }
+            }
+        });
+        unsafe {
+            for i in 1u32..=20_000 {
+                write_now(va, &[i, !i]);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(*cell, (20_000u64) | ((!20_000u64) << 32));
     }
 }

@@ -5396,6 +5396,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::cpu_writes::on_queue_release(this as usize);
     }
     n
 }
