@@ -356,7 +356,8 @@ impl Lw {
     pub fn valu16(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
-        let u: Vec<Value> = self.sources(d, &ins, name.contains("f16"))?.into_iter().map(Src::w).collect();
+        let src_f16 = name.contains("f16") && !matches!(name, "v_cvt_f16_u16" | "v_cvt_f16_i16");
+        let u: Vec<Value> = self.sources(d, &ins, src_f16)?.into_iter().map(Src::w).collect();
         let plain = d.variant == Variant::Plain;
         let z = self.c(0);
         let half = |s: &mut Self, i: usize| -> Value {
