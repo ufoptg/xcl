@@ -38,6 +38,9 @@ const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
+/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh (a UE5 title's mesh dispatch
+/// signature: this one argument, stride 16)
+const XBOX_ARG_DISPATCH_MESH_X: u32 = 107;
 
 fn guid_bytes(g: &GUID) -> (u32, u16, u16, [u8; 8]) {
     (g.data1, g.data2, g.data3, g.data4)
@@ -674,6 +677,13 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // R9G9B9E5_SHAREDEXP targets / UAVs: PC D3D12 forbids ALLOW_RENDER_TARGET and
+    // ALLOW_UNORDERED_ACCESS on format 67 (Series S 1920x1080 target, flags 0x300005:
+    // E_INVALIDARG) – R11G11B10_FLOAT is the same 32 bpp unsigned HDR float format with full
+    // PC RTV/UAV/SRV support. Sampled-only R9G9B9E5 textures stay format 67.
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -723,10 +733,11 @@ fn depth_typeless(f: u32) -> Option<u32> {
 }
 
 /// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8, an R9G9B9E5 target is R11G11B10_FLOAT (`pc_resource_desc`).
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        67 => 26,
         f => pc_view_format(f),
     }
 }
@@ -749,6 +760,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`)
+        (26, 67) => 26,
         (_, v) => v,
     }
 }
@@ -1016,8 +1029,19 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-/// device #41 CreateCommandSignature(desc, root signature, riid, signature): the console's
-/// DispatchX argument (105) is a PC Dispatch; the root signature only goes with arguments
+/// The PC argument type of a console one: DispatchX (105) is a PC Dispatch, DispatchMeshX (107)
+/// a PC DispatchMesh (the PC refuses both console types: debug layer 743, "Unexpected
+/// parameter type"); the others are the PC's own.
+fn pc_argument_type(t: u32) -> u32 {
+    match t {
+        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
+        t => t,
+    }
+}
+
+/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
+/// types become the PC's (`pc_argument_type`); the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
@@ -1029,13 +1053,19 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
     for a in list.iter_mut() {
-        if a[0] == XBOX_ARG_DISPATCH_X {
-            a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
-        }
+        a[0] = pc_argument_type(a[0]);
     }
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
+    if hr < 0 {
+        crate::xlog_warn!(
+            "D3D12.X: CreateCommandSignature stride {} node mask {:#x} root {root:#x} arguments {:?} → {hr:#x}",
+            u32::from_le_bytes(pc[0..4].try_into().unwrap()),
+            u32::from_le_bytes(pc[16..20].try_into().unwrap()),
+            list
+        );
+    }
     if hr >= 0 && !ppv.is_null() && needs_root {
         super::bind::note_root_changing_signature(*ppv as usize);
     }
@@ -1048,6 +1078,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_indirect_argument_types_become_pc_ones() {
+        assert_eq!(pc_argument_type(105), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        assert_eq!(pc_argument_type(107), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32);
+        for t in 0..=10 {
+            assert_eq!(pc_argument_type(t), t, "PC type {t} stays");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
@@ -1142,6 +1181,11 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5_SHAREDEXP target + UAV
+        x[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+        assert_eq!(desc(&x), (26, 0x5));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // sampled-only R9G9B9E5 stays format 67
+        assert_eq!(desc(&x), (67, 0));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
@@ -1152,7 +1196,9 @@ mod tests {
         assert_eq!(pc_shader_view_format(19, 62), 22);
         assert_eq!(pc_shader_view_format(28, 86), 28);
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
-        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+        assert_eq!(pc_shader_view_format(26, 67), 26);
+        assert_eq!(pc_shader_view_format(67, 67), 67, "a sampled-only R9G9B9E5 texture that stayed one");
+        assert_eq!((pc_target_format(86), pc_target_format(67), pc_target_format(118), pc_view_format(117)), (28, 26, 45, 10));
     }
 
     #[test]
