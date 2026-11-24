@@ -706,7 +706,7 @@ pub fn draw_gs(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], &[], size, clear)
 }
 
 /// `draw_gs` of an indexed triangle list (`indices`).
@@ -722,7 +722,7 @@ pub fn draw_gs_indexed(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], &[], size, clear)
 }
 
 /// `draw` with textures and samplers in the directly indexed heaps (see `ViewTexture`).
@@ -740,7 +740,26 @@ pub fn draw_views(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, size, clear)
+    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, &[], size, clear)
+}
+
+/// `draw_views` with static samplers on the graphics root signature.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_views_with_static_samplers(
+    vs: &[u8],
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    sgprs: &[u32],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    static_samplers: &[super::pso::StaticSampler],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, static_samplers, size, clear)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -756,6 +775,7 @@ fn draw_gs_views(
     mem: &[u32],
     textures: &[ViewTexture],
     samplers: &[D3D12_SAMPLER_DESC],
+    static_samplers: &[super::pso::StaticSampler],
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
@@ -763,7 +783,7 @@ fn draw_gs_views(
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
         let dev = &gpu.dev;
-        let rs = root_signature(dev, true)?;
+        let rs = if static_samplers.is_empty() { root_signature(dev, true)? } else { super::pso::abi_root_signature_with(dev, true, static_samplers)? };
         let names: Vec<std::ffi::CString> = layout.iter().map(|l| std::ffi::CString::new(l.semantic).unwrap()).collect();
         let elems: Vec<D3D12_INPUT_ELEMENT_DESC> = layout
             .iter()

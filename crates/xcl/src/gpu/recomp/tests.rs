@@ -2505,6 +2505,99 @@ fn gpu_static_samplers_from_constants_in_code() {
     }
 }
 
+/// `image_get_lod` in the direct pixel translator accepts a static S# and uses its root-signature sampler.
+#[test]
+fn gpu_direct_image_get_lod_static_sampler() {
+    if runner::adapter().is_err() {
+        runner::skip_test("no GPU");
+        return;
+    }
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC};
+
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 0, 0];
+    let mut code = Vec::new();
+    for (k, word) in point.iter().enumerate() {
+        code.extend(if *word == 0 {
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 24 + k as u64), ("SSRC0", 128)], None)
+        } else {
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 24 + k as u64), ("SSRC0", 255)], Some(*word))
+        });
+    }
+    let scale = 0.25f32 / 8.0;
+    code.extend(ins("V_MUL_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())));
+    code.extend(ins("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())));
+    code.extend(ins("IMAGE_GET_LOD", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    code.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None));
+    code.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)], None));
+    code.extend(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None));
+    code.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
+
+    let psi = draw_psi();
+    let ps = crate::gpu::dxil::kernel::translate_pixel(
+        &code,
+        crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 },
+        &psi,
+    )
+    .unwrap();
+    assert_eq!(ps.static_samplers, vec![(point, false)]);
+
+    let vs = translate(&draw_passthrough_vs(), &runner::options(Mode::Vertex(draw_vsi()))).unwrap();
+    assert!(vs.complete(), "{:?}", vs.unsupported_why);
+    let vs = super::dxc::compile(&vs.hlsl, "main", "vs_6_6", &[]).unwrap();
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 8,
+        Height: 8,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+    let texture = runner::ViewTexture { res, srv, data: vec![0; 8 * 8 * 16], row_bytes: 8 * 16 };
+    let vertices: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]]
+        .iter()
+        .flat_map(|p| [p[0], p[1], 0.0, 0.0, 0.0, 0.0])
+        .collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let mut sgprs = vec![0; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    let pixels = runner::draw_views_with_static_samplers(
+        &vs,
+        &ps.dxil,
+        &layout,
+        &vertices,
+        24,
+        &sgprs,
+        &[],
+        &[texture],
+        &[],
+        &ps.static_samplers,
+        16,
+        [-1.0; 4],
+    )
+    .unwrap();
+    for (i, pixel) in pixels.iter().enumerate() {
+        assert!((pixel[0] - 0.0).abs() < 0.02 && (pixel[1] + 2.0).abs() < 0.02, "pixel {i}: {pixel:?}");
+    }
+}
+
 #[test]
 fn gpu_images_a16_d16() {
     if !gpu_ready() {
@@ -7592,6 +7685,38 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
 }
 
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
