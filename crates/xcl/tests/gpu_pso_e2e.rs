@@ -275,16 +275,26 @@ fn check_untextured_triangle(dev: &ID3D12Device, pso: &ID3D12PipelineState) {
 #[test]
 fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     use xcl::hle::d3d12x::pso_async;
+    if !pso_async::enabled() {
+        println!("XCL_ASYNC_PSO=0 – skipping");
+        return;
+    }
     let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
     /// an empty DXIL cache for this test only (restored also when an assertion fails)
-    struct ColdCache(std::path::PathBuf);
+    struct ColdCache(std::path::PathBuf, Option<std::ffi::OsString>);
     impl Drop for ColdCache {
         fn drop(&mut self) {
-            std::env::remove_var("XCL_DXIL_CACHE");
+            match &self.1 {
+                Some(prev) => std::env::set_var("XCL_DXIL_CACHE", prev),
+                None => std::env::remove_var("XCL_DXIL_CACHE"),
+            }
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let cold = ColdCache(std::env::temp_dir().join(format!("xcl-async-pso-{}", std::process::id())));
+    let cold = ColdCache(
+        std::env::temp_dir().join(format!("xcl-async-pso-{}", std::process::id())),
+        std::env::var_os("XCL_DXIL_CACHE"),
+    );
     let _ = std::fs::remove_dir_all(&cold.0);
     std::env::set_var("XCL_DXIL_CACHE", &cold.0);
     let pso = pso_through_hook_raw(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT); // waits for the real one
