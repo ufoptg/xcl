@@ -14,6 +14,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 Â
 | [LLVM](https://github.com/llvm/llvm-project) | Apache-2.0 WITH LLVM-exception | `tests/data/llvm-amdgpu/*` (test data, not part of the program); GFX10 buffer format values (`UfmtSymbolicGFX10`) in `gpu/recomp/emit.rs` | test vectors; hardware facts |
 | [WinDurango](https://github.com/WinDurango/WinDurango) | LGPL-3.0 | no code; d3d12_x.dll export numbers (facts) in `crates/xcl/data/stubdb.toml` | reference only |
 | [libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | no code; XTaskQueue/XAsync contract | specification |
+| [NVIDIA NVAPI](https://github.com/NVIDIA/nvapi) | MIT | no SDK code; function signatures, IDs and structure layout facts in `scripts/measure-nvidia-pso.ps1` | independently written bindings; system driver DLL loaded at runtime, not distributed |
 | Windows XGameRuntime (`System32\xgameruntime.dll`) | system | class GUIDs and slot order of the GDK thunk protocol in `hle/xgameruntime/api.rs` (facts, determined by analysis); APIs XCL does not implement are forwarded to it at runtime | interoperability; not distributed |
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |

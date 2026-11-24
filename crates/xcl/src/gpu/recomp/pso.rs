@@ -597,7 +597,7 @@ fn direct_fallback(stage: &str, err: &str) {
 
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
-fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+pub(crate) fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };

@@ -117,8 +117,26 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --backend direct --repeat 3 --json
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
+
+`--measure-pso --json` reports the exact shader hash and name, backend, selected DXGI
+adapter, translation/DXC time, DXIL size, and every cache-disabled driver PSO time. Record
+the driver version, OS build, full command line, and GPU power settings beside the JSON;
+compare interleaved HLSL/direct runs of the same hash and do not treat an in-game FPS
+screenshot as a shader-compiler benchmark.
+
+On NVIDIA, successful `ShaderCacheControl` calls can still leave repeat measurements
+cached. With the JSON/backend measurement support above, use
+`scripts/measure-nvidia-pso.ps1 -Pack D:\data\shaders.rpf -Hash HEX -Backend direct`.
+It copies the exe beside the original, registers a unique temporary NVIDIA profile
+with the shader disk cache off, and removes both afterwards, including on measurement
+failure. Other profiles and shared cache files are untouched. Run HLSL/direct
+interleaved and check the individual timings; this is compilation time, not GPU
+execution time. If the script is forcibly terminated, its printed `XCL cold PSO ...`
+profile may need removal from NVIDIA settings. Requires Windows NVIDIA NVAPI and
+permission to save an application profile; existing application matches cause an error.
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
