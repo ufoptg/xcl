@@ -855,6 +855,23 @@ fn page_home(page: usize) -> Option<usize> {
     (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
 }
 
+/// The contiguous home address of `pages` when they are consecutive pages of one live allocation.
+fn contiguous_home_in(blocks: &std::collections::BTreeMap<usize, (usize, usize, usize)>, pages: &[usize]) -> Option<usize> {
+    let first_page = *pages.first()?;
+    if first_page == 0 || !(1..pages.len()).all(|i| i.checked_mul(FRAMES).and_then(|d| first_page.checked_add(d)) == Some(pages[i])) {
+        return None;
+    }
+    let index = page_index(first_page)?;
+    let end = index.checked_add(pages.len())?;
+    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
+    (live > 0 && end <= first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+}
+
+fn contiguous_home(pages: &[usize]) -> Option<usize> {
+    let blocks = PHYS_BLOCKS.lock().ok()?;
+    contiguous_home_in(&blocks, pages)
+}
+
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
 /// the coherent window is committed as a whole).
 fn lazy_home(home: usize) -> bool {
@@ -1219,9 +1236,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    // consecutive pages at their home (or no address chosen): that UMA memory itself
-    let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i * FRAMES) == Some(pages[i]));
-    let home = if consecutive { page_home(pages[0]).filter(|_| page_home(pages[n - 1]).is_some()) } else { None };
+    // consecutive pages of one allocation at their home (or no address chosen): that UMA memory itself
+    let home = contiguous_home(&pages);
     if va.is_null() || home == Some(va as usize) {
         let Some(home) = home else {
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
@@ -2111,6 +2127,88 @@ mod tests {
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
         }
+    }
+
+    /// Consecutive page numbers from two separate `AllocateTitlePhysicalPages` calls do not
+    /// share one contiguous home block: `MapTitlePhysicalPages(NULL, ...)` must refuse them
+    /// instead of returning the first allocation's home over unrelated memory next to it.
+    #[test]
+    fn consecutive_pages_from_separate_allocations_do_not_map_as_one_home() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut found = None;
+            let mut held: Vec<usize> = Vec::new();
+            let mut spacers: Vec<(usize, bool)> = Vec::new();
+            for _ in 0..32 {
+                let mut n1 = 1usize;
+                let mut p1 = 0usize;
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n1, &mut p1), 1);
+                let h1 = page_home(p1).expect("p1 home");
+                // occupy the space between p1 and p2 so p2's home is not adjacent to h1
+                let spacer = if u.is_sparse(h1) {
+                    u.sparse_alloc(PHYS_PAGE, PHYS_PAGE).map(|(p, _)| (p, true))
+                } else {
+                    u.alloc(PHYS_PAGE, PHYS_PAGE).map(|p| (p as usize, false))
+                };
+                if let Some(s) = spacer {
+                    spacers.push(s);
+                }
+                let mut n2 = 1usize;
+                let mut p2 = 0usize;
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n2, &mut p2), 1);
+                let h2 = page_home(p2).expect("p2 home");
+                if p2 == p1 + FRAMES && h2 != h1 + PHYS_PAGE {
+                    found = Some((p1, p2, h1, h2));
+                    break;
+                }
+                held.push(p1);
+                held.push(p2);
+            }
+            let (p1, p2, h1, h2) = found.expect("two separate allocations with consecutive page numbers and non-adjacent homes");
+            assert_ne!(h2, h1 + PHYS_PAGE);
+            let mut pair = [p1, p2];
+            fnd::SetLastError(0);
+            let mapped = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pair.as_mut_ptr());
+            let err = fnd::GetLastError();
+            assert!(mapped.is_null(), "separate allocations must not map as one contiguous home (got {mapped:p})");
+            assert_eq!(err, fnd::ERROR_NOT_SUPPORTED);
+
+            let mut free_pair = [p1, p2];
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, free_pair.as_mut_ptr()), 1);
+            if !held.is_empty() {
+                assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), held.len(), held.as_mut_ptr()), 1);
+            }
+            for (addr, sparse) in spacers {
+                if sparse {
+                    crate::hle::d3d12x::sparse::free(addr);
+                } else {
+                    u.free(addr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_home_requires_one_allocation() {
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(10, (3, 3, 0x1_0000_0000));
+        // separate allocation whose page numbers immediately follow, with a non-adjacent home
+        blocks.insert(13, (2, 2, 0x2_0000_0000));
+        // separate allocation whose home happens to be adjacent (still a distinct reservation)
+        blocks.insert(15, (1, 1, 0x2_0002_0000));
+
+        let p = |i| page_number(i);
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(11), p(12)]), Some(0x1_0000_0000));
+        assert_eq!(contiguous_home_in(&blocks, &[p(11), p(12)]), Some(0x1_0000_0000 + PHYS_PAGE));
+        assert_eq!(contiguous_home_in(&blocks, &[p(13), p(14)]), Some(0x2_0000_0000));
+        // spanning two allocations: refused, whether or not the homes are adjacent
+        assert_eq!(contiguous_home_in(&blocks, &[p(12), p(13)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[p(14), p(15)]), None);
+        // non-consecutive, zero, empty, or overflow
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(12)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[0, p(10)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[usize::MAX, 0]), None);
     }
 
     /// A page mapped away from a home in a sparse window is committed once: the home gives its
