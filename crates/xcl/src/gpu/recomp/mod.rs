@@ -1193,6 +1193,27 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     wave_lane_reads(code).0
 }
 
+/// Whether a wave64 VS / PS needs the HLSL `upper_lanes` form when graphics waves may have
+/// 32 lanes. Direct DXIL can only take programs whose cross-lane reads are native in that
+/// case; constant, shadowed and unresolved upper-half reads need the HLSL emulation.
+pub fn needs_upper_lanes(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { return true };
+        if d.len > code.len() - off {
+            return true;
+        }
+        off += d.len;
+        insts.push(d);
+    }
+    if off != code.len() {
+        return true;
+    }
+    rdna2::resolve_far_jumps(&mut insts);
+    upper_lanes::analyze(&insts).reads.values().any(|&r| r != upper_lanes::Read::Native)
+}
+
 /// `wave_hazards` and the kinds of reads `upper_lanes` resolves.
 pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
     let mut insts = Vec::new();

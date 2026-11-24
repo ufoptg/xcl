@@ -248,13 +248,22 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 /// own thread) come back as `"panic: …"`; `validate` runs DXC's validator on the result
 /// (the translator itself only validates in debug / test builds).
 pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<Vec<u8>, String> {
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
-        Mode::Kernel => kernel::translate_full(code, o),
-        Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
-        Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
-        Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
-        Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
-        Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if o.wave64
+            && o.split
+            && matches!(mode, Mode::Vertex(_) | Mode::Pixel(_))
+            && crate::gpu::recomp::needs_upper_lanes(code)
+        {
+            return Err("wave64 VS / PS in 32-lane waves needs upper-lane emulation".into());
+        }
+        match mode {
+            Mode::Kernel => kernel::translate_full(code, o),
+            Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
+            Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
+            Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
+            Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
+            Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
+        }
     }));
     let k = match r {
         Ok(r) => r?,
@@ -410,6 +419,34 @@ mod tests {
         }
         assert_eq!(r.stages["kernel"].translated, 1, "{}", r.text(5));
         assert_eq!(r.stages["GS"].translated, 1, "{}", r.text(5));
+    }
+
+    #[test]
+    fn split_wave64_graphics_refuses_upper_lane_read() {
+        let mut code = rdna2::encode("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 20), ("SRC1", 128 + 32)], None).expect("encode");
+        code.extend(rdna2::encode("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 256 + 6), ("SRC1", 128 + 32)], None).expect("encode"));
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).expect("encode"));
+        assert!(crate::gpu::recomp::needs_upper_lanes(&code));
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        for mode in [Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+            let err = translate_mode(&code, &mode, o, false).unwrap_err();
+            assert!(err.contains("upper-lane emulation"), "{mode:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn split_wave64_graphics_refuses_incomplete_decode() {
+        let unknown = 0x0000_003fu32.to_le_bytes();
+        let mut truncated = rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).expect("encode");
+        truncated.extend([1, 2]);
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        for code in [&unknown[..], &truncated[..]] {
+            assert!(crate::gpu::recomp::needs_upper_lanes(code));
+            for mode in [Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+                let err = translate_mode(code, &mode, o, false).unwrap_err();
+                assert!(err.contains("upper-lane emulation"), "{mode:?}: {err}");
+            }
+        }
     }
 
     #[test]
