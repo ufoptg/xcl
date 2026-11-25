@@ -360,6 +360,22 @@ fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out:
     }
 }
 
+/// Record that the GPU's copy-back wrote `[va, end)` into the page at `pg` (whose `sent`
+/// hashes are per chunk): a chunk the range covers whole is now what the GPU has; one it
+/// covers in part is given a hash it cannot have, so the next `before_execute` uploads it
+/// again – the bytes of it the readback did not touch may be CPU writes that never went out,
+/// and hashing them as sent would drop them (the GPU never sees them, and the CPU's view is
+/// what the next readback overwrites).
+fn mark_read_back(bytes: &[u8], pg: usize, sent: &mut [u64; CHUNKS], va: usize, end: usize) {
+    let lo = va.saturating_sub(pg) / CHUNK;
+    let hi = (end.min(pg + PAGE) - pg).div_ceil(CHUNK).min(CHUNKS);
+    for k in lo..hi {
+        let h = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
+        let whole = pg + k * CHUNK >= va && pg + (k + 1) * CHUNK <= end;
+        sent[k] = if whole { h } else { !h };
+    }
+}
+
 /// The byte ranges (offset, length) of `page` whose 64-byte chunks differ from `sent`
 /// (updated to the page's chunks).
 pub fn changed_chunks(page: &[u8], sent: &mut [u64; CHUNKS]) -> Vec<(usize, usize)> {
@@ -974,8 +990,8 @@ impl State {
         }
     }
 
-    /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
-    /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
+    /// Update `sent` hashes for the 64-byte chunks the CPU copy-back just wrote (`[va, va + len)`)
+    /// so they are not re-uploaded by the next `before_execute`.
     unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
         if len == 0 {
             return;
@@ -992,11 +1008,7 @@ impl State {
                     if entry.holes & (1u16 << idx) == 0 {
                         let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
                         let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
-                        let lo = va.saturating_sub(p) / CHUNK;
-                        let hi = (end.min(p + PAGE) - p).div_ceil(CHUNK).min(CHUNKS);
-                        for k in lo..hi {
-                            sent[k] = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
-                        }
+                        mark_read_back(bytes, p, sent, va, end);
                     }
                     p += PAGE;
                 }
@@ -1750,6 +1762,37 @@ mod tests {
         page[256] = 5; // next to the chunk at 192: one run
         page[200] = 9;
         assert_eq!(changed_chunks(&page, &mut sent), vec![(192, 128)]);
+    }
+
+    /// A GPU copy-back of part of a 64-byte chunk does not make the rest of it "sent": the
+    /// bytes it did not cover may be CPU writes that were never uploaded, and hashing them as
+    /// sent would leave the GPU without them for good.
+    #[test]
+    fn a_partly_read_back_chunk_is_uploaded_again() {
+        let mut page = vec![0u8; PAGE];
+        let mut sent = ZERO_HASHES;
+        let pg = page.as_ptr() as usize;
+        page[0..4].copy_from_slice(&7u32.to_le_bytes()); // a CPU write, not uploaded
+        page[4..8].copy_from_slice(&9u32.to_le_bytes()); // what the GPU wrote there
+        mark_read_back(&page, pg, &mut sent, pg + 4, pg + 8);
+        assert_eq!(changed_chunks(&page, &mut sent), vec![(0, CHUNK)], "the chunk's other bytes still have to go out");
+        assert!(changed_chunks(&page, &mut sent).is_empty(), "and then they are out");
+
+        // a range covering chunks whole is what the GPU has: nothing to send
+        let mut page = vec![0u8; PAGE];
+        let pg = page.as_ptr() as usize;
+        page[64..128].copy_from_slice(&[0xAB; 64]);
+        let mut sent = ZERO_HASHES;
+        mark_read_back(&page, pg, &mut sent, pg + 64, pg + 128);
+        assert!(changed_chunks(&page, &mut sent).is_empty(), "both chunks came from the GPU");
+
+        // the page's last chunk, covered in part
+        let mut page = vec![0u8; PAGE];
+        let pg = page.as_ptr() as usize;
+        page[PAGE - 8..].copy_from_slice(&[1; 8]);
+        let mut sent = ZERO_HASHES;
+        mark_read_back(&page, pg, &mut sent, pg + PAGE - 4, pg + PAGE);
+        assert_eq!(changed_chunks(&page, &mut sent), vec![(PAGE - CHUNK, CHUNK)]);
     }
 
     /// `scan_page` skips allocating a hash box on all-zero pages, allocates on the first write,
