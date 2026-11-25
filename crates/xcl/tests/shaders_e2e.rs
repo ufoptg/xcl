@@ -213,6 +213,41 @@ fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
 }
 
 #[test]
+fn shaders_dump_and_select_individual_programs_in_one_fssm() {
+    let dir = TempDir::new("multi-program-dump");
+    let shader = dir.path().join("ps.bin");
+    let padding = 0xBF9F_0000u32.to_le_bytes(); // s_code_end
+    let code = [CODE.as_slice(), &padding, &CODE].concat();
+    std::fs::write(&shader, xbox_shader(0, &[fssm(&code, &[(5, 1)])])).unwrap();
+
+    let dump = dir.path().join("all");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xcl"));
+    command.arg("shaders").arg(&shader).arg("--recomp")
+        .env("XCL_DUMP_HLSL", &dump)
+        .env("XCL_DUMP_EVERY", "1")
+        .env_remove("XCL_RECOMP_ONLY");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let names: Vec<_> = std::fs::read_dir(&dump).unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}\n{output:?}");
+
+    for (index, name) in names.iter().enumerate() {
+        let prefix = name.split_once('_').unwrap().0;
+        let selected = dir.path().join(format!("selected-{index}"));
+        let output = command
+            .env("XCL_DUMP_HLSL", &selected)
+            .env("XCL_RECOMP_ONLY", prefix)
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read_dir(&selected).unwrap().count(), 1, "{output:?}");
+        assert!(selected.join(name).is_file(), "{name}");
+    }
+}
+
+#[test]
 fn shaders_folder_recurses_and_skips_side_files() {
     let dir = TempDir::new("folder");
     let nested = dir.path().join("nested");

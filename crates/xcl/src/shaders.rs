@@ -555,7 +555,13 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    // The name also keys HLSL dump files and XCL_RECOMP_ONLY.
+                    let program_name = if f.programs.len() > 1 {
+                        format!("{name} FSSM#{fi} @ {:#x}", p.offset)
+                    } else {
+                        format!("{name} FSSM#{fi}")
+                    };
+                    self.rc.add(&program_name, &f.data[p.offset..p.offset + p.len], keep, mode.clone());
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
                     if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
                         let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
