@@ -1066,7 +1066,11 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let desc = if desc.is_null() { desc } else { &d as *const [u32; 4] };
     let sampler = d[0] == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32;
     if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
-        return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
+        let hr = dev_create_descriptor_heap(this, desc as usize, riid, ppv);
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            note_heap_range(this, *ppv, d[1], d[0]);
+        }
+        return hr;
     }
     // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
     // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
@@ -1109,8 +1113,18 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
         }
+        note_heap_range(this, raw, pc_n, d[0]);
     }
     hr
+}
+
+/// `heap` (just made by `dev`) covers the CPU descriptors its `n` slots of type `ty` name:
+/// `present::forget_heap` drops the RTV entries made in them when the heap goes.
+unsafe fn note_heap_range(dev: *mut c_void, heap: *mut c_void, n: u32, ty: u32) {
+    let (Some(heap), Some(dev)) = (ID3D12DescriptorHeap::from_raw_borrowed(&heap), ID3D12Device::from_raw_borrowed(&dev)) else { return };
+    let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(ty as i32)) as usize;
+    super::present::note_heap_range(heap.as_raw() as usize, base, (n as usize).saturating_mul(inc));
 }
 
 unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u32 {
@@ -1955,6 +1969,8 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::console_heap::unregister(this as usize);
+        // its RTVs (and the resources they hold) name descriptors no object can use again
+        super::present::forget_heap(this as usize);
     }
     n
 }

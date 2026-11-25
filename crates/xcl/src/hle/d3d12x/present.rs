@@ -155,6 +155,43 @@ unsafe fn release(p: usize) {
     f(p);
 }
 
+/// The CPU descriptor range of each descriptor heap (`note_heap_range`), so the RTV entries
+/// naming one go when the heap is released (`forget_heap`): each holds a reference to the
+/// resource it was made for, and a heap's entries used to stay for the life of the process.
+static HEAP_RANGES: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+
+/// `heap` covers the CPU descriptors `[base, base + size)`.
+pub fn note_heap_range(heap: usize, base: usize, size: usize) {
+    if base == 0 || size == 0 {
+        return;
+    }
+    HEAP_RANGES.lock().unwrap().get_or_insert_with(HashMap::new).insert(heap, (base, size));
+}
+
+/// The RTV entries whose handle is in `[base, base + size)` are dropped, and the resources they
+/// named returned for the caller to release.
+pub fn take_rtv_range(base: usize, size: usize) -> Vec<usize> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut g = RTVS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return Vec::new() };
+    let end = base.saturating_add(size);
+    let keys: Vec<usize> = m.keys().copied().filter(|h| *h >= base && *h < end).collect();
+    keys.into_iter().filter_map(|h| m.remove(&h)).collect()
+}
+
+/// Descriptor heap `heap` was released for good: the RTV entries made in its descriptors name
+/// handles no object can use again, and each keeps the resource alive.
+pub fn forget_heap(heap: usize) {
+    let Some((base, size)) = HEAP_RANGES.lock().unwrap().as_mut().and_then(|m| m.remove(&heap)) else { return };
+    for r in take_rtv_range(base, size) {
+        if r != 0 {
+            unsafe { release(r) };
+        }
+    }
+}
+
 pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     if !enabled() {
         return;
@@ -1002,6 +1039,41 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each RTV entry keeps its resource alive; entries made in a released descriptor heap's
+    /// descriptors name handles no object can use again, so they must go (and another heap's
+    /// stay).
+    #[test]
+    fn a_released_descriptor_heaps_rtv_entries_go_with_it() {
+        let (heap, other) = (0x7E57_0001usize, 0x7E57_0002usize);
+        note_heap_range(heap, 0x1000, 0x100);
+        note_heap_range(other, 0x2000, 0x100);
+        note_heap_range(0x7E57_0003, 0, 0x100); // (no base: not recorded)
+        {
+            let mut g = RTVS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            m.insert(0x1000, 0); // (0: a resource already gone – nothing to release)
+            m.insert(0x10F0, 0);
+            m.insert(0x1100, 0); // past the heap's end
+            m.insert(0x2000, 0);
+        }
+        forget_heap(heap);
+        {
+            let g = RTVS.lock().unwrap();
+            let m = g.as_ref().unwrap();
+            assert!(!m.contains_key(&0x1000) && !m.contains_key(&0x10F0), "the heap's own entries go");
+            assert!(m.contains_key(&0x1100), "an entry past its end is another heap's");
+            assert!(m.contains_key(&0x2000), "another heap keeps its entries");
+            assert_eq!(HEAP_RANGES.lock().unwrap().as_ref().unwrap().len(), 1, "the range is forgotten (the other heap's is not)");
+        }
+        // a second release finds no range (and no entries): nothing happens
+        forget_heap(heap);
+        assert!(RTVS.lock().unwrap().as_ref().unwrap().contains_key(&0x1100));
+        // clean up for the other tests
+        forget_heap(other);
+        RTVS.lock().unwrap().as_mut().unwrap().clear();
+        HEAP_RANGES.lock().unwrap().as_mut().unwrap().clear();
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {
