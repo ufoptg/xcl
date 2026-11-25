@@ -284,9 +284,7 @@ impl Lw {
     /// `out[c] = v` in active lanes.
     fn set_out(&mut self, var: u32, v: Value) {
         let a = self.act();
-        let old = self.rd(var);
-        let n = self.sel(a, v, old);
-        self.wr(var, n);
+        self.wr_if(var, a, v);
     }
 
     /// Graphics exports (`export_graphics`).

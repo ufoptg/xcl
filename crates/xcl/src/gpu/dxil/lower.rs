@@ -79,6 +79,9 @@ impl Init {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
+        if var == super::lower_round::VAR_F32_MODE {
+            return s.m.i32c(super::lower_round::MODE_INIT);
+        }
         if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
             return s.m.i32c(0);
         }
@@ -151,6 +154,12 @@ pub struct Lw {
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// cached decoded format descriptors hoisted to `d3`'s defining block
+    pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
+    /// cached single-component format decode parameters hoisted to `d3`'s defining block
+    pub fmt_comp1_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtComp1>,
+    /// cached `IO_UMA_BASE_HI` loaded once in the entry block for multi-window address math
+    pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
     /// the lane's scratch array (an alloca in the entry block)
@@ -161,6 +170,9 @@ pub struct Lw {
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
+    /// the program writes a non-default MODE[1:0]: rounding f32 instructions round by
+    /// `lower_round::VAR_F32_MODE` (`lower_round`)
+    pub f32_rm: bool,
     pub has_f64_round_op: bool,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
@@ -188,6 +200,8 @@ pub struct Lw {
     pub partner: Partner,
     /// mesh mode: the record slots
     pub mesh: Option<MeshCtx>,
+    /// geometry mode (ES+GS)
+    pub geom: Option<super::lower_geom::GeomCtx>,
     /// VS / PS entry
     pub gfx: Option<super::lower_gfx::GfxCtx>,
     /// a wave32 program in 64-lane hardware: this hardware half is the upper one (i1)
@@ -311,9 +325,17 @@ impl Lw {
                     return self.s.m.const_int(t, r & mask);
                 }
             }
+            if a == b {
+                match op {
+                    BinOp::And | BinOp::Or => return a,
+                    BinOp::Xor | BinOp::Sub => return self.s.m.const_int(t, 0),
+                    _ => {}
+                }
+            }
             match (op, cb) {
                 (BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::LShr | BinOp::AShr, Some(0)) => return a,
                 (BinOp::And, Some(m)) if m == mask => return a,
+                (BinOp::Or, Some(m)) if m == mask => return b,
                 (BinOp::And | BinOp::Mul, Some(0)) => return b,
                 (BinOp::Mul, Some(1)) => return a,
                 _ => {}
@@ -321,6 +343,7 @@ impl Lw {
             match (op, ca) {
                 (BinOp::Add | BinOp::Or | BinOp::Xor, Some(0)) => return b,
                 (BinOp::And, Some(m)) if m == mask => return b,
+                (BinOp::Or, Some(m)) if m == mask => return a,
                 (BinOp::And | BinOp::Mul | BinOp::Shl | BinOp::LShr, Some(0)) => return a,
                 (BinOp::Mul, Some(1)) => return b,
                 _ => {}
@@ -806,13 +829,25 @@ impl Lw {
         r
     }
 
+    /// Writes `val` to `var` in lanes where `cond` holds, skipping the read of
+    /// the old value (or the write altogether) when `cond` is a known constant.
+    pub fn wr_if(&mut self, var: u32, cond: Value, val: Value) {
+        match self.s.m.const_u64(cond) {
+            Some(1) => self.wr(var, val),
+            Some(0) => {}
+            _ => {
+                let old = self.rd(var);
+                let v = self.sel(cond, val, old);
+                self.wr(var, v);
+            }
+        }
+    }
+
     pub fn write32(&mut self, dst: &Dst, val: Value) {
         match *dst {
             Dst::V(n) => {
-                let old = self.vreg(n);
                 let a = self.act();
-                let v = self.sel(a, val, old);
-                self.wr(VAR_VGPR + n as u32, v);
+                self.wr_if(VAR_VGPR + n as u32, a, val);
             }
             Dst::S(n) => {
                 if n <= 127 && n != 125 {
@@ -827,11 +862,8 @@ impl Lw {
         match *dst {
             Dst::V(n) => {
                 let a = self.act();
-                let (o0, o1) = (self.vreg(n), self.vreg(n + 1));
-                let v0 = self.sel(a, lo, o0);
-                let v1 = self.sel(a, hi, o1);
-                self.wr(VAR_VGPR + n as u32, v0);
-                self.wr(VAR_VGPR + n as u32 + 1, v1);
+                self.wr_if(VAR_VGPR + n as u32, a, lo);
+                self.wr_if(VAR_VGPR + n as u32 + 1, a, hi);
             }
             Dst::S(n) => {
                 if n != 125 {
@@ -891,6 +923,12 @@ impl Lw {
         self.dpp_enable = None;
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
+        }
+        if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
+            return Ok(());
+        }
+        if name == "s_denorm_mode" && self.f32_rm {
+            return self.denorm_mode(Self::fv(d, "SIMM16") as u32);
         }
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
@@ -955,7 +993,10 @@ impl Lw {
             "s_round_mode" => {
                 let simm = Self::fv(d, "SIMM16") as u16;
                 let (sp, dp) = ((simm & 3) as u32, ((simm >> 2) & 3) as u32);
-                if sp != 0 {
+                if self.f32_rm {
+                    let v = self.c(sp);
+                    self.mode_write(v, 3);
+                } else if sp != 0 {
                     return err(d, "non-default f32 round mode");
                 }
                 if dp != 0 && self.has_f64_round_op {
@@ -977,6 +1018,22 @@ impl Lw {
     fn setreg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let simm = Self::fv(d, "SIMM16") as u16;
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
+        if self.f32_rm {
+            // the mirrored MODE bits (single-precision round / denormal modes)
+            let (id, offset, width) = decode_hwreg(simm);
+            if id == 1 {
+                let wmask = if width >= 32 { u32::MAX } else { ((1u32 << width) - 1) << offset };
+                let src = if name == "s_setreg_imm32_b32" {
+                    let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
+                    self.c(imm)
+                } else {
+                    let sd = Self::field(d, "SDST");
+                    self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?
+                };
+                let v = self.shlc(src, offset);
+                self.mode_write(v, wmask);
+            }
+        }
         if sp_mask == 0 && dp_mask == 0 {
             return Ok(());
         }
@@ -984,7 +1041,7 @@ impl Lw {
             let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
             let sp = hwreg_imm_field(imm, off, 0, sp_mask);
             let dp = hwreg_imm_field(imm, off, 2, dp_mask);
-            if sp != 0 {
+            if sp != 0 && !self.f32_rm {
                 return err(d, "non-default f32 round mode");
             }
             if dp_mask != 0 && dp != 0 && self.has_f64_round_op {
@@ -1002,7 +1059,7 @@ impl Lw {
             }
             return Ok(());
         }
-        if sp_mask != 0 {
+        if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
         if self.has_f64_round_op {

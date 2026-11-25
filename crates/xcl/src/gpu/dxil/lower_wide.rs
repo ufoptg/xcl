@@ -36,8 +36,8 @@ impl Lw {
         let u: Vec<Value> = self.sources(d, &ins, name.ends_with("_f16"))?.into_iter().map(Src::w).collect();
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let z = self.c(0);
-        let cur = match &dst {
-            Dst::V(n) => self.vreg(*n),
+        let cur = |s: &mut Self| match dst {
+            Dst::V(n) => s.vreg(n),
             _ => z,
         };
         let src = |i: usize| u.get(i).copied().unwrap_or(z);
@@ -73,7 +73,8 @@ impl Lw {
                         c
                     }
                 } else {
-                    self.f(cur)
+                    let old = cur(self);
+                    self.f(old)
                 };
                 let (a0, b0) = (fh(self, 0, false), fh(self, 1, false));
                 let inner = self.fmad(a0, b0, c);
@@ -82,7 +83,10 @@ impl Lw {
                 let e = if clamp && name == "v_dot2_f32_f16" { self.un(op::SATURATE, e) } else { e };
                 Some(self.bits(e))
             }
-            "v_dot4c_i32_i8" => Some(self.dot_n(src(0), src(1), cur, 8, true, false)),
+            "v_dot4c_i32_i8" => {
+                let old = cur(self);
+                Some(self.dot_n(src(0), src(1), old, 8, true, false))
+            }
             "v_dot2_i32_i16" => {
                 let (a0, b0, a1, b1) = (si(self, 0, false), si(self, 1, false), si(self, 0, true), si(self, 1, true));
                 let p = self.mul(a0, b0);
@@ -126,7 +130,8 @@ impl Lw {
                 }
                 "v_pk_fmac_f16" => {
                     let (x, y) = (fh(self, 0, hi), fh(self, 1, hi));
-                    let ch = self.hsel(cur, hi);
+                    let old = cur(self);
+                    let ch = self.hsel(old, hi);
                     let w = self.s.f16_to_f32(ch);
                     let e = self.fmad(x, y, w);
                     fr(self, e)
@@ -307,16 +312,10 @@ impl Lw {
                 for k in 0..=top.saturating_sub(vdst) {
                     let is = self.cmpc(Pred::Eq, idx, k as u32);
                     let c = self.land(a, is);
-                    let old = self.vreg(vdst + k);
-                    let v = self.sel(c, value, old);
-                    self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    self.wr_if(VAR_VGPR + (vdst + k) as u32, c, value);
                 }
             }
-            None => {
-                let old = self.vreg(vdst);
-                let v = self.sel(a, value, old);
-                self.wr(VAR_VGPR + vdst as u32, v);
-            }
+            None => self.wr_if(VAR_VGPR + vdst as u32, a, value),
         }
         Ok(())
     }
@@ -411,11 +410,10 @@ impl Lw {
             s.to_f16(v)
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
-        let cur = match &dst {
-            Dst::V(n) => self.vreg(*n),
+        let cur = |s: &mut Self| match dst {
+            Dst::V(n) => s.vreg(n),
             _ => z,
         };
-        let curh = self.hsel(cur, plain && m.opsel >> 3 & 1 == 1);
         let (a, b, c) = (half(self, 0), half(self, 1), half(self, 2));
         macro_rules! f1 {
             ($f:expr) => {{
@@ -511,6 +509,8 @@ impl Lw {
             }
             "v_fmac_f16" => {
                 let (x, y) = (fh(self, 0), fh(self, 1));
+                let old = cur(self);
+                let curh = self.hsel(old, plain && m.opsel >> 3 & 1 == 1);
                 let w = self.s.f16_to_f32(curh);
                 let e = self.fmad(x, y, w);
                 fr(self, e)
@@ -637,12 +637,13 @@ impl Lw {
         if d.variant == Variant::Sdwa {
             self.vwrite(d, &dst, r);
         } else {
+            let old = cur(self);
             let merged = if m.opsel >> 3 & 1 == 1 {
-                let l = self.andc(cur, 0xFFFF);
+                let l = self.andc(old, 0xFFFF);
                 let h = self.shlc(r, 16);
                 self.or(l, h)
             } else {
-                let h = self.andc(cur, 0xFFFF_0000);
+                let h = self.andc(old, 0xFFFF_0000);
                 self.or(h, r)
             };
             self.vwrite(d, &dst, merged);
@@ -923,6 +924,7 @@ impl Lw {
                         let a = f64v(self, 0);
                         let t = self.s.m.f32();
                         let f = self.s.m.cast(CastOp::FPTrunc, a, t);
+                        let f = self.rm_cvt_f64(a, f);
                         let f = match m.omod {
                             1..=3 => {
                                 let k = self.fc([2.0, 4.0, 0.5][m.omod as usize - 1]);
