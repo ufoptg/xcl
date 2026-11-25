@@ -647,6 +647,179 @@ unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTE
     out
 }
 
+/// The names of XCL's own functions in thread dumps, from the PDB next to the executable
+/// (`xcl.pdb`; release builds keep it): `xcl.exe+0x21377a (pso_async::resolve_wait)`. Without
+/// them a dump's XCL frames had to be looked up by hand with the same build's PDB. dbghelp is
+/// loaded on the first dump, not before: a run that makes none is unchanged. It has a session of
+/// its own (a made-up process handle), so a title that uses dbghelp itself is not disturbed.
+/// `XCL_DUMP_SYMBOLS=0`: off.
+mod own_symbols {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Diagnostics::Debug::SYMBOL_INFOW;
+
+    type SetOptions = unsafe extern "system" fn(u32) -> u32;
+    type Initialize = unsafe extern "system" fn(HANDLE, *const u16, i32) -> i32;
+    type LoadModule = unsafe extern "system" fn(HANDLE, HANDLE, *const u16, *const u16, u64, u32, *const c_void, u32) -> u64;
+    type FromAddr = unsafe extern "system" fn(HANDLE, u64, *mut u64, *mut SYMBOL_INFOW) -> i32;
+
+    /// dbghelp's session for XCL's module: its lookup, the module's range. (dbghelp is
+    /// single-threaded: the lock is held for every call.)
+    struct Session {
+        from_addr: FromAddr,
+        base: usize,
+        end: usize,
+    }
+
+    // (the function pointer and the range only)
+    unsafe impl Send for Session {}
+
+    /// The session handle: any unique value will do for dbghelp when it does not invade a process.
+    const SESSION: HANDLE = 0x5843_4c00 as HANDLE;
+    const MAX_NAME: usize = 512;
+
+    fn session() -> Option<&'static Mutex<Session>> {
+        static S: OnceLock<Option<Mutex<Session>>> = OnceLock::new();
+        S.get_or_init(|| unsafe { open() }.map(Mutex::new)).as_ref()
+    }
+
+    unsafe fn open() -> Option<Session> {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LoadLibraryExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        };
+        if std::env::var("XCL_DUMP_SYMBOLS").is_ok_and(|v| v.trim() == "0") {
+            return None;
+        }
+        // XCL's own module (the test executable in tests), its file and its size
+        let mut module = std::ptr::null_mut();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        if GetModuleHandleExW(flags, open as *const u16, &mut module) == 0 {
+            return None;
+        }
+        let mut path = [0u16; 1024];
+        let n = GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) as usize;
+        if n == 0 || n >= path.len() {
+            return None;
+        }
+        let exe = std::path::PathBuf::from(String::from_utf16_lossy(&path[..n]));
+        if !exe.with_extension("pdb").is_file() {
+            return None;
+        }
+        let base = module as usize;
+        let size = image_size(base)?;
+        let dll = LoadLibraryExW(crate::util::wide("dbghelp.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if dll.is_null() {
+            return None;
+        }
+        let f = |name: &[u8]| GetProcAddress(dll, name.as_ptr()).map(|p| p as usize);
+        let set_options: SetOptions = std::mem::transmute(f(b"SymSetOptions\0")?);
+        let initialize: Initialize = std::mem::transmute(f(b"SymInitializeW\0")?);
+        let load_module: LoadModule = std::mem::transmute(f(b"SymLoadModuleExW\0")?);
+        let from_addr: FromAddr = std::mem::transmute(f(b"SymFromAddrW\0")?);
+        // SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS
+        set_options(0x2 | 0x200 | 0x80000);
+        let dir = exe.parent().map(|d| crate::util::wide(&d.to_string_lossy())).unwrap_or_else(|| vec![0]);
+        if initialize(SESSION, dir.as_ptr(), 0) == 0 {
+            return None;
+        }
+        let file: Vec<u16> = path[..n].iter().copied().chain([0]).collect();
+        if load_module(SESSION, std::ptr::null_mut(), file.as_ptr(), std::ptr::null(), base as u64, size as u32, std::ptr::null(), 0) == 0 {
+            return None;
+        }
+        Some(Session { from_addr, base, end: base + size })
+    }
+
+    /// SizeOfImage of the image mapped at `base`.
+    unsafe fn image_size(base: usize) -> Option<usize> {
+        let e_lfanew = ((base + 0x3c) as *const u32).read_unaligned() as usize;
+        if ((base + e_lfanew) as *const u32).read_unaligned() != 0x4550 {
+            return None;
+        }
+        // PE signature (4) + file header (20) + optional header's SizeOfImage at 56
+        Some(((base + e_lfanew + 4 + 20 + 56) as *const u32).read_unaligned() as usize)
+    }
+
+    /// The name of XCL's function at `addr`, shortened (`short_name`); None outside XCL's module
+    /// or without its PDB.
+    pub fn name(addr: usize) -> Option<String> {
+        let s = session()?.lock().ok()?;
+        if addr < s.base || addr >= s.end {
+            return None;
+        }
+        #[repr(C)]
+        struct Buf {
+            info: SYMBOL_INFOW,
+            more: [u16; MAX_NAME],
+        }
+        let mut b: Buf = unsafe { std::mem::zeroed() };
+        b.info.SizeOfStruct = std::mem::size_of::<SYMBOL_INFOW>() as u32;
+        b.info.MaxNameLen = MAX_NAME as u32;
+        let mut displacement = 0u64;
+        if unsafe { (s.from_addr)(SESSION, addr as u64, &mut displacement, &mut b.info) } == 0 {
+            return None;
+        }
+        let len = (b.info.NameLen as usize).min(MAX_NAME);
+        let name = unsafe { std::slice::from_raw_parts(b.info.Name.as_ptr(), len) };
+        Some(short_name(&String::from_utf16_lossy(name)))
+    }
+
+    /// A Rust symbol shortened for a dump line: without generic arguments, its last two path
+    /// segments (`xcl::hle::d3d12x::pso_async::resolve_wait<…>` → `pso_async::resolve_wait`).
+    pub fn short_name(full: &str) -> String {
+        let mut plain = String::with_capacity(full.len());
+        let mut depth = 0usize;
+        for ch in full.chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => plain.push(ch),
+                _ => {}
+            }
+        }
+        let parts: Vec<&str> = plain.trim().split("::").filter(|p| !p.is_empty()).collect();
+        parts[parts.len().saturating_sub(2)..].join("::")
+    }
+}
+
+/// A frame for a dump line: `module+offset`, and for XCL's own frames the function's name.
+fn describe_frame(addr: usize) -> String {
+    let at = modules::describe_address(addr);
+    match own_symbols::name(addr) {
+        Some(name) if !name.is_empty() => format!("{at} ({name})"),
+        _ => at,
+    }
+}
+
+/// Frames of a thread dump line from the top of the stack.
+const DUMP_FRAMES: usize = 14;
+/// How deep a thread dump unwinds to find the title's frames under them (a retail title's
+/// thread building a compute pipeline in a bind had its first one 34 and 47 frames deep, under
+/// XCL and NVIDIA's compiler).
+const DUMP_UNWIND: usize = 96;
+/// The title's frames a line adds when none of the top ones is the title's.
+const DUMP_TITLE_FRAMES: usize = 4;
+
+/// A thread dump line's frames: the top `DUMP_FRAMES`. When none of them is in the title's code
+/// but a deeper one is (a title thread in XCL, the driver or DXC: a pipeline it builds in a bind,
+/// a compile it waits for), then also the number of frames left out and the title's first
+/// `DUMP_TITLE_FRAMES` frames from there: which of the title's calls led down there. Without
+/// them such a thread looked like one of XCL's own, its 14 frames all in XCL or the driver.
+fn dump_frames(frames: &[usize], in_title: impl Fn(usize) -> bool, describe: impl Fn(usize) -> String) -> String {
+    let top = &frames[..frames.len().min(DUMP_FRAMES)];
+    let mut parts: Vec<String> = top.iter().map(|&a| describe(a)).collect();
+    if !top.iter().any(|&a| in_title(a)) {
+        if let Some(k) = frames.iter().skip(top.len()).position(|&a| in_title(a)).map(|i| i + top.len()) {
+            if k > top.len() {
+                parts.push(format!("… {} frames …", k - top.len()));
+            }
+            parts.extend(frames[k..frames.len().min(k + DUMP_TITLE_FRAMES)].iter().map(|&a| describe(a)));
+        }
+    }
+    parts.join(" < ")
+}
+
 /// `XCL_THREAD_DUMP_AT`: every other thread of the process stopped for a moment – where it is
 /// (RIP) and the calls on its stack that lead there, in the log.
 pub fn dump_threads() {
@@ -682,8 +855,8 @@ pub fn dump_threads() {
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
-                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
+                        let frames = dump_frames(&unwind(&mut c.0, DUMP_UNWIND), |a| modules::image_base_for_addr(a).is_some(), describe_frame);
+                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames));
                     }
                     CloseHandle(h);
                 }
@@ -973,6 +1146,79 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// frames 0x1000, 0x1001, …; those at or above `title` are the title's
+    fn frames_line(n: usize, title: usize) -> String {
+        let frames: Vec<usize> = (0..n).map(|i| 0x1000 + i).collect();
+        dump_frames(&frames, |a| a >= 0x1000 + title, |a| format!("{a:#x}"))
+    }
+
+    #[test]
+    fn a_dump_line_reaches_the_title_frames_under_a_deep_stack() {
+        // a title thread deep in XCL or the driver: the top 14, the gap, the title's first 4
+        assert_eq!(
+            frames_line(30, 20),
+            "0x1000 < 0x1001 < 0x1002 < 0x1003 < 0x1004 < 0x1005 < 0x1006 < 0x1007 < 0x1008 < 0x1009 < 0x100a < 0x100b < 0x100c < 0x100d < … 6 frames … < 0x1014 < 0x1015 < 0x1016 < 0x1017"
+        );
+        // the title's frames right after the top ones: no gap; fewer than 4 left: those
+        assert_eq!(frames_line(16, 14), (0..16).map(|i| format!("{:#x}", 0x1000 + i)).collect::<Vec<_>>().join(" < "));
+    }
+
+    #[test]
+    fn a_symbol_name_drops_generic_arguments_and_keeps_two_segments() {
+        use own_symbols::short_name;
+        assert_eq!(short_name("xcl::hle::d3d12x::pso_async::resolve_wait"), "pso_async::resolve_wait");
+        assert_eq!(
+            short_name("core::ops::function::FnOnce::call_once<xcl::hle::d3d12x::real::go_background::closure_env$0,tuple$<> >"),
+            "FnOnce::call_once"
+        );
+        assert_eq!(
+            short_name("std::sync::mpmc::list::Channel<enum2$<core::result::Result<alloc::vec::Vec<u8,alloc::alloc::Global>,alloc::string::String> > >::recv<enum2$<u8> >"),
+            "Channel::recv"
+        );
+        assert_eq!(short_name("main"), "main");
+        assert_eq!(short_name(""), "");
+    }
+
+    /// The return address of its call: an address inside the caller.
+    #[inline(never)]
+    fn return_address() -> usize {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        let mut f = [std::ptr::null_mut(); 1];
+        unsafe { RtlCaptureStackBackTrace(1, 1, f.as_mut_ptr(), std::ptr::null_mut()) };
+        f[0] as usize
+    }
+
+    #[test]
+    fn a_dump_frame_of_xcl_names_its_function() {
+        // MSVC builds keep the test executable's PDB next to it; the GNU toolchain makes none
+        let exe = std::env::current_exe().unwrap();
+        if !exe.with_extension("pdb").is_file() {
+            println!("SKIPPED eh::tests::a_dump_frame_of_xcl_names_its_function: no PDB next to the test executable");
+            return;
+        }
+        let line = describe_frame(return_address());
+        assert!(line.contains("+0x") && line.ends_with("(tests::a_dump_frame_of_xcl_names_its_function)"), "{line}");
+        // another module's frame keeps its plain form
+        let k32 = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            GetProcAddress(GetModuleHandleA(b"kernel32.dll\0".as_ptr()), b"GetCurrentProcessId\0".as_ptr()).unwrap() as usize
+        };
+        let other = describe_frame(k32);
+        assert!(!other.contains('('), "{other}");
+    }
+
+    #[test]
+    fn a_dump_line_is_the_top_frames_otherwise() {
+        let top: String = (0..14).map(|i| format!("{:#x}", 0x1000 + i)).collect::<Vec<_>>().join(" < ");
+        // a title frame among the top ones: nothing added
+        assert_eq!(frames_line(30, 3), top);
+        // none of the title's at all (one of XCL's threads): nothing added
+        assert_eq!(frames_line(30, 99), top);
+        // a short stack
+        assert_eq!(frames_line(2, 99), "0x1000 < 0x1001");
+        assert_eq!(frames_line(0, 0), "");
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
