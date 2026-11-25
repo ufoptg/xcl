@@ -1118,6 +1118,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
     recomp::dxc::set_memory_reserve(2);
+    // and the compiles together stay under a share of the RAM (`XCL_DXC_MEMORY_GB`, 0 = no cap)
+    let cap = recomp::dxc::default_memory_cap();
+    recomp::dxc::set_memory_cap(cap);
+    if cap > 0 {
+        println!("compiles held to {:.0} GB of memory (XCL_DXC_MEMORY_GB)", cap as f64 / (1u64 << 30) as f64);
+    }
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);

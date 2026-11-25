@@ -404,6 +404,63 @@ pub fn set_memory_reserve(gb: u64) {
     RESERVE_GB.store(gb, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Cap on this process's private memory for `xcl shaders --precompile` (0: none, as for a running
+/// title). `wait_for_memory` measures it instead of trusting the free commit, which an
+/// auto-growing page file keeps "plenty" however much the compiles hold: a retail pack's
+/// `CS_RaytracingResolve_*` compute programs take 2 – 15 GB each in DXC, and 15 compile threads
+/// on them ran to 100 GB of commit, most of it in the page file.
+static MEMORY_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds (`memory_clock_ms`) at which the last compile was let in under a cap.
+static LAST_ADMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the cap (`MEMORY_CAP`) in bytes; 0 turns it off.
+pub fn set_memory_cap(bytes: u64) {
+    MEMORY_CAP.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The cap `--precompile` uses: `XCL_DXC_MEMORY_GB` if set (0 = none), else half of the PC's RAM.
+pub fn default_memory_cap() -> u64 {
+    if let Some(gb) = std::env::var("XCL_DXC_MEMORY_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        return (gb.max(0.0) * (1u64 << 30) as f64) as u64;
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { 0 } else { m.ullTotalPhys / 2 }
+}
+
+/// This process's private memory (commit) in bytes; 0 when it cannot be read.
+fn private_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) == 0 {
+            return 0;
+        }
+        // Wine fills the fields before PrivateUsage only; PagefileUsage is the same on Windows
+        if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
+    }
+}
+
+fn memory_clock_ms() -> u64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Whether the cap lets one more compile in, with `working` already running and `used` bytes
+/// held: below a quarter of the cap at once; up to the cap one per 500 ms, so that the growth of
+/// the compiles just started shows in `used` before the next one goes; at the cap not while
+/// another compile runs (one alone always goes, or nothing would finish).
+fn cap_admits(cap: u64, used: u64, working: usize, now_ms: u64, last_admit_ms: u64) -> bool {
+    if cap == 0 || working == 0 || used < cap / 4 {
+        return true;
+    }
+    used < cap && now_ms.saturating_sub(last_admit_ms) >= 500
+}
+
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -424,6 +481,9 @@ impl Drop for MemorySlot {
 /// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
 /// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
 /// ended it.
+///
+/// Under a cap (`set_memory_cap`: `--precompile`, where no title waits) the compile also needs
+/// `cap_admits`, and the minute's wait does not let it go.
 pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -433,7 +493,16 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
+        let cap = MEMORY_CAP.load(Ordering::Relaxed);
+        let go = if cap == 0 {
+            plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted())
+        } else {
+            let (now, last) = (memory_clock_ms(), LAST_ADMIT_MS.load(Ordering::Acquire));
+            plenty
+                && cap_admits(cap, private_bytes(), WORKING.load(Ordering::Acquire), now, last)
+                && LAST_ADMIT_MS.compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        };
+        if go {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
@@ -1012,6 +1081,28 @@ mod cache_tests {
         assert!(hit && a == b);
         assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_cap_lets_compiles_in_by_how_much_is_held() {
+        const GB: u64 = 1 << 30;
+        let cap = 16 * GB;
+        // no cap, or nothing running: always
+        assert!(cap_admits(0, 100 * GB, 5, 0, 0));
+        assert!(cap_admits(cap, 100 * GB, 0, 0, 0));
+        // under a quarter of the cap: at once, however many run
+        assert!(cap_admits(cap, 3 * GB, 8, 10, 10));
+        // between a quarter and the cap: one per 500 ms
+        assert!(!cap_admits(cap, 8 * GB, 3, 1_499, 1_000));
+        assert!(cap_admits(cap, 8 * GB, 3, 1_500, 1_000));
+        // at the cap: not while another runs, however long ago the last one went in
+        assert!(!cap_admits(cap, 16 * GB, 3, 60_000, 0));
+        assert!(!cap_admits(cap, 40 * GB, 1, 60_000, 0));
+    }
+
+    #[test]
+    fn private_bytes_reads_this_process() {
+        assert!(private_bytes() > 1 << 20);
     }
 
     #[test]
