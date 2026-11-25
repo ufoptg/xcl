@@ -883,4 +883,45 @@ mod tests {
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
         }
     }
+
+    #[test]
+    fn null_pointers_and_short_buffers_fail_cleanly() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPort(std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(XNetworkingGetConnectivityHint(std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut()), E_INVALIDARG);
+
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XNetworkingQuerySecurityInformationForUrlAsync(std::ptr::null(), &mut b), E_INVALIDARG);
+            assert_eq!(XNetworkingQuerySecurityInformationForUrlUtf16Async(std::ptr::null(), &mut b), E_INVALIDARG);
+
+            assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(&mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut b, std::ptr::null_mut()), E_INVALIDARG);
+
+            let mut b2: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XNetworkingQuerySecurityInformationForUrlAsync(b"https://example.invalid/\0".as_ptr(), &mut b2), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b2, true), S_OK);
+            let mut small = [0u8; 4];
+            let mut used = 99usize;
+            let mut out_ptr = 1usize as *mut XNetworkingSecurityInformation;
+            let hr = XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b2, small.len(), &mut used, small.as_mut_ptr(), &mut out_ptr);
+            assert!(hr < 0, "short buffer must fail, got {hr:#x}");
+            assert!(out_ptr.is_null(), "out_ptr must be cleared on failure");
+        }
+    }
+
+    #[test]
+    fn register_callbacks_issue_distinct_nonzero_tokens_and_unregister() {
+        unsafe {
+            let (mut t1, mut t2) = (0u64, 0u64);
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(std::ptr::null_mut(), std::ptr::null_mut(), 0, &mut t1), S_OK);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(std::ptr::null_mut(), std::ptr::null_mut(), 0, &mut t2), S_OK);
+            assert!(t1 != 0 && t2 != 0 && t1 != t2);
+            assert!(XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(t1, true));
+            assert!(XNetworkingUnregisterConnectivityHintChanged(t2, true));
+        }
+    }
 }
