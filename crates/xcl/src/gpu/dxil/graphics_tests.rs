@@ -907,7 +907,9 @@ fn sampling_ps() -> Vec<u8> {
     let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
     let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
     let zero = s.m.i32c(0);
-    let tex = s.heap_texture(zero, TexKind::D2, false, OpsComp::F32, 4, false);
+    // the draw harness puts its textures after the memory windows' views
+    let first_view = s.m.i32c(crate::gpu::recomp::runner::VIEW_HEAP_BASE);
+    let tex = s.heap_texture(first_view, TexKind::D2, false, OpsComp::F32, 4, false);
     let smp = s.heap_sampler(zero, false, false);
     let x = io.load_input(&mut s, pos, 0, 0);
     let y = io.load_input(&mut s, pos, 0, 1);

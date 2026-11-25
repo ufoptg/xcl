@@ -2100,7 +2100,7 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
     let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
     let mut sgprs = vec![0u32; 32];
-    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[16..24].copy_from_slice(&tsharp(runner::VIEW_HEAP_BASE, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
     let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
     for y in 0..16 {

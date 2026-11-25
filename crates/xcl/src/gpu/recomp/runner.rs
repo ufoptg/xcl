@@ -803,8 +803,9 @@ fn draw_gs_views(
 
 /// Render with an existing graphics pipeline on `dev` (its own queue): vertex buffer
 /// `vertices` (`stride` bytes per vertex, triangle list), the XCL shader ABI bound – root
-/// signature `rs`, u0 = `sgprs` (initial SGPRs), u1 = scratch, u2 = `mem` (flat memory) –
-/// into a `size`² RGBA32F target cleared to `clear`. Returns the pixels, row by row.
+/// signature `rs`, u0 = `sgprs` (initial SGPRs), u1 = scratch, u2 = `mem` (flat memory, also
+/// every memory window's raw UAV in the heap for `Options::heap_windows`) – into a `size`²
+/// RGBA32F target cleared to `clear`. Returns the pixels, row by row.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_on(
     dev: &ID3D12Device,
@@ -821,9 +822,14 @@ pub fn draw_on(
     draw_on_multi(dev, pso, rs, vertices, stride, &[draw], mem, &[], &[], size, clear)
 }
 
+/// The first descriptor of the draw heap after the memory windows' raw UAVs
+/// (`MEM_HEAP_BASE`..): where `ViewTexture`s start, as the console heap's views do.
+pub const VIEW_HEAP_BASE: u32 = super::MEM_HEAP_BASE + crate::gpu::uma::MAX_WINDOWS as u32;
+
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
-/// descriptor heap index 2·i; `data` = the `MipLevels` levels one after the other, each in
-/// tightly packed rows (`row_bytes` for level 0, its width's share for the smaller ones).
+/// descriptor heap index `VIEW_HEAP_BASE` + 2·i; `data` = the `MipLevels` levels one after the
+/// other, each in tightly packed rows (`row_bytes` for level 0, its width's share for the
+/// smaller ones).
 pub struct ViewTexture {
     pub res: D3D12_RESOURCE_DESC,
     pub srv: D3D12_SHADER_RESOURCE_VIEW_DESC,
@@ -838,12 +844,14 @@ pub struct Draw {
     pub scissor: [i32; 4],
 }
 
-/// Heaps with `textures` (SRV at 2·i) and `samplers` (at j), bound on `list`.
-unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC]) -> Result<Vec<windows::core::IUnknown>, String> {
+/// Heaps with every memory window as a raw UAV of `mem` (`bytes`) at `MEM_HEAP_BASE`..,
+/// `textures` (SRV at `VIEW_HEAP_BASE` + 2·i) and `samplers` (at j), bound on `list`.
+unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, mem: &ID3D12Resource, bytes: u64, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC]) -> Result<Vec<windows::core::IUnknown>, String> {
+    let base = VIEW_HEAP_BASE as usize;
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: (2 * textures.len()).max(2) as u32,
+            NumDescriptors: (base + 2 * textures.len()) as u32,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -863,6 +871,10 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
         dev.CreateSampler(sd, at(&sheap, j, sinc));
     }
     let mut keep: Vec<windows::core::IUnknown> = vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
+    // a pipeline from the backend's hook with heap windows reads window k at MEM_HEAP_BASE + k
+    for k in 0..crate::gpu::uma::MAX_WINDOWS {
+        dev.CreateUnorderedAccessView(mem, None::<&ID3D12Resource>, Some(&raw_window_uav(bytes)), at(&heap, super::MEM_HEAP_BASE as usize + k, inc));
+    }
     for (i, t) in textures.iter().enumerate() {
         let levels = t.res.MipLevels.max(1) as usize;
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels];
@@ -893,7 +905,7 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
         list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
-        dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, 2 * i, inc));
+        dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, base + 2 * i, inc));
         keep.push(r.cast().map_err(e)?);
         keep.push(up.cast().map_err(e)?);
     }
@@ -1014,7 +1026,7 @@ fn draw_indexed_on(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
+        let _bound = bind_views(dev, &list, &mem_buf, mem_bytes, textures, samplers)?;
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());

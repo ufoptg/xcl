@@ -435,7 +435,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
 
     // descriptor tables in the XCL shader ABI form: +0x00 world V#, +0x20 T#, +0x40 view-projection V#
     let vsharp = |base: u32| [base, 0, 0x1000, 0];
-    for (table, t, heap_index) in [(0x100usize, t_a, 0u32), (0x200, t_b, 2)] {
+    for (table, t, heap_index) in [(0x100usize, t_a, runner::VIEW_HEAP_BASE), (0x200, t_b, runner::VIEW_HEAP_BASE + 2)] {
         mem[table / 4..table / 4 + 4].copy_from_slice(&vsharp(0x1000));
         mem[(table + 0x20) / 4..(table + 0x20) / 4 + 8].copy_from_slice(&desc::xcl_image_words(&t, heap_index));
         mem[(table + 0x40) / 4..(table + 0x40) / 4 + 4].copy_from_slice(&vsharp(0x2000));
