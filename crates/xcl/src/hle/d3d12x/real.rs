@@ -5406,6 +5406,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     if n == 0 {
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
+        super::indirect_clamp::allocator_reset(this as usize);
     }
     n
 }
@@ -5426,6 +5427,7 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
+        super::indirect_clamp::allocator_reset(this as usize);
     }
     hr
 }
