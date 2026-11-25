@@ -405,12 +405,33 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
-/// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
-pub fn pool_bytes() -> (usize, usize) {
+#[derive(Default)]
+pub(crate) struct PoolStats {
+    pub active: usize,
+    pub occupied: usize,
+    /// Virtual address coverage within occupied tiles, not additional heap capacity.
+    pub parked_mappings: usize,
+    /// Heap capacity still held while waiting for release.
+    pub retired: usize,
+}
+
+impl State {
+    fn pool_stats(&self) -> PoolStats {
+        let bytes_per_pool = POOL_TILES as usize * TILE;
+        let active = self.pools.iter().filter(|p| p.is_some()).count() * bytes_per_pool;
+        PoolStats {
+            active,
+            occupied: active.saturating_sub(self.free.len() * TILE),
+            parked_mappings: self.parked.len() * TILE,
+            retired: self.retired.len() * bytes_per_pool,
+        }
+    }
+}
+
+/// Sparse heap allocation and tile use for `XCL_ACTIVITY`.
+pub(crate) fn pool_stats() -> PoolStats {
     let g = STATE.lock().unwrap();
-    let Some(s) = g.as_ref() else { return (0, 0) };
-    let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    (pools, pools.saturating_sub(s.free.len() * TILE))
+    g.as_ref().map_or_else(PoolStats::default, State::pool_stats)
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
@@ -1705,17 +1726,27 @@ mod tests {
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
             assert!(!reused, "a new pool's tile needs no clearing");
+            let pool_size = POOL_TILES as usize * TILE;
+            let stats = s.pool_stats();
+            assert_eq!((stats.active, stats.occupied, stats.retired), (pool_size, TILE, 0));
             s.free.push(first);
             s.retire_free_pools();
             assert_eq!(s.retired.len(), 1, "an all-free pool is retired");
+            let stats = s.pool_stats();
+            assert_eq!((stats.active, stats.occupied, stats.retired), (0, 0, pool_size), "a held retired heap stays in the memory report");
             for round in 0..8 {
                 let (tile, reused) = s.take_tile().expect("a tile");
                 assert!(reused, "round {round}: a tile of a retired pool is cleared before use");
+                let stats = s.pool_stats();
+                assert_eq!((stats.active, stats.occupied, stats.retired), (pool_size, TILE, 0));
                 s.free.push(tile);
                 s.retire_free_pools();
                 assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
                 assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
             }
+            s.retired[0].2 -= std::time::Duration::from_secs(3);
+            s.retire_free_pools();
+            assert_eq!(s.pool_stats().retired, 0, "the released heap leaves the report");
         }
     }
 

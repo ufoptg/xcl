@@ -58,11 +58,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 };
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
-                let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
+                let sparse = crate::hle::d3d12x::sparse::pool_stats();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                let sparse_occupied = mb(sparse.occupied as u64);
+                // Keep the historical "mapped" field for activity-log readers. It counts occupied tiles.
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); sparse heaps {} MB occupied, {} MB parked mappings, {} MB retired",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -70,8 +72,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(page_pools as u64),
                     mb(arenas as u64),
                     mb(arenas_made as u64),
-                    mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(sparse.active as u64),
+                    sparse_occupied,
+                    sparse_occupied,
+                    mb(sparse.parked_mappings as u64),
+                    mb(sparse.retired as u64)
                 );
                 last = now;
             }
