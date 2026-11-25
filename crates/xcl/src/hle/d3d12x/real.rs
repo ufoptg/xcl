@@ -491,6 +491,7 @@ pub fn init() -> Result<String, String> {
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
         if std::env::var_os("XCL_DRED").is_some() {
+            DRED.store(true, Ordering::Relaxed);
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
@@ -1662,6 +1663,31 @@ pub fn pso_layout(pso: usize) -> Option<String> {
     PSO_LAYOUTS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// `XCL_DRED=1` is set: command lists record their draws (`draw_log`) and pipelines keep their
+/// shader hashes for `log_device_removed`.
+static DRED: AtomicBool = AtomicBool::new(false);
+
+pub fn dred_enabled() -> bool {
+    DRED.load(Ordering::Relaxed)
+}
+
+/// translated pipelines → the console shaders (dump hashes) they were made from (`XCL_DRED`)
+static DRED_SHADERS: Mutex<Option<HashMap<usize, super::draw_log::Shaders>>> = Mutex::new(None);
+
+fn note_dred_shaders(pso: *mut c_void, shaders: super::draw_log::Shaders) {
+    if dred_enabled() && !pso.is_null() {
+        DRED_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, shaders);
+    }
+}
+
+/// The shaders of `pso` as a title bound it (a background build's stand-in: its resolved PSO).
+/// Does not wait on the lock – it is read while the device is being reported removed.
+pub(super) fn dred_pso_shaders(pso: usize) -> Option<super::draw_log::Shaders> {
+    let g = DRED_SHADERS.try_lock().ok()?;
+    let m = g.as_ref()?;
+    m.get(&pso).or_else(|| m.get(&super::pso_async::resolve(pso))).copied()
+}
+
 pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
@@ -1759,6 +1785,9 @@ fn forget_pso(pso: usize) {
         m.remove(&pso);
     }
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    if let Some(m) = DRED_SHADERS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
     super::device_x::forget_base(pso);
@@ -3891,6 +3920,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    note_dred_shaders(*ppv, super::draw_log::Shaders::Compute { cs: crate::gpu::shader::fnv64(cs) });
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
@@ -4245,6 +4275,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    note_dred_shaders(*ppv, super::draw_log::Shaders::Graphics { vs: crate::gpu::shader::fnv64(vs), ps: shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64) });
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -5785,7 +5816,11 @@ pub fn log_device_removed() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
                 let count = node.BreadcrumbCount as usize;
                 let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
+                crate::xlog_error!("DRED: list {list:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                if let Some(draws) = super::bind::dred_summary(list as usize) {
+                    crate::xlog_error!("DRED: list {list:p} recorded (its last Reset): {draws}");
+                }
             });
         }
     }
