@@ -1386,14 +1386,21 @@ unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_voi
 
 unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_void, value: u64) {
     let q = queue(p);
-    if q.closed.load(Ordering::Acquire) || fence.is_null() || !crate::gpu::shader::readable(fence as usize, std::mem::size_of::<usize>()) {
+    if q.closed.load(Ordering::Acquire) {
         return;
     }
-    let vt = *(fence as *const *const usize);
-    if vt.is_null() || !crate::gpu::shader::readable(vt as usize, (FENCE_SIGNAL + 1) * std::mem::size_of::<usize>()) {
+    // The fence and its table are read, not looked up with `VirtualQuery`: a native host's D3D12
+    // (D3DMetal under CrossOver) keeps its objects in memory `VirtualQuery` does not know, and
+    // the signal of every fence there was dropped.
+    let mut vt = 0usize;
+    if !read_own(fence as usize, &mut vt as *mut usize as *mut u8, std::mem::size_of::<usize>()) || vt == 0 {
         return;
     }
-    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+    let mut slots = [0usize; FENCE_SIGNAL + 1];
+    if !read_own(vt, slots.as_mut_ptr() as *mut u8, std::mem::size_of_val(&slots)) {
+        return;
+    }
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slots[1]);
     add(fence);
     q.enqueue(Entry::Signal(FenceRef(fence as usize), value));
 }
@@ -2140,6 +2147,55 @@ mod tests {
 
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    /// A fence of the host's D3D12 is signalled. A native host's D3D12 (D3DMetal under
+    /// CrossOver) keeps its fences in memory `VirtualQuery` does not know, and their signals were
+    /// dropped (#258). A pointer to memory that cannot be read is still not taken for a fence.
+    #[test]
+    fn a_fence_of_the_hosts_d3d12_is_signalled() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device, ID3D12Fence, D3D12_FENCE_FLAG_NONE};
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS};
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let fence: ID3D12Fence = dev.unwrap().CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+
+            // reserved, not committed: nothing there can be read
+            let hole = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!hole.is_null());
+            queue_enqueue_signal(q, hole, 1);
+            assert!(queue(q).pending.lock().unwrap().entries.is_empty(), "unreadable memory was taken for a fence");
+
+            queue_enqueue_signal(q, fence.as_raw(), 7);
+            assert_eq!(queue(q).pending.lock().unwrap().entries.len(), 1, "the host's fence was not taken");
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while fence.GetCompletedValue() < 7 && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(fence.GetCompletedValue(), 7, "the host's fence was not signalled");
+
+            queue_release(q);
+            VirtualFree(hole, 0, MEM_RELEASE);
         }
     }
 
