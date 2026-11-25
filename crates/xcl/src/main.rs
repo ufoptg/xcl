@@ -36,8 +36,9 @@ Usage:
       --compile N: additionally compiles N complete translations with DXC.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
           compute HLSL for investigation; an exact hash bypasses the size threshold.
-      --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact
-          compute record with XCL's real root signature and static samplers.
+      --measure-pso HEX [--repeat N] [--backend hlsl|direct] [--json]:
+          times cache-disabled driver compilation of one exact compute record.
+          The default backend is hlsl. Direct translation failures are reported.
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
