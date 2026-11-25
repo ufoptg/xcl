@@ -155,6 +155,51 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn direct_json_reports_effective_sampling_and_size_exclusions() {
+    let dir = TempDir::new("direct-json");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    // The size cap excludes the synthetic program before translation: no GPU or DXC needed.
+    let out = run_shaders(dir.path(), &["--direct", "--json", "--sample", "7", "--seed", "20261124", "--max-bytes", "1", "--timeout", "2", "--threads", "1", "--split", "0", "--windows", "2", "--validate", "--compare"]);
+    assert!(out.status.success(), "{out:?}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["all"]["total"], 0);
+    assert_eq!(json["run"]["seed"], 20261124);
+    assert_eq!(json["run"]["sample_limit"], 7);
+    assert_eq!(json["run"]["records_available"], 1);
+    assert_eq!(json["run"]["selected_records"], 1);
+    assert_eq!(json["run"]["skipped_oversize"], 1);
+    assert_eq!(json["run"]["max_bytes"], 1);
+    assert_eq!(json["run"]["timeout_seconds"], 2);
+    assert_eq!(json["run"]["threads"], 1);
+    assert_eq!(json["run"]["split"], false);
+    assert_eq!(json["run"]["windows"], 2);
+    assert_eq!(json["run"]["validate"], true);
+    assert_eq!(json["run"]["compare"], true);
+    assert!(json["run"]["record_hash"].is_null());
+    assert_eq!(json["unsupported"], serde_json::json!([]));
+
+    let out = run_shaders(dir.path(), &["--direct", "--json", "--sample", "0", "--max-bytes", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["run"]["sample_limit"], 0, "zero means all programs");
+    assert_eq!(json["run"]["seed"], 1);
+    assert_eq!(json["run"]["skipped_oversize"], 1);
+    assert_eq!(json["run"]["validate"], false);
+
+    // An exact hash overrides the sample and size limits, even when it finds no record.
+    let out = run_shaders(dir.path(), &["--direct", "--json", "--sample", "1", "--max-bytes", "1", "--hash", "0"]);
+    assert!(out.status.success(), "{out:?}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["run"]["record_hash"], "0000000000000000");
+    assert_eq!(json["run"]["sample_limit"], 0);
+    assert_eq!(json["run"]["max_bytes"], 0);
+    assert_eq!(json["run"]["skipped_oversize"], 0);
+    assert_eq!(json["all"]["total"], 0);
+}
+
+#[test]
 fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     let dir = TempDir::new("single");
     let file = dir.path().join("ps.bin");

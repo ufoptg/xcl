@@ -1806,7 +1806,24 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
         rep.add(name, s);
     }
     if json {
-        println!("{}", rep.json(top));
+        let run = serde_json::json!({
+            "seed": seed,
+            "sample_limit": if want == usize::MAX { 0 } else { want },
+            "records_available": input.len(),
+            "selected_records": order.len(),
+            "skipped_oversize": skipped.load(Ordering::Relaxed),
+            "max_bytes": max_bytes,
+            "timeout_seconds": timeout.as_secs(),
+            "threads": threads,
+            "split": split,
+            "windows": windows,
+            "validate": validate,
+            "compare": compare,
+            "record_hash": only_hash.map(|h| format!("{h:016x}")),
+        });
+        // Keep the coverage fields at the top level for existing consumers.
+        let report = rep.json(top);
+        println!("{{\"run\":{run},{}", &report[1..]);
     } else {
         println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
         print!("{}", rep.text(top));

@@ -128,6 +128,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- `xcl shaders <pack> --direct --json` includes a `run` object with the seed, effective
+  sampling and size limits, selected record count, oversized-program skips and translation
+  options. `sample_limit: 0` means no program limit; `--hash` disables both the sample and
+  size limits. Use `--threads 1` for repeatable sample selection.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
