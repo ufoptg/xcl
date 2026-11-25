@@ -873,9 +873,10 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
     if pages.len() < need {
         return None;
     }
+    // every page is validated before any home is committed again
+    let homes = pages[..need].iter().map(|&p| page_home(p)).collect::<Option<Vec<_>>>()?;
     let mut addrs = Vec::with_capacity(need);
-    for &p in &pages[..need] {
-        let home = page_home(p)?;
+    for (&p, home) in pages[..need].iter().zip(homes) {
         let addr = match away.and_then(|a| a.page.get(&p).copied()) {
             Some(at) => at,
             None => home_again(home)?,
@@ -2332,6 +2333,22 @@ mod tests {
         }
         FreeTitlePhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr());
         None
+    }
+
+    /// A read or write that fails on a later page must not commit the home of an earlier one.
+    #[test]
+    fn failed_physical_page_read_or_write_does_not_commit_earlier_sparse_homes() {
+        unsafe {
+            let Some(mut pages) = sparse_pages(1) else { return };
+            let home = page_home(pages[0]).unwrap();
+            assert!(!committed_page(home), "a sparse home is only reserved until it is used");
+            assert!(!write_physical_pages(&[pages[0], 0], 0, &vec![1u8; PHYS_PAGE + 1]));
+            assert!(!committed_page(home), "a failed write leaves the earlier home reserved");
+            let mut dst = vec![0u8; PHYS_PAGE + 1];
+            assert!(!read_physical_pages(&[pages[0], 0], 0, &mut dst));
+            assert!(!committed_page(home), "a failed read leaves the earlier home reserved");
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+        }
     }
 
     /// Pages mapped, half of them written, then all mapped again in one call – at another
