@@ -858,25 +858,68 @@ pub fn gamepad_association() -> DeviceAssociationChange {
     DeviceAssociationChange { device_id: crate::hle::gameinput::gamepad_device_id(), old_user: 0, new_user: LOCAL_ID }
 }
 
+/// Where a queued association callback is: `Done` before it starts means it was unregistered
+/// while queued (it must not call the title's context), and a `Running` one is what the
+/// unregister's `wait` waits for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallState {
+    Queued,
+    Running,
+    Done,
+}
+
 struct AssociationCall {
+    token: u64,
     cb: usize,
     ctx: usize,
     change: DeviceAssociationChange,
+    state: std::sync::Mutex<CallState>,
+    done: std::sync::Condvar,
 }
 
-unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
-    let r = Box::from_raw(rec as *mut AssociationCall);
-    let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
-    f(r.ctx as *mut c_void, &r.change);
+/// The association callbacks handed to a queue that have not finished yet: the unregister finds
+/// them by token to cancel the queued ones and wait for a running one.
+static ASSOCIATION_CALLS: std::sync::Mutex<Vec<std::sync::Arc<AssociationCall>>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "system" fn association_call(rec: *mut c_void, canceled: bool) {
+    let call = std::sync::Arc::from_raw(rec as *const AssociationCall);
+    let run = {
+        let mut st = call.state.lock().unwrap();
+        if canceled || *st != CallState::Queued {
+            *st = CallState::Done;
+            call.done.notify_all();
+            false
+        } else {
+            *st = CallState::Running;
+            true
+        }
+    };
+    if run {
+        let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(call.cb);
+        f(call.ctx as *mut c_void, &call.change);
+        *call.state.lock().unwrap() = CallState::Done;
+        call.done.notify_all();
+    }
+    ASSOCIATION_CALLS.lock().unwrap().retain(|c| !std::sync::Arc::ptr_eq(c, &call));
 }
 
 /// The title's association callback gets the gamepad → user association, on its queue's
 /// completion port.
-unsafe fn notify_association(queue: usize, ctx: usize, cb: usize) {
-    let rec = Box::into_raw(Box::new(AssociationCall { cb, ctx, change: gamepad_association() }));
+unsafe fn notify_association(token: u64, queue: usize, ctx: usize, cb: usize) {
+    let call = std::sync::Arc::new(AssociationCall {
+        token,
+        cb,
+        ctx,
+        change: gamepad_association(),
+        state: std::sync::Mutex::new(CallState::Queued),
+        done: std::sync::Condvar::new(),
+    });
+    ASSOCIATION_CALLS.lock().unwrap().push(call.clone());
+    let rec = std::sync::Arc::into_raw(call.clone());
     let hr = xasync::submit_callback(queue as *mut c_void, PORT_COMPLETION, rec as *mut c_void, association_call as usize);
     if hr < 0 {
-        drop(Box::from_raw(rec));
+        drop(std::sync::Arc::from_raw(rec));
+        ASSOCIATION_CALLS.lock().unwrap().retain(|c| !std::sync::Arc::ptr_eq(c, &call));
         crate::xlog_warn!("XUser: the device association callback could not be queued ({:#x})", hr as u32);
         return;
     }
@@ -897,15 +940,43 @@ pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *m
     ASSOCIATION_CALLBACKS.lock().unwrap().push((t, queue as usize, ctx as usize, cb));
     crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if USER_SIGNED_IN.load(Ordering::Acquire) { "" } else { " – before the user is signed in" });
     if USER_SIGNED_IN.load(Ordering::Acquire) {
-        notify_association(queue as usize, ctx as usize, cb);
+        notify_association(t, queue as usize, ctx as usize, cb);
     }
     S_OK
 }
 
 static NEXT_ASSOCIATION_TOKEN: AtomicU64 = AtomicU64::new(0x4153_0001);
 
-pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, _wait: bool) -> bool {
+/// No callback of `token` runs after this: one still queued is canceled (the title may free its
+/// context as soon as the call returns), and with `wait` a running one is waited for.
+pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, wait: bool) -> bool {
     ASSOCIATION_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
+    let mut running: Vec<std::sync::Arc<AssociationCall>> = Vec::new();
+    {
+        let mut calls = ASSOCIATION_CALLS.lock().unwrap();
+        let mut i = 0;
+        while i < calls.len() {
+            if calls[i].token != token {
+                i += 1;
+                continue;
+            }
+            let call = calls.remove(i);
+            let mut st = call.state.lock().unwrap();
+            match *st {
+                CallState::Queued => *st = CallState::Done, // the queue's later call skips it
+                CallState::Running => running.push(call.clone()),
+                CallState::Done => {}
+            }
+        }
+    }
+    if wait {
+        for call in running {
+            let mut st = call.state.lock().unwrap();
+            while *st != CallState::Done {
+                st = call.done.wait(st).unwrap();
+            }
+        }
+    }
     true
 }
 
@@ -917,8 +988,8 @@ fn user_signed_in() {
     }
     crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
     let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
-    for (_, q, ctx, cb) in calls {
-        unsafe { notify_association(q, ctx, cb) };
+    for (t, q, ctx, cb) in calls {
+        unsafe { notify_association(t, q, ctx, cb) };
     }
 }
 
@@ -999,6 +1070,43 @@ mod tests {
         }
         assert!(!unsafe { XGameRuntimeIsFeatureAvailable(22) });
         assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
+    }
+
+    /// The title may free its context as soon as `XUserUnregisterForDeviceAssociationChanged`
+    /// returns: a callback still queued must not run after that (`wait = true` waits for a
+    /// running one; a queued one is canceled).
+    #[test]
+    fn an_unregistered_association_callback_does_not_run() {
+        use crate::hle::xgameruntime::taskqueue::{XTaskQueueCloseHandle, XTaskQueueCreate, XTaskQueueDispatch, MODE_MANUAL, PORT_COMPLETION};
+        use std::sync::atomic::AtomicU32;
+
+        unsafe extern "system" fn count(ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            let n = ctx as *const AtomicU32;
+            (*n).fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            // a manual queue: the callback waits in it until this test dispatches
+            let mut q: *mut c_void = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let calls = AtomicU32::new(0);
+            let mut token = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, &calls as *const AtomicU32 as *mut c_void, count as usize, &mut token), S_OK);
+            user_signed_in(); // queues the association callback
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "not before the queue runs it");
+            assert!(XUserUnregisterForDeviceAssociationChanged(token, true));
+            while XTaskQueueDispatch(q, PORT_COMPLETION, 0) {}
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "the callback was unregistered: its context may be gone");
+            // a registration made now hears of the association as usual (the cancel is per
+            // callback), and one that is not unregistered does run
+            let mut token2 = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, &calls as *const AtomicU32 as *mut c_void, count as usize, &mut token2), S_OK);
+            assert_eq!(token2, token + 1);
+            while XTaskQueueDispatch(q, PORT_COMPLETION, 0) {}
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "a registered callback still runs");
+            assert!(XUserUnregisterForDeviceAssociationChanged(token2, false));
+            XTaskQueueCloseHandle(q);
+        }
     }
 
     #[test]

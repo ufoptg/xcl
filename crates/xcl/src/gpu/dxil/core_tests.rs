@@ -279,3 +279,107 @@ fn graphics_stages_with_a_branch_before_their_exports() {
     assert_eq!(draw(&dvs, &dps, 0), cleared, "branch not taken");
     assert_eq!(draw(&dvs, &dps, 1), kept, "branch taken");
 }
+
+/// Exhaustive bit-exact check of the IEEE-754 bit-manipulation formula used by
+/// `lower_mem::uf_small_bits` for all 10-bit (mb=5) and 11-bit (mb=6) float inputs.
+#[test]
+fn uf_small_ieee_bit_math_matches_exact_formula() {
+    for mb in [5u32, 6u32] {
+        let p = 1u32 << mb;
+        let mmask = p - 1;
+        let mshift = 23 - mb;
+        let den_scale = f32::from_bits(if mb == 6 { 0x3580_0000 } else { 0x3600_0000 });
+        for v in 0..(1u32 << (mb + 5)) {
+            let e = v >> mb;
+            let m = v & mmask;
+            // Reference formula (matching HLSL `uf_small`)
+            let fm = (m as f32) / (p as f32);
+            let ref_f = if e == 31 {
+                f32::from_bits(if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 })
+            } else if e == 0 {
+                fm * (-14.0f32).exp2()
+            } else {
+                ((e as f32) - 15.0).exp2() * (1.0 + fm)
+            };
+            // Exact IEEE bit math
+            let got_bits = if e == 31 {
+                if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 }
+            } else if e == 0 {
+                ((m as f32) * den_scale).to_bits()
+            } else {
+                ((e + 112) << 23) | (m << mshift)
+            };
+            assert_eq!(got_bits, ref_f.to_bits(), "mb={mb} v={v:#x} (e={e} m={m})");
+        }
+    }
+}
+
+/// Multi-window switch dispatch, vector rawBufferLoad/Store, hoisted FormatLoad
+/// descriptors, single/multi-component FormatLoad, and hoisted BVH loads all pass
+/// DXIL validation across 1..=4 memory windows and wave configurations.
+#[test]
+fn multi_window_mem_format_and_bvh_validate() {
+    let code = prog(&[
+        // Load descriptor s[12:15] once, then reuse across repeated BUFFER_LOAD_FORMAT_X
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 12), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        // Divergent EXEC so lane guards are active (non-constant `act`)
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        // Repeated single-component format loads sharing s[12:15] (exercises hoisted FmtComp1 + Load2)
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Sub-4 and full-4 component format loads + D16 + static MTBUF + small byte load
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 28), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Vector MUBUF & FLAT loads/stores
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("DATA", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 24), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+        // BVH node intersection (box32 / box16 / tri hoisted vector loads)
+        ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 3), ("DMASK", 0xF)], None),
+    ]);
+    for windows in [1u32, 2, 3, 4] {
+        for (wave64, split) in [(true, false), (false, false)] {
+            translate(&code, KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 })
+                .unwrap_or_else(|e| panic!("w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            if windows > 1 {
+                translate(&code, KernelOptions { wave64, split, mem_windows: windows | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+                    .unwrap_or_else(|e| panic!("heap w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            }
+        }
+    }
+}
+
+/// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
+/// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
+/// the same S#, and validates.
+#[test]
+fn ps_get_lod_with_a_static_sampler() {
+    use crate::gpu::recomp::{Mode, PsInterface};
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 1 << 20 | 1 << 22, 0];
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for (k, &w) in linear.iter().enumerate() {
+        list.push(if w == 0 { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 128)], None) } else { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 255)], Some(w)) });
+    }
+    // uv = (I, J) of the first barycentric pair (v0, v1); T# s[16:23], S# s[24:27]
+    list.push(("IMAGE_GET_LOD", "ENC_MIMG", vec![("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("IMAGE_SAMPLE", "ENC_MIMG", vec![("VDATA", 6), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    }
+}
