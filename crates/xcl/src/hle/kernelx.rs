@@ -43,6 +43,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         VirtualFreeEx,
         VirtualProtect,
         VirtualProtectEx,
+        VirtualQuery,
+        VirtualQueryEx,
         XMemAlloc,
         XMemFree,
         XMemAllocDefault,
@@ -642,6 +644,56 @@ pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize,
     VirtualAlloc(addr, size, t, p)
 }
 
+/// Fast-path `VirtualQuery` / `VirtualQueryEx` / `XMemVirtualQuery` for a committed coherent
+/// UMA window: `OpenExistingHeapFromAddress` makes a kernel `VirtualQuery` on a 4 GiB coherent
+/// window walk the whole region (~75–80 ms, holding `MmLockAddressSpace`), stalling
+/// `GetWriteWatch` on other threads. A committed coherent window is `PAGE_READWRITE` as a whole.
+unsafe fn query_committed_window(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> Option<usize> {
+    let need = std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>();
+    if mbi.is_null() || len < need {
+        return None;
+    }
+    let addr = address as usize;
+    let u = crate::gpu::uma::get()?;
+    if !u.in_committed_window(addr, 1) {
+        return None;
+    }
+    let k = u.window_of(addr)?;
+    let (win_base, win_len) = u.window(k);
+    let page_base = addr & !0xFFF;
+    mbi.write_unaligned(mem::MEMORY_BASIC_INFORMATION {
+        BaseAddress: page_base as *mut c_void,
+        AllocationBase: win_base as *mut c_void,
+        AllocationProtect: mem::PAGE_READWRITE,
+        PartitionId: 0,
+        RegionSize: (win_base + win_len).saturating_sub(page_base),
+        State: mem::MEM_COMMIT,
+        Protect: mem::PAGE_READWRITE,
+        Type: mem::MEM_PRIVATE,
+    });
+    Some(need)
+}
+
+fn is_current_process(process: HANDLE) -> bool {
+    process == (-1isize as HANDLE) || process == unsafe { thr::GetCurrentProcess() }
+}
+
+pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if let Some(n) = query_committed_window(address, mbi, len) {
+        return n;
+    }
+    mem::VirtualQuery(address, mbi, len)
+}
+
+pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    if is_current_process(process) {
+        if let Some(n) = query_committed_window(address, mbi, len) {
+            return n;
+        }
+    }
+    mem::VirtualQueryEx(process, address, mbi, len)
+}
+
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
 /// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
 /// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
@@ -652,6 +704,10 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
         return 0;
     }
     let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
+    if is_current_process(process) && query_committed_window(address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()).is_some() {
+        *(info as *mut u8).add(48).cast::<u32>() = 1;
+        return 1;
+    }
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
@@ -998,6 +1054,9 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
 /// Whether all of `[a, a + len)` is committed: one VirtualQuery per run of pages in one state
 /// (page by page each asked walked the rest of the run).
 fn committed_range(a: usize, len: usize) -> bool {
+    if len > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, len)) {
+        return true;
+    }
     let mut p = a;
     while p < a + len {
         let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1028,6 +1087,9 @@ struct StateRun {
 fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
     if (run.start..run.end).contains(&a) {
         return run.committed;
+    }
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(a, 1)) {
+        return true;
     }
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
@@ -2937,5 +2999,35 @@ mod tests {
         let stub_h = modules::hle_handle("unit_stub_probe.dll");
         assert_ne!(stub_h, 0);
         assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
+    }
+
+    #[test]
+    fn virtual_query_fastpath_covers_committed_coherent_window() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let Some(k) = u.committed_window() else { return };
+        let (base, len) = u.window(k);
+        assert!(len >= 0x2000);
+        let addr = (base + 0x1234) as *const c_void;
+        unsafe {
+            let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n = VirtualQuery(addr, &mut mbi, std::mem::size_of_val(&mbi));
+            assert_eq!(n, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>());
+            assert_eq!(mbi.BaseAddress as usize, base + 0x1000);
+            assert_eq!(mbi.AllocationBase as usize, base);
+            assert_eq!(mbi.RegionSize, len - 0x1000);
+            assert_eq!(mbi.State, mem::MEM_COMMIT);
+            assert_eq!(mbi.Protect, mem::PAGE_READWRITE);
+
+            let mut mbi2: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let n2 = VirtualQueryEx(thr::GetCurrentProcess(), addr, &mut mbi2, std::mem::size_of_val(&mbi2));
+            assert_eq!(n2, n);
+            assert_eq!(mbi2.RegionSize, mbi.RegionSize);
+
+            let mut xinfo = [0u8; 64];
+            assert_eq!(XMemVirtualQuery(thr::GetCurrentProcess(), addr, xinfo.as_mut_ptr() as *mut c_void), 1);
+            assert_eq!(u32::from_ne_bytes(xinfo[48..52].try_into().unwrap()), 1);
+            assert!(committed_range(base + 0x1000, 0x1000));
+            assert!(committed_page(base + 0x1000));
+        }
     }
 }
