@@ -572,23 +572,31 @@ mod tests {
     #[test]
     fn high_coordinate_tables_keep_their_offsets_at_one_period() {
         let full = |bits: &[u64; 20], blk: u32, l: u32, shift: u32| -> Vec<u32> {
-            (0..1u32 << (16 - l.min(16)))
-                .map(|c| {
-                    let mut off = 0u32;
-                    for (i, &b) in bits[..blk as usize].iter().enumerate() {
-                        let mask = ((b >> shift) & 0xFFFF) as u32;
-                        off |= ((mask & (c << l)).count_ones() & 1) << i;
-                    }
-                    off
-                })
-                .collect()
+            let direct = |c: u32| {
+                let mut off = 0u32;
+                for (i, &b) in bits[..blk as usize].iter().enumerate() {
+                    let mask = ((b >> shift) & 0xFFFF) as u32;
+                    off |= ((mask & (c << l)).count_ones() & 1) << i;
+                }
+                off
+            };
+            // each offset bit is the parity of a mask and the coordinate, so the offset of a
+            // coordinate is the XOR of its single bits' offsets
+            let mut v = vec![0u32; 1 << (16 - l.min(16))];
+            for c in 1..v.len() {
+                let low = c & c.wrapping_neg();
+                v[c] = if low == c { direct(c as u32) } else { v[c ^ low] ^ v[low] };
+            }
+            v
         };
         let check = |l: &Layout, bits: &[u64; 20], what: &str| {
             let blk = l.block_bytes.trailing_zeros();
             for (t, b, shift) in [(&l.hx, l.block_w, 0), (&l.hy, l.block_h, 16), (&l.hz, l.block_d, 32)] {
                 let want = full(bits, blk, b.trailing_zeros(), shift);
                 assert!(t.len().is_power_of_two() && t.len() <= want.len(), "{what}: table of {} for {}", t.len(), want.len());
-                for c in (0..1usize << 18).step_by(3).chain([u32::MAX as usize, (1 << 40) + 5]) {
+                // both lengths are powers of two and t's divides want's, so one period of want
+                // covers every coordinate
+                for c in (0..want.len()).chain([u32::MAX as usize, (1 << 40) + 5]) {
                     assert_eq!(t[c % t.len()], want[c % want.len()], "{what}: shift {shift} coordinate block {c}");
                 }
             }
