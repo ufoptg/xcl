@@ -4,9 +4,8 @@
 //! value built with `WaveActiveBallot`; a lane tests its own bit
 //! ([`Lw::lanebit`], cached per block). In the split form (a wave64 console
 //! program on a GPU with 32-lane waves only, `docs/wave64-on-wave32.md`) the
-//! two hardware halves of the console wave are the whole thread group and
-//! meet at a group barrier to exchange one word each: ballot words and
-//! `v_readlane` values. Lane reads the ISA keeps inside a 32-lane half (DPP,
+//! two hardware halves exchange ballot words and `v_readlane` values through bounded
+//! group-shared counters. Lane reads the ISA keeps inside a 32-lane half (DPP,
 //! `ds_swizzle`, permlane) need no exchange.
 
 use super::lower::{Lw, Partner};
@@ -39,12 +38,10 @@ impl Lw {
         } else if self.split {
             let w = self.s.groupshared("xcl_xw", i32, 1);
             self.xw = Some((w, 0));
-            if self.waves > 1 {
-                let x = self.s.groupshared("xcl_xs", i32, (4 * self.xslot * self.waves) as u64);
-                self.xs = Some((x, 0));
-                let c = self.s.groupshared("xcl_xc", i32, 2 * self.waves as u64);
-                self.xc = Some((c, 0));
-            }
+            let x = self.s.groupshared("xcl_xs", i32, (4 * self.xslot * self.waves) as u64);
+            self.xs = Some((x, 0));
+            let c = self.s.groupshared("xcl_xc", i32, 2 * self.waves as u64);
+            self.xc = Some((c, 0));
         }
     }
 
@@ -58,7 +55,15 @@ impl Lw {
             let ai = self.c(at);
             let p = self.s.gs_ptr(xw, ai);
             self.s.m.store(p, z, 4);
+            let (xc, cb) = self.xc.expect("split counters");
+            let gi = self.s.flattened_thread_id_in_group();
+            let last = self.c(1);
+            let counter = self.umin(gi, last);
+            let counter = self.addc(counter, cb);
+            let cp = self.s.gs_ptr(xc, counter);
+            self.s.m.store(cp, z, 4);
             self.s.barrier(barrier::GROUP_SYNC);
+            self.xn = self.c(32);
             let first = self.s.wave_is_first_lane();
             let k = self.selc(first, 32, z);
             let got = self.s.m.atomic_rmw(RmwOp::Add, p, k);

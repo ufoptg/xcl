@@ -239,10 +239,9 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(&cfg.insts, kernel);
     }
     lw.setup_storage(uses_lds, if split { slot } else { 1 });
-    if let (Some(t), true) = (group_threads, split) {
-        lw.partner = match t {
-            0..=32 => Partner::Missing,
-            33..=64 => Partner::Present,
+    if split {
+        lw.partner = match group_threads {
+            Some(0..=32) => Partner::Missing,
             _ => Partner::Spin,
         };
     }

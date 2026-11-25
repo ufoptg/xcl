@@ -15,6 +15,32 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
 }
 
 #[test]
+fn split_single_wave_uses_bounded_exchange() {
+    use crate::gpu::recomp::CsInterface;
+    let code = prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None)]);
+    let options = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let kernel = translate(&code, options).unwrap();
+    let dis = super::validate::disassemble(&kernel).unwrap();
+    assert!(dis.matches("atomicrmw").count() >= 3, "kernel must use bounded counter exchange: {dis}");
+    let single = CsInterface { threads: [32, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let single_shader = super::kernel::translate_compute(&code, options, &single).unwrap();
+    let single_dis = super::validate::disassemble(&single_shader.dxil).unwrap();
+    assert!(single_dis.matches("atomicrmw").count() < 3, "a missing partner must not spin: {single_dis}");
+    for threads in [33, 64, 128] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let shader = super::kernel::translate_compute(&code, options, &cs).unwrap();
+        let dis = super::validate::disassemble(&shader.dxil).unwrap();
+        assert!(dis.matches("atomicrmw").count() >= 3, "{threads} threads must use bounded counter exchange: {dis}");
+    }
+    let with_lds = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None),
+    ]);
+    let shader = super::kernel::translate_compute(&with_lds, options, &CsInterface { threads: [64, 1, 1], ..single }).unwrap();
+    let dis = super::validate::disassemble(&shader.dxil).unwrap();
+    assert!(dis.matches("atomicrmw").count() >= 3, "LDS-backed counters must use bounded exchange: {dis}");
+}
+#[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
