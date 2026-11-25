@@ -68,7 +68,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
-| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
+| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf`, `xcl pipelines` (compiles a run's pipelines outside the game) | – |
 
 ## Controls
 
@@ -118,6 +118,7 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build com
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued (<data>\cache\pipelines.bin)
 ```
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a

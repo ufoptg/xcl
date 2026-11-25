@@ -76,12 +76,31 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
-        n | super::HEAP_WINDOWS
+    let n = match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
+            if n > 1 && heap_windows() {
+                n | super::HEAP_WINDOWS
+            } else {
+                n
+            }
+        }
+        n => n,
+    };
+    if SWITCH_FORM.with(|s| s.get()) {
+        n & !super::HEAP_WINDOWS
     } else {
         n
     }
+}
+
+static MEM_WINDOWS_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` as a title's run had it, with its `HEAP_WINDOWS` (`xcl pipelines` replays a
+/// run's pipelines without the title's unified memory: the HLSL, and so the cache keys, must be
+/// that run's). 0: unset.
+pub fn set_mem_windows(n: u32) {
+    MEM_WINDOWS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 thread_local! {
