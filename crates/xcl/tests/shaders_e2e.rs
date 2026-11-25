@@ -296,3 +296,32 @@ fn shaders_handles_non_console_file_and_missing_path() {
     let stderr = String::from_utf8(err_out.stderr).unwrap();
     assert!(stderr.contains("xcl shaders:"), "{stderr}");
 }
+
+#[test]
+fn direct_sweep_rejects_invalid_hash_filters() {
+    let dir = TempDir::new("direct-hash");
+    for name in ["one.bin", "two.bin"] {
+        std::fs::write(dir.path().join(name), b"not a shader").unwrap();
+    }
+
+    for value in [None, Some(""), Some("0xxyz"), Some("10000000000000000")] {
+        let mut args = vec!["--direct", "--hash"];
+        args.extend(value);
+        let out = run_shaders(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "{value:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{value:?}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("expected a hexadecimal shader hash after --hash"), "{stderr}");
+    }
+
+    let sample = run_shaders(dir.path(), &["--direct", "--sample", "1"]);
+    assert!(sample.status.success(), "{sample:?}");
+    assert!(String::from_utf8(sample.stdout).unwrap().contains("from 1 sampled records"));
+
+    for value in ["abcd", "0xabcd", "0XABCD"] {
+        let out = run_shaders(dir.path(), &["--direct", "--sample", "1", "--hash", value]);
+        assert!(out.status.success(), "{value}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("from 2 sampled records"), "{value}: {stdout}");
+    }
+}

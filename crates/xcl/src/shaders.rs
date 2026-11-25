@@ -1694,6 +1694,20 @@ fn name_hash(name: &str) -> u64 {
 /// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
 fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
     use crate::gpu::dxil::coverage::{self, Report, Sample};
+    // With --hash, search every record for the container's [SHADER] hash (FNV-64).
+    let only_hash = if let Some(i) = args.iter().position(|a| a == "--hash") {
+        let hash = args.get(i + 1)
+            .map(|v| v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v))
+            .filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|v| u64::from_str_radix(v, 16).ok());
+        let Some(hash) = hash else {
+            eprintln!("xcl shaders --direct: expected a hexadecimal shader hash after --hash");
+            return 2;
+        };
+        Some(hash)
+    } else {
+        None
+    };
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
     let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
     let want = if want == 0 { usize::MAX } else { want };
@@ -1713,10 +1727,8 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
     let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
     let skipped = AtomicUsize::new(0);
-    // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
-    // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
+    // `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
-    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
     let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
     if let Some(d) = &dump_dir {
         let _ = std::fs::create_dir_all(d);
