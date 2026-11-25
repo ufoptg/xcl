@@ -1151,4 +1151,101 @@ mod tests {
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
     }
+
+    struct MappedCode {
+        base: usize,
+    }
+
+    impl MappedCode {
+        unsafe fn new(name: &str, bytes: &[u8], protect: u32) -> Self {
+            use std::sync::{atomic::AtomicBool, Arc};
+            use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+            let base = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base as *mut u8, bytes.len());
+            if protect != PAGE_READWRITE {
+                let mut old = 0u32;
+                assert_ne!(VirtualProtect(base as *const _, 0x1000, protect, &mut old), 0);
+            }
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: name.into(),
+                path: name.into(),
+                base,
+                size: 0x1000,
+                entry_rva: 0,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Mutex::new(Vec::new()),
+                no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true),
+                stack_reserve: 0,
+            }));
+            Self { base }
+        }
+    }
+
+    impl Drop for MappedCode {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            modules::unregister_mapped(self.base);
+            unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn clwb_patches_instruction_bytes_to_nop_and_advances_rip() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ};
+        unsafe {
+            // `66 0F AE 30` = clwb [rax]
+            let code = MappedCode::new("clwb_test.exe", &[0x66, 0x0F, 0xAE, 0x30, 0xC3], PAGE_EXECUTE_READ);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = code.base as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code.base as u64 + 4);
+            let patched = std::slice::from_raw_parts(code.base as *const u8, 5);
+            assert_eq!(patched, &[0x90, 0x90, 0x90, 0x90, 0xC3], "CLWB must be patched to NOPs without touching trailing bytes");
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(code.base as *const _, &mut m, std::mem::size_of_val(&m)), 0);
+            assert_eq!(m.Protect, PAGE_EXECUTE_READ, "page protection must be restored after patching");
+        }
+    }
+
+    #[test]
+    fn monitorx_mwaitx_step_and_ud2_or_unknown_return_zero() {
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        unsafe {
+            // monitorx (`0F 01 FA`), mwaitx (`0F 01 FB`), ud2 (`0F 0B`), unknown (`06`)
+            let code = MappedCode::new("mon_mwait_ud2.exe", &[0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x0F, 0x0B, 0x06], PAGE_EXECUTE_READ);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = code.base as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code.base as u64 + 3, "monitorx advances Rip by 3");
+
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code.base as u64 + 6, "mwaitx advances Rip by 3");
+
+            assert_eq!(emulate_console_only(&mut ctx), 0, "ud2 must not be swallowed");
+            assert_eq!(ctx.Rip, code.base as u64 + 6);
+
+            ctx.Rip = code.base as u64 + 8;
+            assert_eq!(emulate_console_only(&mut ctx), 0, "non-console illegal opcode returns 0");
+            assert_eq!(ctx.Rip, code.base as u64 + 8);
+        }
+    }
+
+    #[test]
+    fn clzero_on_unwritable_memory_does_not_advance_rip() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY};
+        unsafe {
+            let ro = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize;
+            assert!(ro != 0);
+            let code = MappedCode::new("clzero_ro.exe", &[0x0F, 0x01, 0xFC], PAGE_EXECUTE_READ);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = code.base as u64;
+            ctx.Rax = ro as u64;
+            assert_eq!(emulate_console_only(&mut ctx), 0, "faulting clzero must pass exception to title handler");
+            assert_eq!(ctx.Rip, code.base as u64);
+            VirtualFree(ro as *mut _, 0, MEM_RELEASE);
+        }
+    }
 }
