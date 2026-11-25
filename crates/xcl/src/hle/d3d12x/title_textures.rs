@@ -423,8 +423,11 @@ fn recheck_gpu_view_sources() {
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
+    for e in t.by_res.values_mut() {
+        changed |= recheck_source(e, true);
+    }
+    for e in t.shadowed.values_mut() {
+        changed |= recheck_source(e, false);
     }
     drop(g);
     if changed {
@@ -434,7 +437,12 @@ fn recheck_gpu_view_sources() {
 
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
 /// uploaded at the next submit. Whether it changed.
-fn recheck_source(e: &mut Entry) -> bool {
+///
+/// `active` is whether `e` is one the upload walks (`by_res`): a shadowed texture is not
+/// uploaded, so marking it pending would count in `PENDING` with nothing to clear it – the
+/// fast path of `before_execute` never runs again. It takes its upload from `Table::insert`
+/// when it becomes active.
+fn recheck_source(e: &mut Entry, active: bool) -> bool {
     if !e.in_gpu_view {
         return false;
     }
@@ -443,7 +451,7 @@ fn recheck_source(e: &mut Entry) -> bool {
         return false;
     }
     e.src = src;
-    if !e.pending {
+    if active && !e.pending {
         e.pending = true;
         PENDING.fetch_add(1, Ordering::Relaxed);
     }
@@ -1387,10 +1395,10 @@ mod tests {
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
             let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
-            assert!(!recheck_source(&mut e), "nothing changed yet");
+            assert!(!recheck_source(&mut e, true), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
             // … and the page mapped under it later, uploaded again
-            assert!(recheck_source(&mut e));
+            assert!(recheck_source(&mut e, true));
             assert_eq!(e.src, at);
             assert!(e.pending);
             PENDING.fetch_sub(1, Ordering::Relaxed);
@@ -1593,6 +1601,42 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    /// A shadowed texture is not uploaded (`before_execute` walks `by_res`), so a source change
+    /// it sees must not mark it pending: nothing would ever clear that, and `PENDING` – the
+    /// fast path's guard – would stay non-zero for the rest of the process.
+    #[test]
+    fn a_shadowed_texture_source_change_does_not_count_as_pending() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let mut local = [0u8; 64];
+        let va = local.as_mut_ptr() as usize; // a committed page: mirror_source(va) is va
+        let mut e = Entry {
+            device: 0,
+            va,
+            src: 0xDEAD_0000,
+            in_gpu_view: true,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        assert!(recheck_source(&mut e, false), "the source changed");
+        assert_eq!(e.src, va);
+        assert!(!e.pending, "a shadowed texture has no upload to be pending for");
+
+        let before = PENDING.load(Ordering::Relaxed);
+        e.src = 0xDEAD_0000; // the same change, seen by the entry while it is active
+        assert!(recheck_source(&mut e, true), "the source changed again");
+        assert!(e.pending, "an active texture is uploaded at the next submit");
+        assert_eq!(PENDING.load(Ordering::Relaxed), before + 1);
+        assert!(!recheck_source(&mut e, true), "no second change, no second count");
+        assert_eq!(PENDING.load(Ordering::Relaxed), before + 1);
+        e.pending = false;
+        PENDING.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared
