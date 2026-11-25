@@ -74,7 +74,14 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    /// the shaders index the view heap / the sampler heap themselves (the root signature's
+    /// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED / SAMPLER_HEAP_DIRECTLY_INDEXED): they take the 32-bit
+    /// address of each from a user SGPR after the arguments, the view heap's first
+    pub heaps: [bool; 2],
 }
+
+const CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED: u32 = 0x400;
+const SAMPLER_HEAP_DIRECTLY_INDEXED: u32 = 0x800;
 
 /// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
 /// driver's), graphics stages (VS, PS) s8…s31 (s0…s7: the driver's, s[4:5] of a VS the
@@ -100,7 +107,8 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     };
     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
-    let mut l = Layout::default();
+    let flags = r(20).unwrap_or(0);
+    let mut l = Layout { heaps: [CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED, SAMPLER_HEAP_DIRECTLY_INDEXED].map(|f| flags & f != 0), ..Default::default() };
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
@@ -168,6 +176,19 @@ pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at:
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
+}
+
+/// `sgprs` (`user_data_for` / `user_data_gfx`) and the addresses of the view heap and the sampler
+/// heap set that the shaders index (`Layout::heaps`). A compute shader without registers left
+/// for them (`user_sgprs`: its count) gets none.
+pub fn with_heaps(l: &Layout, user_sgprs: Option<u32>, mut sgprs: Vec<u32>, heaps: [u32; 2]) -> Vec<u32> {
+    for (_, base) in l.heaps.iter().zip(heaps).filter(|(&used, _)| used) {
+        if user_sgprs.is_some_and(|n| sgprs.len() as u32 >= n) {
+            break;
+        }
+        sgprs.push(base);
+    }
+    sgprs
 }
 
 fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
@@ -971,6 +992,36 @@ mod tests {
             r.extend([0, 0, count]);
         }
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Shaders that index the heaps set themselves get the heaps' addresses after their
+    /// arguments, the view heap's first; a compute shader without registers for them does not.
+    #[test]
+    fn heap_addresses_follow_the_arguments() {
+        let layout = |flags: u32, p: &[(u32, u32)]| {
+            let mut blob = rts0(p);
+            blob[20..24].copy_from_slice(&flags.to_le_bytes());
+            layout_from_blob(&blob).unwrap()
+        };
+        let heaps = [0x6000_0000, 0x6381_0000];
+        // a table and two constants
+        let args: Vec<u8> = [0x80u32, 5, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let gfx = |flags: u32| {
+            let l = layout(flags, &[(0, 0), (1, 2)]);
+            with_heaps(&l, None, user_data_gfx(&l, &args, 0x200), heaps)[8..].to_vec()
+        };
+        assert_eq!(gfx(1), [0x80, 5, 0]);
+        assert_eq!(gfx(0x801), [0x80, 5, 0, 0x6381_0000]);
+        assert_eq!(gfx(0x401), [0x80, 5, 0, 0x6000_0000]);
+        assert_eq!(gfx(0xC01), [0x80, 5, 0, 0x6000_0000, 0x6381_0000]);
+        let cs = |flags: u32, user: u32| {
+            let l = layout(flags, &[(0, 0), (1, 2)]);
+            with_heaps(&l, Some(user), user_data_for(&l, Some(user), &args, 0x200), heaps)[4..].to_vec()
+        };
+        assert_eq!(cs(0xC00, 9), [0x80, 5, 0, 0x6000_0000, 0x6381_0000]);
+        assert_eq!(cs(0xC00, 8), [0x80, 5, 0, 0x6000_0000]);
+        assert_eq!(cs(0xC00, 7), [0x80, 5, 0], "no register left");
+        assert_eq!(cs(0, 9), [0x80, 5, 0]);
     }
 
     /// A blob whose constant count makes the arguments overflow u32 (0x4000_0000) or take

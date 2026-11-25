@@ -334,6 +334,11 @@ pub fn unregister(obj: usize) {
     }
 }
 
+/// Whether heap `obj` holds samplers, and the 32-bit console address of its slots.
+pub fn base(obj: usize) -> Option<(bool, u32)> {
+    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))
+}
+
 /// Start of the console slots of heap `obj` (CPU handle = GPU handle on the console).
 pub fn start(obj: usize) -> Option<u64> {
     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
