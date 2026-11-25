@@ -12,6 +12,28 @@ use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
 impl Lw {
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, 0xFFF);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -32,14 +54,31 @@ impl Lw {
         let f32 = self.s.m.f32();
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
-    fn load3f(&mut self, at: Value) -> [Value; 3] {
-        let mut r = [at; 3];
-        for (k, slot) in r.iter_mut().enumerate() {
-            let a = self.addc(at, 4 * k as u32);
-            let v = self.mem_ld(a);
-            *slot = self.f(v);
-        }
-        r
+
+    fn bvh_load_box32(&mut self, at16: Value, k: Value) -> ([Value; 3], [Value; 3]) {
+        let k24 = self.c(24);
+        let off = self.mul(k, k24);
+        let a = self.add(at16, off);
+        let words = self.with_mem_i32s(None, 6, &mut |lw, m| {
+            let mut out = Vec::with_capacity(6);
+            out.extend(lw.s.raw_load(m, a, 0xF));
+            let b = lw.addc(a, 16);
+            out.extend(lw.s.raw_load(m, b, 0x3));
+            out
+        });
+        ([self.f(words[0]), self.f(words[1]), self.f(words[2])], [self.f(words[3]), self.f(words[4]), self.f(words[5])])
+    }
+    fn bvh_load_box16(&mut self, at16: Value, k: Value) -> ([Value; 3], [Value; 3]) {
+        let k12 = self.c(12);
+        let off = self.mul(k, k12);
+        let a = self.add(at16, off);
+        let h = self.with_mem_i32s(None, 3, &mut |lw, m| lw.s.raw_load(m, a, 0x7));
+        let hx16 = self.lshrc(h[0], 16);
+        let hy16 = self.lshrc(h[1], 16);
+        let hz16 = self.lshrc(h[2], 16);
+        let mn = [self.s.f16_to_f32(h[0]), self.s.f16_to_f32(hx16), self.s.f16_to_f32(h[1])];
+        let mx = [self.s.f16_to_f32(hy16), self.s.f16_to_f32(h[2]), self.s.f16_to_f32(hz16)];
+        (mn, mx)
     }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
@@ -49,91 +88,147 @@ impl Lw {
         for &t in &out {
             self.wr(t, ones);
         }
-        for box32 in [true, false] {
-            let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
-            self.guarded(is, &mut |lw| {
-                let mut child = [ones; 4];
-                for (k, c) in child.iter_mut().enumerate() {
-                    let a = lw.addc(at, 4 * k as u32);
-                    *c = lw.mem_ld(a);
-                }
-                let ninf = lw.s.m.f32c(0xFF80_0000);
-                let pinf = lw.s.m.f32c(0x7F80_0000);
-                let mut tn = [pinf; 4];
-                let mut id = [ones; 4];
-                for k in 0..4u32 {
-                    let (mn, mx) = if box32 {
-                        let a = lw.addc(at, 16 + 24 * k);
-                        let b = lw.addc(at, 28 + 24 * k);
-                        (lw.load3f(a), lw.load3f(b))
-                    } else {
-                        let a = lw.addc(at, 16 + 12 * k);
-                        let mut h = [ones; 3];
-                        for (j, slot) in h.iter_mut().enumerate() {
-                            let x = lw.addc(a, 4 * j as u32);
-                            *slot = lw.mem_ld(x);
-                        }
-                        let hx16 = lw.lshrc(h[0], 16);
-                        let hy16 = lw.lshrc(h[1], 16);
-                        let hz16 = lw.lshrc(h[2], 16);
-                        let mn = [lw.s.f16_to_f32(h[0]), lw.s.f16_to_f32(hx16), lw.s.f16_to_f32(h[1])];
-                        let mx = [lw.s.f16_to_f32(hy16), lw.s.f16_to_f32(h[2]), lw.s.f16_to_f32(hz16)];
-                        (mn, mx)
-                    };
-                    let d1 = lw.f3(mn, o, Lw::fsub);
-                    let t1 = lw.f3(d1, inv, Lw::fmul);
-                    let d2 = lw.f3(mx, o, Lw::fsub);
-                    let t2 = lw.f3(d2, inv, Lw::fmul);
-                    let mut lo = [pinf; 3];
-                    let mut hi = [pinf; 3];
+        let is_box32 = self.cmpc(Pred::Eq, ty, 5);
+        let is_box16 = self.cmpc(Pred::Eq, ty, 4);
+        let is_box = self.lor(is_box16, is_box32);
+        self.guarded(is_box, &mut |lw| {
+            let f32t = lw.s.m.f32();
+            let i32t = lw.s.m.i32();
+            let ninf = lw.s.m.f32c(0xFF80_0000);
+            let pinf = lw.s.m.f32c(0x7F80_0000);
+            let z0 = lw.c(0);
+            let zf = lw.fc(0.0);
+            let at_al = lw.andc(at, !3);
+            let child_words = lw.with_mem_i32s(None, 4, &mut |lw, m| lw.s.raw_load(m, at_al, 0xF));
+            let children = [child_words[0], child_words[1], child_words[2], child_words[3]];
+            let at16 = lw.addc(at_al, 16);
+            let inv_inf = [lw.isinf(inv[0]), lw.isinf(inv[1]), lw.isinf(inv[2])];
+            let pre = lw.cur();
+            let lp = lw.block(Some(2));
+            let ex = lw.block(Some(1));
+            lw.br(lp);
+
+            lw.s.m.set_block(lp);
+            let k = lw.s.m.phi(i32t);
+            lw.s.m.add_incoming(k, z0, pre);
+            // 3-slot shift register carried across k = 0..4; on exit after k = 3,
+            // [t0, t1, t2, tk] and [i0, i1, i2, ik] hold children 0..4 in order.
+            let t2 = lw.s.m.phi(f32t);
+            let t1 = lw.s.m.phi(f32t);
+            let t0 = lw.s.m.phi(f32t);
+            let i2 = lw.s.m.phi(i32t);
+            let i1 = lw.s.m.phi(i32t);
+            let i0 = lw.s.m.phi(i32t);
+            for p in [t2, t1, t0] {
+                lw.s.m.add_incoming(p, pinf, pre);
+            }
+            for p in [i2, i1, i0] {
+                lw.s.m.add_incoming(p, ones, pre);
+            }
+
+            let child = lw.pick4f(&children, k);
+            let (mn, mx) = match lw.s.m.const_u64(is_box32) {
+                Some(1) => lw.bvh_load_box32(at16, k),
+                Some(0) => lw.bvh_load_box16(at16, k),
+                _ => {
+                    let b32 = lw.block(Some(1));
+                    let b16 = lw.block(Some(1));
+                    let got = lw.block(Some(2));
+                    lw.cond_br(is_box32, b32, b16);
+
+                    lw.s.m.set_block(b32);
+                    let (mn32, mx32) = lw.bvh_load_box32(at16, k);
+                    let e32 = lw.cur();
+                    lw.br(got);
+
+                    lw.s.m.set_block(b16);
+                    let (mn16, mx16) = lw.bvh_load_box16(at16, k);
+                    let e16 = lw.cur();
+                    lw.br(got);
+
+                    lw.s.m.set_block(got);
+                    let mut mn = [pinf; 3];
+                    let mut mx = [pinf; 3];
                     for c in 0..3 {
-                        let ge = lw.fcmp(Pred::FOGe, o[c], mn[c]);
-                        let le = lw.fcmp(Pred::FOLe, o[c], mx[c]);
-                        let slab = lw.land(ge, le);
-                        let ii = lw.isinf(inv[c]);
-                        let l0 = lw.sel(slab, ninf, pinf);
-                        let h0 = lw.sel(slab, pinf, ninf);
-                        let mn_t = lw.fmin(t1[c], t2[c]);
-                        let mx_t = lw.fmax(t1[c], t2[c]);
-                        lo[c] = lw.sel(ii, l0, mn_t);
-                        hi[c] = lw.sel(ii, h0, mx_t);
+                        mn[c] = lw.s.m.phi(f32t);
+                        lw.s.m.add_incoming(mn[c], mn32[c], e32);
+                        lw.s.m.add_incoming(mn[c], mn16[c], e16);
                     }
-                    let a = lw.fmax(lo[0], lo[1]);
-                    let a = lw.fmax(a, lo[2]);
-                    let b = lw.fmin(hi[0], hi[1]);
-                    let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k as usize], u32::MAX);
-                    let mut all = cv;
                     for c in 0..3 {
-                        let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
-                        all = lw.land(all, le);
+                        mx[c] = lw.s.m.phi(f32t);
+                        lw.s.m.add_incoming(mx[c], mx32[c], e32);
+                        lw.s.m.add_incoming(mx[c], mx16[c], e16);
                     }
-                    let ab = lw.fcmp(Pred::FOLe, a, b);
-                    let z = lw.fc(0.0);
-                    let b0 = lw.fcmp(Pred::FOGe, b, z);
-                    let at_ = lw.fcmp(Pred::FOLe, a, tmax);
-                    let hit = lw.land(all, ab);
-                    let x = lw.land(b0, at_);
-                    let hit = lw.land(hit, x);
-                    tn[k as usize] = lw.sel(hit, a, pinf);
-                    id[k as usize] = lw.sel(hit, child[k as usize], ones);
+                    (mn, mx)
                 }
-                for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
-                    let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
-                    let sw = lw.land(sort, lt);
-                    let (ti, tj) = (lw.sel(sw, tn[j], tn[i]), lw.sel(sw, tn[i], tn[j]));
-                    let (ii, ij) = (lw.sel(sw, id[j], id[i]), lw.sel(sw, id[i], id[j]));
-                    tn[i] = ti;
-                    tn[j] = tj;
-                    id[i] = ii;
-                    id[j] = ij;
-                }
-                for k in 0..4 {
-                    lw.wr(out[k], id[k]);
-                }
-                Ok(())
-            })?;
-        }
+            };
+
+            let d1 = lw.f3(mn, o, Lw::fsub);
+            let t1_ = lw.f3(d1, inv, Lw::fmul);
+            let d2 = lw.f3(mx, o, Lw::fsub);
+            let t2_ = lw.f3(d2, inv, Lw::fmul);
+            let mut lo = [pinf; 3];
+            let mut hi = [pinf; 3];
+            for c in 0..3 {
+                let ge = lw.fcmp(Pred::FOGe, o[c], mn[c]);
+                let le = lw.fcmp(Pred::FOLe, o[c], mx[c]);
+                let slab = lw.land(ge, le);
+                let l0 = lw.sel(slab, ninf, pinf);
+                let h0 = lw.sel(slab, pinf, ninf);
+                let mn_t = lw.fmin(t1_[c], t2_[c]);
+                let mx_t = lw.fmax(t1_[c], t2_[c]);
+                lo[c] = lw.sel(inv_inf[c], l0, mn_t);
+                hi[c] = lw.sel(inv_inf[c], h0, mx_t);
+            }
+            let a = lw.fmax(lo[0], lo[1]);
+            let a = lw.fmax(a, lo[2]);
+            let b = lw.fmin(hi[0], hi[1]);
+            let b = lw.fmin(b, hi[2]);
+            let cv = lw.cmpc(Pred::Ne, child, u32::MAX);
+            let mut all = cv;
+            for c in 0..3 {
+                let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
+                all = lw.land(all, le);
+            }
+            let ab = lw.fcmp(Pred::FOLe, a, b);
+            let b0 = lw.fcmp(Pred::FOGe, b, zf);
+            let at_ = lw.fcmp(Pred::FOLe, a, tmax);
+            let hit = lw.land(all, ab);
+            let x = lw.land(b0, at_);
+            let hit = lw.land(hit, x);
+            let tk = lw.sel(hit, a, pinf);
+            let ik = lw.sel(hit, child, ones);
+
+            let k1 = lw.addc(k, 1);
+            let done = lw.cmpc(Pred::UGe, k1, 4);
+            let me = lw.cur();
+            lw.s.m.add_incoming(k, k1, me);
+            lw.s.m.add_incoming(t2, tk, me);
+            lw.s.m.add_incoming(t1, t2, me);
+            lw.s.m.add_incoming(t0, t1, me);
+            lw.s.m.add_incoming(i2, ik, me);
+            lw.s.m.add_incoming(i1, i2, me);
+            lw.s.m.add_incoming(i0, i1, me);
+            lw.cond_br(done, ex, lp);
+
+            lw.s.m.set_block(ex);
+            let mut tn = [t0, t1, t2, tk];
+            let mut id = [i0, i1, i2, ik];
+            for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
+                let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
+                let sw = lw.land(sort, lt);
+                let (ti, tj) = (lw.sel(sw, tn[j], tn[i]), lw.sel(sw, tn[i], tn[j]));
+                let (ii, ij) = (lw.sel(sw, id[j], id[i]), lw.sel(sw, id[i], id[j]));
+                tn[i] = ti;
+                tn[j] = tj;
+                id[i] = ii;
+                id[j] = ij;
+            }
+            for k in 0..4 {
+                lw.wr(out[k], id[k]);
+            }
+            Ok(())
+        })?;
         let tri = self.cmpc(Pred::ULe, ty, 3);
         self.guarded(tri, &mut |lw| {
             let t1 = lw.cmpc(Pred::Eq, ty, 1);
@@ -145,9 +240,20 @@ impl Lw {
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
             let p2 = lw.addc(at, 24);
-            let v0 = lw.load3f(p0);
-            let v1 = lw.load3f(p1);
-            let v2 = lw.load3f(p2);
+            let p60 = lw.addc(at, 60);
+            let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
+            let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
+                let mut out = Vec::with_capacity(10);
+                out.extend(lw.s.raw_load(m, p0, 0x7));
+                out.extend(lw.s.raw_load(m, p1, 0x7));
+                out.extend(lw.s.raw_load(m, p2, 0x7));
+                out.push(lw.s.raw_load(m, p60, 0x1)[0]);
+                out
+            });
+            let v0 = [lw.f(words[0]), lw.f(words[1]), lw.f(words[2])];
+            let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
+            let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
+            let tw = words[9];
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -176,8 +282,6 @@ impl Lw {
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];
-            let p60 = lw.addc(at, 60);
-            let tw = lw.mem_ld(p60);
             let sh = lw.shlc(ty, 3);
             let tid = lw.shr_masked(tw, sh);
             let s0 = lw.andc(tid, 3);
@@ -427,8 +531,23 @@ impl Lw {
             3 => TexKind::CubeArray,
             4 => TexKind::D1Array,
             5 => TexKind::D2Array,
+            // multisampled: the fragment index is the sample index (D3D12 MSAA resources have
+            // no FMASK; their samples are stored uncompressed)
+            6 => TexKind::D2MS,
+            7 => TexKind::D2MSArray,
             _ => return err(d, "MIMG dim"),
         };
+        let ms = matches!(dim, 6 | 7);
+        if ms && (sampling || base == "get_lod") {
+            return err(d, "MIMG sample MSAA");
+        }
+        if ms && !matches!(base, "load" | "msaa_load" | "get_resinfo") {
+            // stores / atomics need RWTexture2DMS (SM 6.7, WriteableMSAATextures)
+            return err(d, "MIMG MSAA store / atomic / load_mip");
+        }
+        if base == "msaa_load" && !ms {
+            return err(d, "image_msaa_load on a single-sampled dim");
+        }
 
         if sampling {
             if f("UNORM") != 0 && dim != 3 {
@@ -459,25 +578,7 @@ impl Lw {
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
-                    }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
-                }
-            };
+            let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
             if let Some(o) = ovgpr {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
@@ -613,9 +714,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -623,8 +721,7 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
@@ -636,6 +733,19 @@ impl Lw {
                 r[c as usize]
             }).collect();
             return self.image_result(vdata, &vals, d16, act);
+        }
+
+        if base == "get_resinfo" && ms {
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+            let dims = self.s.get_dimensions(tex.handle, None);
+            let one = self.c(1);
+            let w = self.s.m.extract(dims, 0);
+            let hh = self.s.m.extract(dims, 1);
+            let dd = if dim == 7 { self.s.m.extract(dims, 2) } else { one };
+            let r = [w, hh, dd, one];
+            let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
+            return self.image_result(vdata, &vals, false, act);
         }
 
         if base == "get_resinfo" {
@@ -674,6 +784,9 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        if ms {
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act);
+        }
         match base {
             "load" | "load_mip" => {
                 let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
@@ -789,6 +902,72 @@ impl Lw {
             }
             _ => err(d, "MIMG"),
         }
+    }
+
+    /// `image_load` / `image_msaa_load` on a multisampled T#: `ic` = x, y, (slice,) fragment.
+    /// `image_load` reads the DMASK components of that sample; `image_msaa_load` reads the one
+    /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
+    /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value) -> LResult<()> {
+        let nc = kind.coords();
+        let frag = ic[nc];
+        let coords = ic[..nc].to_vec();
+        let samples: Vec<Value> = if base == "msaa_load" { (0..4).map(|k| self.addc(frag, k)).collect() } else { vec![frag] };
+        // per sample: the texel's four channels as raw bits
+        let tmps: Vec<[u32; 4]> = samples.iter().map(|_| [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()]).collect();
+        let z = self.c(0);
+        for t in &tmps {
+            for &v in t {
+                self.wr(v, z);
+            }
+        }
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            let samples = samples.clone();
+            let coords = coords.clone();
+            let tmps = tmps.clone();
+            self.guarded(is, &mut |lw| {
+                let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                // Emit all TextureLoad calls before GetDimensions in this basic block:
+                // AMD's DXIL compiler (amdxc64.dll) hits a null-pointer dereference
+                // (0xc0000005) when dx.op.getDimensions precedes dx.op.textureLoad on a
+                // dynamically indexed heap Texture2DMS/Texture2DMSArray in the same block.
+                let loads: Vec<[Value; 4]> = samples.iter().map(|&sv| lw.s.texture_load_sample(tex, sv, &coords)).collect();
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let count = lw.s.m.extract(dims, 3);
+                for (si, (&sv, r)) in samples.iter().zip(loads).enumerate() {
+                    let inside = lw.cmp(Pred::ULt, sv, count);
+                    for k in 0..4 {
+                        let b = lw.bits(r[k]);
+                        let zz = lw.c(0);
+                        let b = lw.sel(inside, b, zz);
+                        lw.wr(tmps[si][k], b);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let raw: Vec<Value> = if base == "msaa_load" {
+            let c = comps.first().copied().unwrap_or(0) as usize;
+            tmps.iter().map(|t| self.rd(t[c])).collect()
+        } else {
+            comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
+        };
+        let vals: Vec<Value> = if d16 {
+            raw.iter()
+                .map(|&x| {
+                    let fx = self.f(x);
+                    let h = self.s.f32_to_f16(fx);
+                    let lo = self.andc(x, 0xFFFF);
+                    let fl = self.cmpc(Pred::Eq, cls, 0);
+                    self.sel(fl, h, lo)
+                })
+                .collect()
+        } else {
+            raw
+        };
+        self.image_result(vdata, &vals, d16, act)
     }
 
     /// A compare-exchange loop on a texel (`rmw32` on an `At::Ref` texel).
