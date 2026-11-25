@@ -1729,7 +1729,21 @@ pub unsafe extern "system" fn LoadLibraryA(name: *const u8) -> usize {
 }
 
 unsafe fn load_as_data(name: &str, file: HANDLE, flags: u32) -> usize {
-    let real = crate::vfs::get().and_then(|v| v.real_path_for_read(name)).unwrap_or_else(|| name.to_string());
+    load_as_data_in(crate::vfs::get(), name, file, flags)
+}
+
+unsafe fn load_as_data_in(vfs: Option<&crate::vfs::Vfs>, name: &str, file: HANDLE, flags: u32) -> usize {
+    let real = match vfs {
+        Some(v) => match v.real_path_for_read(name) {
+            Some(p) => p,
+            None => {
+                // hidden by a whiteout: not there, whatever the host still has
+                fnd::SetLastError(fnd::ERROR_FILE_NOT_FOUND);
+                return 0;
+            }
+        },
+        None => name.to_string(),
+    };
     ll::LoadLibraryExW(crate::util::wide(&real).as_ptr(), file, flags) as usize
 }
 
@@ -2030,6 +2044,43 @@ mod tests {
         assert_eq!(sleep_hold_min(Some("0")), None);
         assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
         assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
+    /// A game file hidden by a whiteout is not there for LoadLibraryEx(LOAD_LIBRARY_AS_DATAFILE)
+    /// either: not the host copy, and ERROR_FILE_NOT_FOUND rather than a path error.
+    #[test]
+    fn load_library_ex_as_data_respects_vfs_mount_and_whiteouts() {
+        let dir = std::env::temp_dir().join(format!("xcl_kx_asdata_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let dll = game.join("data").join("res.dll");
+        std::fs::copy(format!("{sys}\\System32\\version.dll"), &dll).unwrap();
+        let game_s = game.to_string_lossy().to_string();
+        let v = crate::vfs::Vfs::new(&game, &dir.join("xcldata"), vec![("G:".into(), game_s)]);
+        let host = dll.to_string_lossy().to_string();
+        let flags = 0x2; // LOAD_LIBRARY_AS_DATAFILE
+
+        // visible: loads from the game folder, console path and host path alike
+        for name in [host.as_str(), "G:\\data\\res.dll"] {
+            let h = unsafe { load_as_data_in(Some(&v), name, std::ptr::null_mut(), flags) };
+            assert_ne!(h, 0, "{name} is visible and must load");
+            unsafe { fnd::FreeLibrary(h as _) };
+        }
+
+        v.delete_file("data\\res.dll").unwrap();
+        for name in [host.as_str(), "G:\\data\\res.dll"] {
+            unsafe { fnd::SetLastError(0) };
+            let h = unsafe { load_as_data_in(Some(&v), name, std::ptr::null_mut(), flags) };
+            let err = unsafe { fnd::GetLastError() };
+            if h != 0 {
+                unsafe { fnd::FreeLibrary(h as _) };
+            }
+            assert_eq!(h, 0, "{name} is whited out and must not load");
+            assert_eq!(err, fnd::ERROR_FILE_NOT_FOUND, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
