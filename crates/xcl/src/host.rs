@@ -117,7 +117,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
     // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
-    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
+    let mut vfs = crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir());
+    // so are the folders it loads the Agility SDK and DXC from, which it does after the hooks
+    // are in: with them on the PC's G: or D: drive the title's mount sent XCL into the game folder
+    // and it ran on the inbox D3D12 (no SM 6.6 on Windows 10) and the Windows SDK's DXC
+    for dir in xcl_folders() {
+        vfs = vfs.own_folder(&dir);
+    }
+    crate::vfs::init(vfs);
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {
@@ -145,4 +152,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// The folders XCL loads its own DLLs from (`gpu::agility`, `gpu::recomp::dxc`): xcl.exe's folder
+/// (and its `D3D12` folder), `XCL_D3D12_DIR` and `XCL_DXC_DIR`.
+fn xcl_folders() -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).into_iter().collect();
+    v.extend(crate::gpu::agility::clean_env_path(std::env::var_os(crate::gpu::agility::ENV)));
+    v.extend(crate::gpu::agility::clean_env_path(std::env::var_os("XCL_DXC_DIR")));
+    v
 }

@@ -195,11 +195,13 @@ impl Vfs {
     /// the PC's D: drive ("D:" is the console's game drive) the title's process wrote its DXIL
     /// into the overlay and looked for it in the game folder, so what `xcl shaders --precompile`
     /// had put into the cache was never found and every run compiled again.
+    /// The root of a drive is not taken: it would turn off the console mount of that drive.
     pub fn own_folder(mut self, dir: &Path) -> Vfs {
         let dir = dir.to_string_lossy();
         let dir = full_path(&dir).unwrap_or_else(|| dir.into_owned());
         let dir = trim_sep(&strip_verbatim(&norm(&dir))).to_lowercase();
-        if !dir.is_empty() {
+        let drive_root = dir.len() == 2 && dir.ends_with(':');
+        if !dir.is_empty() && !drive_root {
             self.own_roots_lc.push(dir);
         }
         self
@@ -813,6 +815,29 @@ mod tests {
         assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
         // a verbatim path (`std::fs::canonicalize`, which the DXIL cache uses for its folder)
         assert_eq!(v.classify(&format!("\\\\?\\{file}")), Target::Pass);
+    }
+
+    /// The Agility SDK and DXC folders on the drive of a console mount ("G:", "D:") are XCL's
+    /// (`host::xcl_folders`): without `own_folder` XCL looked for D3D12Core.dll in the game folder
+    /// and ran on the inbox D3D12. The root of the drive is not taken: the console's paths on it
+    /// still go to the game.
+    #[test]
+    fn a_console_drive_mount_leaves_xcls_sdk_folders_but_not_the_whole_drive() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_sdk_{}", std::process::id()));
+        let game_s = full_path(&dir.join("game").to_string_lossy()).unwrap();
+        let drive = game_s[..2].to_string();
+        let sdk = full_path(&dir.join("Tools").join("D3D12").to_string_lossy()).unwrap();
+        let dll = format!("{sdk}\\D3D12Core.dll");
+        let new = || Vfs::new(Path::new(&game_s), &dir.join("xcldata"), vec![(drive.clone(), game_s.clone())]);
+
+        assert_eq!(new().classify(&dll), Target::Game { rel: dll[3..].to_string() });
+        let v = new().own_folder(Path::new(&sdk));
+        assert_eq!(v.classify(&dll), Target::Pass);
+        assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
+
+        // XCL_D3D12_DIR=G:\ (or xcl.exe at the root of the drive)
+        let v = new().own_folder(Path::new(&format!("{drive}\\")));
+        assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
     }
 
     #[test]
