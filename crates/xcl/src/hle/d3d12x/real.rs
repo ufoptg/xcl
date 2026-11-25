@@ -3430,9 +3430,96 @@ fn note_translation_error(e: String) {
     // each different reason once (the first five only hid a retail game's "mesh pipeline with
     // AS" behind five earlier ones)
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
-    if g.len() < 40 && !g.contains(&e) {
+    if keep_translation_error(&g, &e) {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
         g.push(e);
+    }
+}
+
+/// Whether `e` is logged and kept for `report.json`: a reason not seen yet, among the first 40 –
+/// or past them, one of a kind not seen yet (`translation_error_kind`). A retail title's 40 "MS
+/// in the AS slot" refusals, one per shader hash, used the 40 up in its first seconds, and the
+/// driver's E_OUTOFMEMORY for a translated compute PSO at its world loading left no trace.
+fn keep_translation_error(kept: &[String], e: &str) -> bool {
+    if kept.iter().any(|k| k == e) {
+        return false;
+    }
+    if kept.len() < 40 {
+        return true;
+    }
+    let kind = translation_error_kind(e);
+    kept.len() < 120 && !kept.iter().any(|k| translation_error_kind(k) == kind)
+}
+
+/// A translation error without its shader hashes (16 hex digits) and plain numbers: the kind of
+/// failure. HRESULTs (`0x…`) stay: a different one is a different failure.
+fn translation_error_kind(e: &str) -> String {
+    let mut out = String::with_capacity(e.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let hash = word.len() == 16 && word.bytes().all(|b| b.is_ascii_hexdigit());
+        let number = !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+        out.push_str(if hash || number { "#" } else { word });
+        word.clear();
+    };
+    for c in e.chars() {
+        if c.is_ascii_alphanumeric() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod translation_error_tests {
+    use super::*;
+
+    fn as_slot(i: u64) -> String {
+        format!("mesh pipeline with its MS {:016x} in the AS slot – refused", 0x1975_c2a6_e0fa_0b2a ^ i)
+    }
+
+    #[test]
+    fn a_new_kind_of_error_is_kept_after_forty_of_another() {
+        let mut kept: Vec<String> = (0..40).map(as_slot).collect();
+        // what used to be dropped: more of the same kind, and every other kind
+        assert!(!keep_translation_error(&kept, &as_slot(40)));
+        let oom = "the driver rejected the compute PSO with the translated CS (0x8007000e)";
+        assert!(keep_translation_error(&kept, oom));
+        kept.push(oom.into());
+        assert!(!keep_translation_error(&kept, oom));
+        // a different HRESULT is a different failure; a different size is not
+        assert!(keep_translation_error(&kept, "the driver rejected the compute PSO with the translated CS (0x80070057)"));
+        kept.push("CS: 1234 B of DXIL over the limit".into());
+        assert!(!keep_translation_error(&kept, "CS: 5678 B of DXIL over the limit"));
+    }
+
+    #[test]
+    fn the_first_forty_reasons_are_kept_as_before() {
+        let mut kept = Vec::new();
+        for i in 0..40 {
+            assert!(keep_translation_error(&kept, &as_slot(i)));
+            kept.push(as_slot(i));
+        }
+        assert!(!keep_translation_error(&kept[..10], &as_slot(3)), "a reason already kept is not kept twice");
+    }
+
+    #[test]
+    fn at_most_120_reasons_are_kept() {
+        let kept: Vec<String> = (0..120).map(|i| format!("kind {}", char::from(b'a' + (i % 26) as u8).to_string().repeat(1 + i / 26))).collect();
+        assert!(!keep_translation_error(&kept, "a kind never seen"));
+        assert!(keep_translation_error(&kept[..119], "a kind never seen"));
+    }
+
+    #[test]
+    fn a_kind_leaves_out_hashes_and_numbers_only() {
+        assert_eq!(translation_error_kind(&as_slot(0)), "mesh pipeline with its MS # in the AS slot – refused");
+        assert_eq!(translation_error_kind("MS: 128 vertices (0x8007000e) d7c434f73b4b811c"), "MS: # vertices (0x8007000e) #");
+        // a word of 16 letters that are hex digits too is a hash; shorter hex words are words
+        assert_eq!(translation_error_kind("CS: cafe face"), "CS: cafe face");
     }
 }
 
