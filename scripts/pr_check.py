@@ -37,6 +37,8 @@ COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
 # counts are checked where they are used), and those of them that are numbers
 SMOKE_FIELDS = ("title", "seconds", "frames shown")
 SMOKE_NUMBERS = ("seconds", "frames shown")
+# what smoke.ps1 writes as `frames shown` when the run did not reach its end (a crash)
+FRAMES_UNENDED = "none logged"
 
 
 def smoke_blocks(body):
@@ -58,13 +60,16 @@ def number(s):
     return int(m.group(1)) if m else None
 
 
-def field_problems(block, run):
+def field_problems(block, run, *, may_crash=False):
     """What `block` (the smoke block of `run`) lacks for the comparison: a missing line or a
-    number that is not one."""
+    number that is not one. `may_crash`: main's run, which may not have reached its end
+    (CONTRIBUTING.md: a PR that fixes a crash shows it there), so smoke.ps1's text for that
+    is accepted as its `frames shown`."""
     name = f"{run} regression run (`xcl-smoke` block of commit {(block.get('commit') or '?').split()[0]})"
     out = [f"{name} has no `{k}` line" for k in SMOKE_FIELDS if not block.get(k)]
     out += [f"{name} has a non-numeric `{k}`: {block[k]}" for k in SMOKE_NUMBERS
-            if block.get(k) and number(block[k]) is None]
+            if block.get(k) and number(block[k]) is None
+            and not (may_crash and k == "frames shown" and block[k].startswith(FRAMES_UNENDED))]
     return out
 
 
@@ -150,7 +155,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             if main:
                 m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
                 for b in [m] if m else main:
-                    problems += field_problems(b, "the main")
+                    problems += field_problems(b, "the main", may_crash=True)
                 if m is None:
                     problems.append("the main and PR regression runs are not of the same title for the same time")
                 else:

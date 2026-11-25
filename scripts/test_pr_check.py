@@ -102,6 +102,19 @@ class SmokeBlockTests(unittest.TestCase):
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
 
+    def test_main_run_that_crashed_before_its_end_passes(self):
+        # smoke.ps1's text when the run did not reach its end; a crash-fix PR shows it on main
+        unended = "frames shown: none logged (the run did not reach its end)\n"
+        main_run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 1\nexit: 0xc0000005\n" + unended
+        pr_run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        self.assertEqual([], self.smoke_problems(main_run, pr_run))
+
+    def test_pr_run_that_did_not_reach_its_end_still_fails(self):
+        run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
+        unended = "frames shown: none logged (the run did not reach its end)\n"
+        problems = self.smoke_problems(run + "frames shown: 100\n", run + unended)
+        self.assertTrue(any(p.startswith("the PR's") and "non-numeric `frames shown`" in p for p in problems), problems)
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):
