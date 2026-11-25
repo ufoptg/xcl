@@ -3956,8 +3956,17 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    // the GPU wrote the destination: a CPU upload of a kept-in-step texture must not follow it
+    super::title_textures::note_gpu_write(dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
+    let format = resolve_format(format);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+}
+
+/// The PC's form of a resolve's format, which is the target's *view* format and so may be one
+/// of the console's (its 116–120 are the depth family's).
+fn resolve_format(format: i32) -> i32 {
+    super::device_x::pc_target_format(format as u32) as i32
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -3965,9 +3974,11 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
+    let format = resolve_format(format);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
 }
 
@@ -4750,6 +4761,47 @@ mod tests {
                 ]
             );
         });
+    }
+
+    /// A resolve writes its destination with the GPU: it is marked so (a later CPU upload must
+    /// not overwrite it), and the format it names is the target's console view format, the
+    /// PC's form of which the driver gets.
+    #[test]
+    fn resolve_subresource_marks_the_destination_and_translates_the_format() {
+        #[repr(C)]
+        struct FakeCom {
+            vt: *const usize,
+        }
+        thread_local! {
+            static FORMATS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn fake_resolve(_t: *mut c_void, _dst: usize, _ds: u32, _src: usize, _ss: u32, format: i32) {
+            FORMATS.with(|f| f.borrow_mut().push(format));
+        }
+        unsafe extern "system" fn fake_resolve_region(_t: *mut c_void, _dst: usize, _ds: u32, _x: u32, _y: u32, _src: usize, _ss: u32, _r: *const windows::Win32::Foundation::RECT, format: i32, _m: i32) {
+            FORMATS.with(|f| f.borrow_mut().push(format));
+        }
+        let mut orig = [0usize; 70];
+        orig[PC_RESOLVE_SUBRESOURCE] = fake_resolve as usize;
+        orig[PC_RESOLVE_SUBRESOURCE_REGION] = fake_resolve_region as usize;
+        // (adopted objects keep their original vtable at ext[-1])
+        let ext = [orig.as_ptr() as usize, 0usize];
+        let mut list = FakeCom { vt: unsafe { ext.as_ptr().add(1) } };
+        let list = &mut list as *mut FakeCom as *mut c_void;
+        let before = crate::hle::d3d12x::title_textures::NOTE_GPU_WRITE_CALLS.load(Ordering::Relaxed);
+        unsafe {
+            resolve_subresource_x(list, 0x1111, 0, 0x2222, 0, 116);
+            resolve_subresource_region_x(list, 0x1111, 0, 0, 0, 0x2222, 0, std::ptr::null(), 116, 0);
+        }
+        FORMATS.with(|f| assert_eq!(*f.borrow(), vec![10, 10], "the console's D16S8 family is the PC's D24S8 on a resolve"));
+        assert_eq!(
+            crate::hle::d3d12x::title_textures::NOTE_GPU_WRITE_CALLS.load(Ordering::Relaxed),
+            before + 2,
+            "both resolves mark the destination GPU-written"
+        );
+        // a PC format is passed as it is
+        unsafe { resolve_subresource_x(list, 0x1111, 0, 0x2222, 0, 28) };
+        FORMATS.with(|f| assert_eq!(*f.borrow(), vec![10, 10, 28]));
     }
 
     /// SetDescriptorHeaps(0, NULL) unbinds every heap: the list must not still count the
