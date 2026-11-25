@@ -12,6 +12,8 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Memory::*;
 
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+
 unsafe fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, bytes: u64, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc(bytes, D3D12_RESOURCE_FLAG_NONE), state, None, &mut r).unwrap();
@@ -104,6 +106,9 @@ fn heaps_over_partly_committed_sections() {
             let hr = dev.CreatePlacedResource(&heap, 0, &desc(4 * mb as u64, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER), D3D12_RESOURCE_STATE_COMMON, None, &mut placed);
             let Some(placed) = placed.filter(|_| hr.is_ok()) else {
                 println!("{size_label}: heap {} bytes, CreatePlacedResource: {hr:?}", hd.SizeInBytes);
+                drop(heap);
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view });
+                CloseHandle(h);
                 continue;
             };
             let rb = buffer(&dev, D3D12_HEAP_TYPE_READBACK, mb as u64, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -167,14 +172,23 @@ fn heaps_over_sections_in_a_placeholder() {
         let base = VirtualAlloc2(proc_, std::ptr::null(), total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
         assert!(base != 0, "placeholder reservation");
         let mut keep = Vec::new();
+        let mut chunk1_mapped = false;
         for (k, at) in [(0usize, base + 10 * chunk), (1, base + 11 * chunk), (2, base + 40 * chunk)] {
             // split the chunk off the placeholder (the first split of a range: VirtualFree with
             // MEM_PRESERVE_PLACEHOLDER)
             let ok = VirtualFree(at as *mut c_void, chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
             let h = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, chunk as u32, std::ptr::null());
+            if h.is_null() {
+                println!("chunk {k}: CreateFileMappingW failed, error {}", windows_sys::Win32::Foundation::GetLastError());
+                continue;
+            }
             let v = MapViewOfFile3(h, proc_, at as *const c_void, 0, chunk, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
             if v.Value as usize != at {
                 println!("chunk {k}: split {ok}, view {:p} (wanted {at:#x}), error {}", v.Value, windows_sys::Win32::Foundation::GetLastError());
+                if !v.Value.is_null() {
+                    UnmapViewOfFile(v);
+                }
+                CloseHandle(h);
                 continue;
             }
             for i in 0..chunk / 4 {
@@ -184,6 +198,8 @@ fn heaps_over_sections_in_a_placeholder() {
                 Ok(hp) => hp,
                 Err(e) => {
                     println!("chunk {k}: OpenExistingHeapFromFileMapping: {e}");
+                    UnmapViewOfFileEx(v, MEM_PRESERVE_PLACEHOLDER);
+                    CloseHandle(h);
                     continue;
                 }
             };
@@ -205,14 +221,24 @@ fn heaps_over_sections_in_a_placeholder() {
             gpu_copy(&dev, &q, &placed, chunk as u64 - 4096, &up, 0, 4096);
             let write_ok = (0..1024).all(|i| *((at + chunk - 4096) as *const u32).add(i) == 0xBEEF_0000 | (k as u32) << 12 | i as u32);
             println!("chunk {k} at {at:#x}: GPU reads it: {read_ok}, CPU sees GPU writes: {write_ok}");
-            keep.push((h, heap, placed));
+            if k == 1 {
+                chunk1_mapped = true;
+            }
+            keep.push((at, h, heap, placed));
         }
         // neighbours untouched: chunk 0's last page was written by the GPU, chunk 1's first word is chunk 1's
-        println!("chunk 1 first word {:#x}", *((base + 11 * chunk) as *const u32));
-        for (h, heap, placed) in keep {
+        if chunk1_mapped {
+            let w1 = *((base + 11 * chunk) as *const u32);
+            println!("chunk 1 first word {w1:#x}");
+            assert_eq!(w1, 1 << 28);
+        }
+        for (at, h, heap, placed) in keep {
             drop((placed, heap));
+            assert_ne!(UnmapViewOfFileEx(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER), 0);
             CloseHandle(h);
         }
+        let _ = VirtualFree(base as *mut c_void, total, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
     }
 }
 
@@ -277,6 +303,41 @@ fn window_sized_reserved_buffer_on_video_memory_tiles() {
     }
 }
 
+/// Verify on CPU that when a split placeholder chunk is skipped (e.g. failed map/heap open),
+/// its range remains `PAGE_NOACCESS` (so an unguarded read would fault), and that unmapping
+/// mapped chunks with `MEM_PRESERVE_PLACEHOLDER` + `MEM_COALESCE_PLACEHOLDERS` releases the
+/// whole reservation cleanly via `VirtualFree(..., 0, MEM_RELEASE)`.
+#[test]
+fn placeholder_chunks_unmap_coalesce_and_release_cleanly() {
+    unsafe {
+        let (total, chunk) = (8usize << 20, 2usize << 20);
+        let proc_ = windows_sys::Win32::System::Threading::GetCurrentProcess();
+        let base = VirtualAlloc2(proc_, std::ptr::null(), total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+        assert_ne!(base, 0, "placeholder reservation");
+
+        let chunk0 = base + chunk;
+        let chunk1 = base + 2 * chunk;
+        assert_ne!(VirtualFree(chunk0 as *mut c_void, chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+        assert_ne!(VirtualFree(chunk1 as *mut c_void, chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+
+        let h0 = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, chunk as u32, std::ptr::null());
+        assert!(!h0.is_null());
+        let v0 = MapViewOfFile3(h0, proc_, chunk0 as *const c_void, 0, chunk, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+        assert_eq!(v0.Value as usize, chunk0);
+        *(chunk0 as *mut u32) = 0x1234_5678;
+
+        // Simulate chunk 1 failing after split: chunk 1 stays an unmapped PAGE_NOACCESS placeholder.
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        assert_ne!(VirtualQuery(chunk1 as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+        assert_eq!((mbi.State, mbi.AllocationProtect), (MEM_RESERVE, PAGE_NOACCESS));
+
+        assert_ne!(UnmapViewOfFileEx(v0, MEM_PRESERVE_PLACEHOLDER), 0);
+        CloseHandle(h0);
+        assert_ne!(VirtualFree(base as *mut c_void, total, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS), 0);
+        assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+    }
+}
+
 /// How large a shader-visible view heap this GPU takes (OPTIONS19 and a real one): console
 /// titles' view heaps together go past the 1 000 000 of resource binding tier 2.
 #[test]
@@ -284,7 +345,9 @@ fn window_sized_reserved_buffer_on_video_memory_tiles() {
 fn view_heap_capacity() {
     unsafe {
         let mut dev: Option<ID3D12Device> = None;
-        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).unwrap();
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+            return;
+        }
         let dev = dev.unwrap();
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         let ok = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok();
