@@ -279,3 +279,359 @@ fn graphics_stages_with_a_branch_before_their_exports() {
     assert_eq!(draw(&dvs, &dps, 0), cleared, "branch not taken");
     assert_eq!(draw(&dvs, &dps, 1), kept, "branch taken");
 }
+
+/// Geometry mode (ES+GS, the compute pass of `recomp::Mode::Geometry`): an ES that writes
+/// its vertex to the LDS ring, the GS that reads its triangle's vertices, writes them to
+/// its output area and emits a strip; split and native forms validate (also the ES or GS
+/// alone, as the coverage sweep translates them).
+#[test]
+fn geometry_mode_validates() {
+    use crate::gpu::recomp::GsInterface;
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut es = Vec::new();
+    // v20 = lane * ES item (16 B), ring[v20] = v9 (a fetched input)
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)]));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 256 + 20)]));
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 132), ("VSRC1", 20)]));
+    es.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 20), ("DATA0", 9)]));
+    es.extend(e("S_BARRIER", "ENC_SOPP", &[]));
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let mut gs = Vec::new();
+    // v0 = vertex 0's dword offset: read it, write 3 output vertices at s2 + lane * 48
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)]));
+    gs.extend(e("DS_READ_B32", "ENC_DS", &[("ADDR", 30), ("VDST", 31)]));
+    gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 32), ("SRC0", 193), ("SRC1", 128)]));
+    gs.extend(e("V_MUL_U32_U24", "ENC_VOP2", &[("VDST", 32), ("SRC0", 176), ("VSRC1", 32)]));
+    gs.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 2), ("VSRC1", 32)]));
+    for k in 0..3u64 {
+        gs.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 32), ("DATA0", 31), ("OFFSET0", 16 * k)]));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)]));
+    }
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)]));
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0)],
+        es_outputs: vec![sig("SV_Position", 1, 0)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es.clone();
+    code.extend_from_slice(&gs);
+    let mut es_end = es;
+    es_end.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let cases = [
+        ("ES+GS", code, g.clone()),
+        ("ES alone", es_end, GsInterface { gs_start: None, ..g.clone() }),
+        ("GS alone", gs, GsInterface { gs_start: Some(0), ..g }),
+    ];
+    for (name, code, g) in cases {
+        for split in [true, false] {
+            let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+        }
+    }
+}
+
+/// Exhaustive bit-exact check of the IEEE-754 bit-manipulation formula used by
+/// `lower_mem::uf_small_bits` for all 10-bit (mb=5) and 11-bit (mb=6) float inputs.
+#[test]
+fn uf_small_ieee_bit_math_matches_exact_formula() {
+    for mb in [5u32, 6u32] {
+        let p = 1u32 << mb;
+        let mmask = p - 1;
+        let mshift = 23 - mb;
+        let den_scale = f32::from_bits(if mb == 6 { 0x3580_0000 } else { 0x3600_0000 });
+        for v in 0..(1u32 << (mb + 5)) {
+            let e = v >> mb;
+            let m = v & mmask;
+            // Reference formula (matching HLSL `uf_small`)
+            let fm = (m as f32) / (p as f32);
+            let ref_f = if e == 31 {
+                f32::from_bits(if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 })
+            } else if e == 0 {
+                fm * (-14.0f32).exp2()
+            } else {
+                ((e as f32) - 15.0).exp2() * (1.0 + fm)
+            };
+            // Exact IEEE bit math
+            let got_bits = if e == 31 {
+                if m != 0 { 0x7FC0_0000 } else { 0x7F80_0000 }
+            } else if e == 0 {
+                ((m as f32) * den_scale).to_bits()
+            } else {
+                ((e + 112) << 23) | (m << mshift)
+            };
+            assert_eq!(got_bits, ref_f.to_bits(), "mb={mb} v={v:#x} (e={e} m={m})");
+        }
+    }
+}
+
+/// Multi-window switch dispatch, vector rawBufferLoad/Store, hoisted FormatLoad
+/// descriptors, single/multi-component FormatLoad, and hoisted BVH loads all pass
+/// DXIL validation across 1..=4 memory windows and wave configurations.
+#[test]
+fn multi_window_mem_format_and_bvh_validate() {
+    let code = prog(&[
+        // Load descriptor s[12:15] once, then reuse across repeated BUFFER_LOAD_FORMAT_X
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 12), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+        // Divergent EXEC so lane guards are active (non-constant `act`)
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        // Repeated single-component format loads sharing s[12:15] (exercises hoisted FmtComp1 + Load2)
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Sub-4 and full-4 component format loads + D16 + static MTBUF + small byte load
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 28), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        // Vector MUBUF & FLAT loads/stores
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORDX4", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("DATA", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+        ("GLOBAL_LOAD_USHORT", "ENC_FLAT_GLBL", &[("VDST", 24), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+        // BVH node intersection (box32 / box16 / tri hoisted vector loads)
+        ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 3), ("DMASK", 0xF)], None),
+    ]);
+    for windows in [1u32, 2, 3, 4] {
+        for (wave64, split) in [(true, false), (false, false)] {
+            translate(&code, KernelOptions { wave64, split, mem_windows: windows, sampler_base: 0 })
+                .unwrap_or_else(|e| panic!("w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            if windows > 1 {
+                translate(&code, KernelOptions { wave64, split, mem_windows: windows | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
+                    .unwrap_or_else(|e| panic!("heap w={windows} wave64={wave64}: {}", &e[..e.len().min(800)]));
+            }
+        }
+    }
+}
+
+/// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
+/// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
+/// the same S#, and validates.
+#[test]
+fn ps_get_lod_with_a_static_sampler() {
+    use crate::gpu::recomp::{Mode, PsInterface};
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 1 << 20 | 1 << 22, 0];
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for (k, &w) in linear.iter().enumerate() {
+        list.push(if w == 0 { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 128)], None) } else { ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 255)], Some(w)) });
+    }
+    // uv = (I, J) of the first barycentric pair (v0, v1); T# s[16:23], S# s[24:27]
+    list.push(("IMAGE_GET_LOD", "ENC_MIMG", vec![("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("IMAGE_SAMPLE", "ENC_MIMG", vec![("VDATA", 6), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None));
+    list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    }
+}
+
+// ------------------------------------------------------------ s_barrier (`group_barrier`)
+
+/// The `s_barrier` policy follows the recompiler's (`Em::configure_round_modes`): the kernel
+/// ABI keeps its group sync, one hardware wave fences, several get the safe barrier when the
+/// program has an `s_barrier` (unless `XCL_SAFE_BARRIER=0`).
+#[test]
+fn s_barrier_policy_matches_the_recompiler() {
+    use super::group_barrier::{policy, SBarrier};
+    assert_eq!(policy(true, None, 32, true), SBarrier::Sync, "kernel ABI");
+    assert_eq!(policy(true, None, 64, true), SBarrier::Sync, "kernel ABI");
+    for (threads, hw) in [(1, 32), (32, 32), (64, 64), (33, 64)] {
+        assert_eq!(policy(true, Some(threads), hw, true), SBarrier::Fence, "{threads} threads, wave{hw}");
+        assert_eq!(policy(false, Some(threads), hw, true), SBarrier::Fence, "{threads} threads, wave{hw}");
+    }
+    for (threads, hw) in [(33, 32), (64, 32), (128, 32), (128, 64), (1024, 64)] {
+        assert_eq!(policy(true, Some(threads), hw, true), SBarrier::Safe, "{threads} threads, wave{hw}");
+        assert_eq!(policy(true, Some(threads), hw, false), SBarrier::Sync, "XCL_SAFE_BARRIER=0: {threads} threads, wave{hw}");
+        assert_eq!(policy(false, Some(threads), hw, true), SBarrier::Sync, "no s_barrier: {threads} threads, wave{hw}");
+    }
+}
+
+fn cs(threads: [u32; 3]) -> crate::gpu::recomp::CsInterface {
+    crate::gpu::recomp::CsInterface { threads, user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 }
+}
+
+/// Disassembly of a compute translation (validated by `translate_compute` in tests).
+fn cs_dis(code: &[u8], wave64: bool, split: bool, threads: [u32; 3]) -> String {
+    let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_compute(code, o, &cs(threads))
+        .unwrap_or_else(|e| panic!("wave64 {wave64} split {split} {threads:?}: {}", &e[..e.len().min(1500)]));
+    super::validate::disassemble(&k.dxil).unwrap()
+}
+
+/// `Barrier(mode)` calls (`ops::barrier`: 9 = group sync, 8 = group-shared fence).
+fn barriers(dis: &str, mode: u32) -> usize {
+    dis.matches(&format!("@dx.op.barrier(i32 80, i32 {mode})")).count()
+}
+
+/// Group-shared atomics that leave the live count (`atomicrmw add .., i32 -1`).
+fn alive_decrements(dis: &str) -> usize {
+    dis.lines().filter(|l| l.contains("atomicrmw add") && l.contains("i32 -1")).count()
+}
+
+fn gs_globals(dis: &str) -> Vec<&str> {
+    dis.lines().filter(|l| l.contains("addrspace(3) global")).collect()
+}
+
+const S_BARRIER: (&str, &str, &[(&str, u64)], Option<u32>) = ("S_BARRIER", "ENC_SOPP", &[], None);
+
+/// (wave64, split, threads) of thread groups of several hardware waves: wave32, native
+/// wave64, split wave64 with one console wave (two hardware halves) and with several.
+const MULTI_WAVE: [(bool, bool, [u32; 3]); 6] = [
+    (false, false, [64, 1, 1]),
+    (false, false, [8, 8, 1]),
+    (true, false, [128, 1, 1]),
+    (true, true, [64, 1, 1]),
+    (true, true, [128, 1, 1]),
+    (false, false, [256, 1, 1]),
+];
+
+/// Programs without `s_barrier` pay nothing for the safe barrier: no live count, no
+/// arrival loop, no extra group-shared words.
+#[test]
+fn programs_without_s_barrier_have_no_safe_barrier() {
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        let dis = cs_dis(&code, wave64, split, threads);
+        assert!(!dis.contains("cmpxchg"), "wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        assert_eq!(alive_decrements(&dis), 0, "wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        if !split {
+            assert!(gs_globals(&dis).iter().all(|g| !g.contains("[2 x i32]")), "wave64 {wave64} {threads:?}:\n{dis}");
+        }
+    }
+    // with LDS: the program keeps the whole block (no clamp below the top words)
+    let lds = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None)]);
+    let dis = cs_dis(&lds, false, false, [64, 1, 1]);
+    assert!(!dis.contains("8188"), "{dis}");
+}
+
+/// Several hardware waves and an `s_barrier`: the live count is set up at entry (two group
+/// syncs, every thread present), the `s_barrier` is the bounded arrival barrier (fences and
+/// a compare-exchange, no group sync of its own), and the wave leaves the count once at the
+/// end (and on giving up).
+#[test]
+fn multi_wave_s_barrier_is_early_exit_safe() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let base = prog(&[]);
+    let one = prog(&[S_BARRIER]);
+    let two = prog(&[S_BARRIER, ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None), S_BARRIER]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let b = cs_dis(&base, wave64, split, threads);
+        for (code, n) in [(&one, 1), (&two, 2)] {
+            let dis = cs_dis(code, wave64, split, threads);
+            assert_eq!(barriers(&dis, 9), barriers(&b, 9) + 2, "{at}: only the entry's two group syncs:\n{dis}");
+            assert_eq!(barriers(&dis, 8), barriers(&b, 8) + 2 * n, "{at}: two fences per s_barrier:\n{dis}");
+            assert_eq!(dis.matches("cmpxchg").count(), 2 * n, "{at}: open the next generation, or on giving up:\n{dis}");
+            assert_eq!(alive_decrements(&dis), 1 + n, "{at}: one decrement at the end, one per give-up path:\n{dis}");
+            if !split {
+                assert_eq!(gs_globals(&dis).iter().filter(|g| g.contains("[2 x i32]")).count(), 1, "{at}: the two words of their own:\n{dis}");
+            }
+        }
+    }
+}
+
+/// `s_endpgm` before the `s_barrier`, and a loop around it (whose budget may run out): every
+/// way out goes through the one decrement.
+#[test]
+fn safe_barrier_decrements_on_every_exit() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let early_end = prog(&[
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        S_BARRIER,
+    ]);
+    let looped = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
+        S_BARRIER,
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 132)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None),
+    ]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        for (name, code) in [("early s_endpgm", &early_end), ("loop", &looped)] {
+            let dis = cs_dis(code, wave64, split, threads);
+            assert_eq!(alive_decrements(&dis), 2, "{name}, wave64 {wave64} split {split} {threads:?}:\n{dis}");
+            assert_eq!(dis.matches("cmpxchg").count(), 2, "{name}, wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        }
+    }
+}
+
+/// One hardware wave: `s_barrier` is a group-shared fence (nothing to wait for), no live
+/// count.
+#[test]
+fn single_wave_s_barrier_is_a_fence() {
+    let base = prog(&[]);
+    let code = prog(&[S_BARRIER]);
+    for (wave64, split, threads) in [(false, false, [32, 1, 1]), (true, false, [64, 1, 1]), (false, false, [16, 1, 1]), (true, true, [32, 1, 1])] {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let b = cs_dis(&base, wave64, split, threads);
+        let dis = cs_dis(&code, wave64, split, threads);
+        assert_eq!(barriers(&dis, 9), barriers(&b, 9), "{at}: no group sync:\n{dis}");
+        assert_eq!(barriers(&dis, 8), barriers(&b, 8) + 1, "{at}: one fence:\n{dis}");
+        assert!(!dis.contains("cmpxchg"), "{at}:\n{dis}");
+        assert_eq!(alive_decrements(&dis), 0, "{at}:\n{dis}");
+    }
+}
+
+/// The kernel ABI (one console wave, as the HLSL kernel) keeps its group sync.
+#[test]
+fn kernel_s_barrier_stays_a_group_sync() {
+    let base = prog(&[]);
+    let code = prog(&[S_BARRIER]);
+    for (wave64, split) in [(false, false), (true, false), (true, true)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let b = super::validate::disassemble(&translate(&base, o).unwrap()).unwrap();
+        let dis = super::validate::disassemble(&translate(&code, o).unwrap()).unwrap();
+        assert_eq!(barriers(&dis, 9), barriers(&b, 9) + 1, "wave64 {wave64} split {split}:\n{dis}");
+        assert!(!dis.contains("cmpxchg"), "wave64 {wave64} split {split}:\n{dis}");
+    }
+}
+
+/// With LDS the safe barrier's words are the top of the one 32 KB block (8189, 8190; the
+/// split form's lane counter keeps 8191, its exchange moves below): no second group-shared
+/// array past the D3D12 limit, and the program's accesses stop below them.
+#[test]
+fn safe_barrier_words_live_in_the_lds_block() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let code = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        S_BARRIER,
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 1), ("VDST", 2)], None),
+    ]);
+    for (wave64, split, threads) in [(false, false, [64, 1, 1]), (true, false, [128, 1, 1]), (false, false, [8, 8, 1])] {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let dis = cs_dis(&code, wave64, split, threads);
+        let g = gs_globals(&dis);
+        assert_eq!(g.len(), 1, "{at}: only the LDS block:\n{dis}");
+        assert!(g[0].contains("[8192 x i32]"), "{at}:\n{dis}");
+        assert!(dis.contains("i32 8188"), "{at}: accesses clamped below the barrier words:\n{dis}");
+        assert!(dis.contains("i32 8189") && dis.contains("i32 8190"), "{at}:\n{dis}");
+    }
+    for threads in [[64, 1, 1], [128, 1, 1]] {
+        let dis = cs_dis(&code, true, true, threads);
+        let g = gs_globals(&dis);
+        assert_eq!(g.len(), 1, "split {threads:?}: only the LDS block:\n{dis}");
+        assert!(g[0].contains("[8192 x i32]"), "split {threads:?}:\n{dis}");
+        assert!(dis.contains("i32 8189") && dis.contains("i32 8190") && dis.contains("i32 8191"), "split {threads:?}:\n{dis}");
+    }
+}

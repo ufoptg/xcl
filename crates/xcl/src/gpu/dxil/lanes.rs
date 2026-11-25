@@ -28,7 +28,7 @@ impl Lw {
                 // HLSL: exchange base = 8192 - slots - counters - 1 (slots = 4 · slot per console
                 // wave, 2 counters each); the program's LDS stops below it
                 let slots = 4 * self.xslot * self.waves;
-                let base = 8192 - slots - 2 * self.waves - 1;
+                let base = 8192 - slots - 2 * self.waves - 1 - self.bar_lds_words();
                 self.lds_top = base - 1;
                 self.xs = Some((g, base));
                 self.xc = Some((g, base + slots));

@@ -16,12 +16,15 @@ pub mod cfg;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
+mod group_barrier;
 pub mod kernel;
 mod lanes;
 pub mod lower;
+mod lower_geom;
 mod lower_gfx;
 mod lower_image;
 mod lower_mem;
+mod lower_round;
 mod lower_valu;
 mod lower_wide;
 mod lower_window;
@@ -43,3 +46,11 @@ mod ops_tests;
 mod bitreader_tests;
 #[cfg(test)]
 mod robustness_tests;
+#[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
+mod msaa_tests;
+#[cfg(test)]
+mod round_tests;
+#[cfg(test)]
+mod geometry_tests;
