@@ -181,12 +181,11 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     mirror_program_through_the_hook(&dev);
 }
 
-/// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
-/// pipeline it built and check every thread's output.
-fn mirror_program_through_the_hook(dev: &ID3D12Device) {
-    // user SGPRs 2, TGID_X + TGID_Y, thread ids v0 + v1
-    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
-    assert!(xcl::gpu::xbox::is_xbox(&blob), "expected a console container");
+// User SGPRs 2, TGID_X + TGID_Y, thread ids v0 + v1.
+const MIRROR_RSRC2: u32 = 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11;
+const MIRROR_THREADS: [u32; 3] = [16, 8, 1];
+
+fn create_compute_pso(dev: &ID3D12Device, blob: &[u8]) -> ID3D12PipelineState {
     let game_rs: ID3D12RootSignature = unsafe {
         let mut ser = None;
         D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
@@ -198,18 +197,31 @@ fn mirror_program_through_the_hook(dev: &ID3D12Device) {
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
         ..Default::default()
     };
-    let before = real::stats();
     let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
-    let pso = pso.expect("CreateComputePipelineState through the backend hook");
+    pso.expect("CreateComputePipelineState through the backend hook")
+}
+
+/// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
+/// pipeline it built and check every thread's output.
+fn mirror_program_through_the_hook(dev: &ID3D12Device) {
+    let blob = console_cs(&program(), MIRROR_RSRC2, MIRROR_THREADS);
+    assert!(xcl::gpu::xbox::is_xbox(&blob), "expected a console container");
+    let before = real::stats();
+    let pso = create_compute_pso(dev, &blob);
     // built in the background behind a stand-in when its shader was not compiled yet
-    let real_raw = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+    let real_raw = pso_async::resolve_wait(pso.as_raw() as usize);
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shader: {:?}", after.translation_errors);
+    check_mirror_dispatch(dev, real_raw);
+}
+
+fn check_mirror_dispatch(dev: &ID3D12Device, real_raw: usize) {
     assert!(
-        real::is_translated_compute(real_raw as usize),
+        real::is_translated_compute(real_raw),
         "resolved compute PSO must be registered in TRANSLATED_COMPUTE"
     );
+    let real_raw = real_raw as *mut std::ffi::c_void;
     let pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&real_raw) }.unwrap().clone();
     let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
@@ -351,4 +363,199 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     // Releasing the stand-in must release and forget the background-built real PSO too.
     drop(pso);
     assert!(!real::is_translated_compute(real_raw), "forgetting released async compute PSO must clean up TRANSLATED_COMPUTE");
+}
+
+fn mirror_fspx(code: &[u8]) -> Vec<u8> {
+    // ACCC/FSPX is recognized as console compute bytecode, but only HLSL translates it.
+    let body_len = 0x24 + code.len() as u32;
+    let mut part = b"FSPX".to_vec();
+    for word in [1, 2, 0x4C + body_len, 0, 0x30, 0x1C, 0, 6, 0x4C, body_len, 0] {
+        le(&mut part, word);
+    }
+    part.resize(0x4C + 0x24, 0);
+    for (i, n) in MIRROR_THREADS.into_iter().enumerate() {
+        let offset = 0x3C + 2 * i;
+        part[offset..offset + 2].copy_from_slice(&(n as u16).to_le_bytes());
+    }
+    part[0x48..0x4C].copy_from_slice(&MIRROR_RSRC2.to_le_bytes());
+    part.extend_from_slice(code);
+
+    let mut blob = b"DXBC".to_vec();
+    blob.resize(20, 0);
+    for word in [
+        1,
+        44 + part.len() as u32,
+        1,
+        36,
+        u32::from_le_bytes(*b"ACCC"),
+        part.len() as u32,
+    ] {
+        le(&mut blob, word);
+    }
+    blob.extend(part);
+    blob
+}
+
+#[test]
+fn direct_compute_pso_cached_only() {
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use xcl::gpu::dxil::coverage::fallback_summary;
+    use xcl::gpu::recomp::{
+        dxc,
+        pso::{console_to_dxil_in, Stage},
+    };
+
+    const CASE: &str = "XCL_TEST_DIRECT_COMPUTE_CHILD";
+    let Ok(case) = std::env::var(CASE) else {
+        // Backend selection and the disk cache namespace are process-wide.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        struct TempCache(PathBuf);
+        impl Drop for TempCache {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let cache = TempCache(std::env::temp_dir().join(format!("xcl-direct-probe-{}-{nonce}", std::process::id())));
+        let exe = std::env::current_exe().unwrap();
+        for case in ["probe", "cold", "disk hit", "no cache", "lazy", "sync"] {
+            let mut child = Command::new(&exe);
+            child
+                .args(["--exact", "direct_compute_pso_cached_only", "--nocapture"])
+                .env(CASE, case)
+                .env("XCL_DIRECT_DXIL", "1")
+                .env("XCL_ASYNC_PSO", if case == "sync" { "0" } else { "1" })
+                .env("XCL_LAZY_PSO", if case == "lazy" { "1" } else { "0" })
+                .env("XCL_PSO_WAIT_MS", "0")
+                .env("XCL_HUGE_PSO_BYTES", "262144")
+                .env("XCL_HEAP_WINDOWS", "0")
+                .env("XCL_PSO_DISK_CACHE", "0")
+                .env("XCL_TRANSLATED_CACHE", if case == "no cache" { "0" } else { "1" })
+                .env(
+                    "XCL_DXIL_CACHE",
+                    cache.0.join(if case == "disk hit" { "cold" } else { case }),
+                );
+            for name in [
+                "XCL_RECOMP_NO_STRUCTURED",
+                "XCL_RECOMP_WHY",
+                "XCL_X64_ALL_MASKS",
+                "XCL_WAVE64_SPIN",
+            ] {
+                child.env_remove(name);
+            }
+            if case == "no cache" {
+                child.env("XCL_RECOMP_NO_STRUCTURED", "1"); // also bypasses the RAM translation cache
+            }
+            let output = child.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{case} ({}): {}\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            );
+            if let Some(reason) = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("SKIPPED direct_compute_pso_cached_only: "))
+            {
+                runner::skip_test(reason);
+                return;
+            }
+        }
+        return;
+    };
+
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    assert!(xcl::gpu::dxil::kernel::enabled());
+    let code = program();
+    let blob = console_cs(&code, MIRROR_RSRC2, MIRROR_THREADS);
+    if case == "probe" {
+        let (result, missed) = dxc::cached_only(|| console_to_dxil_in(&blob, Stage::Compute, 0, true, 1));
+        assert!(
+            result.is_err() && missed,
+            "cold direct translation ran in the cache probe: {}",
+            fallback_summary()
+        );
+        assert!(
+            !fallback_summary().contains("CS direct"),
+            "the probe recorded a translation or fallback"
+        );
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no wave64");
+        return;
+    }
+
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+    let alloc: ID3D12CommandAllocator = unsafe { dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE) }.unwrap();
+    let list: ID3D12GraphicsCommandList =
+        unsafe { dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None) }.unwrap();
+    let pso = create_compute_pso(dev, &blob);
+    let raw = pso.as_raw() as usize;
+    let inline = case == "sync" || case == "disk hit";
+    assert_eq!(
+        real::is_translated_compute(raw),
+        inline,
+        "{case}: unexpected pipeline at CreateComputePipelineState return ({})",
+        fallback_summary()
+    );
+    if case == "lazy" {
+        assert!(pso_async::is_pending(raw), "lazy PSO built before first use");
+    }
+    // Use the title's first bind before the test resolves the stand-in itself.
+    unsafe { list.SetPipelineState(&pso) };
+    assert!(
+        !pso_async::is_pending(raw),
+        "first bind returned before the build finished"
+    );
+    let ready = pso_async::resolve(raw);
+    assert_eq!(
+        ready == raw,
+        inline,
+        "{case}: first bind did not resolve the expected PSO"
+    );
+    unsafe { list.Close() }.unwrap();
+    drop(list);
+    check_mirror_dispatch(dev, ready);
+    let summary = fallback_summary();
+    if case == "disk hit" {
+        assert!(!summary.contains("CS direct"), "disk hit reran translation: {summary}");
+    } else {
+        assert!(summary.contains("CS direct 1 / HLSL fallback 0"), "{summary}");
+    }
+
+    if case == "no cache" {
+        let cache = PathBuf::from(std::env::var_os("XCL_DXIL_CACHE").unwrap());
+        assert!(!cache.join("translated").exists());
+    }
+    if case == "cold" {
+        let warm = create_compute_pso(dev, &blob);
+        let warm_raw = warm.as_raw() as usize;
+        assert!(
+            real::is_translated_compute(warm_raw),
+            "RAM hit must return the translated PSO"
+        );
+        assert_eq!(fallback_summary(), summary, "RAM hit reran translation");
+        check_mirror_dispatch(dev, warm_raw);
+
+        let fallback = create_compute_pso(dev, &mirror_fspx(&code));
+        let raw = fallback.as_raw() as usize;
+        assert!(!real::is_translated_compute(raw), "HLSL fallback ran in the probe");
+        check_mirror_dispatch(dev, pso_async::resolve_wait(raw));
+        assert!(fallback_summary().contains("CS direct 1 / HLSL fallback 1"));
+    }
 }

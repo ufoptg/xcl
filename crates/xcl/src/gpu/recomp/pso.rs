@@ -345,6 +345,11 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+        // The PSO probe already checked the translation caches. Direct DXIL would otherwise
+        // compile here without reaching the DXC cache's cached-only check.
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
