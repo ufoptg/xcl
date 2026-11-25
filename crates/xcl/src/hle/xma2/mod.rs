@@ -1565,12 +1565,13 @@ impl StreamDecoder {
 
             if num_bits_prev_frame > 0 {
                 let remaining_packet_bits = buf_bit_size.saturating_sub(pgb.bits_count());
+                let continuation_complete = num_bits_prev_frame <= remaining_packet_bits;
                 if num_bits_prev_frame >= remaining_packet_bits {
                     num_bits_prev_frame = remaining_packet_bits;
                     self.packet_done = true;
                 }
                 self.save_bits(&mut pgb, num_bits_prev_frame, true);
-                if !self.packet_loss {
+                if !self.packet_loss && continuation_complete {
                     let (_, gf) = self.decode_frame(out_frame);
                     got_frame = gf;
                 }
@@ -1896,6 +1897,38 @@ impl Decoder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_continuation_remains_buffered_for_the_next_packet() {
+        let mut decoder = StreamDecoder::new(Version::Xma2, 1, 48_000);
+        decoder.packet_loss = false;
+        decoder.packet_done = true;
+        decoder.reservoir.put_bits(15, 300);
+        decoder.num_saved_bits = 15;
+        let mut packet = BitWriter::new();
+        packet.put_bits(6, 0);
+        packet.put_bits(15, 200); // more continuation bits than fit in this packet
+        packet.put_bits(3, 0);
+        packet.put_bits(8, 0);
+        let mut output = [[0.0; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM];
+        let result = decoder.decode_packet_step(&packet.buf[..16], &mut output);
+        assert_eq!(result, Ok((16, false)));
+        assert_eq!(decoder.num_saved_bits, 15 + 96);
+        assert_eq!(decoder.reservoir.bit_pos, 15 + 96);
+        assert!(decoder.packet_done);
+        assert!(!decoder.packet_loss);
+
+        let mut next = BitWriter::new();
+        next.put_bits(6, 0);
+        next.put_bits(15, 104); // 200 - 96: this packet still cannot finish the frame
+        next.put_bits(3, 0);
+        next.put_bits(8, 0);
+        assert_eq!(decoder.decode_packet_step(&next.buf[..16], &mut output), Ok((16, false)));
+        assert_eq!(decoder.num_saved_bits, 15 + 2 * 96);
+        assert_eq!(decoder.reservoir.bit_pos, 15 + 2 * 96);
+        assert!(decoder.packet_done);
+        assert!(!decoder.packet_loss);
+    }
 
     // FFmpeg-verified synthetic XMA2/XMA1 test packets (copyright-free spectral tones;
     // zero-padded to 2048-byte packets). Every vector's output was cross-checked against
