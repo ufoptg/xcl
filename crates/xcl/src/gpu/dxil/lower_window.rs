@@ -28,9 +28,14 @@ impl Lw {
 
     /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`).
     fn uma_base(&mut self) -> Value {
-        let io = self.init.io.expect("io");
-        let off = self.c(crate::gpu::recomp::IO_UMA_BASE_HI as u32 * 4);
-        self.s.raw_load(io, off, 1)[0]
+        *self.uma_base_hi.get_or_insert_with(|| {
+            let current = self.s.m.current_block();
+            self.s.m.set_block(self.init.entry);
+            let off = self.s.m.i32c(crate::gpu::recomp::IO_UMA_BASE_HI as u32 * 4);
+            let base = self.s.raw_load(self.init.io.expect("io"), off, 1)[0];
+            self.s.m.set_block(current);
+            base
+        })
     }
 
     /// Selects the window of an access whose 64-bit effective address is `hi:lo` plus
@@ -41,6 +46,15 @@ impl Lw {
     pub fn window_at(&mut self, hi: Value, lo: Value, adds: &[Ea], write: bool) {
         if !self.windowed() {
             return;
+        }
+        // With no displacement, the low dword cannot carry into the window selector.
+        let zero = |v| self.s.m.const_u64(v) == Some(0);
+        if adds.iter().all(|term| match *term {
+            Ea::K(k) => k == 0,
+            Ea::U(v) | Ea::S(v) => zero(v),
+            Ea::Mul(a, b) => zero(a) || zero(b),
+        }) {
+            return self.window_hi(hi, write);
         }
         let mut ea = self.pack64(lo, hi);
         for &t in adds {
@@ -62,6 +76,10 @@ impl Lw {
     /// `window_at` of a high dword already computed (`window_read` / `window_write`).
     pub fn window_hi(&mut self, hi: Value, write: bool) {
         if !self.windowed() {
+            return;
+        }
+        if !write && self.s.m.const_u64(hi) == Some(0) {
+            self.wr(VAR_WIN, hi);
             return;
         }
         let base = self.uma_base();

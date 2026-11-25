@@ -145,6 +145,8 @@ pub struct Lw {
     pub half: Value,
     /// the memory windows `mem`, `mem1`.. (u2..)
     pub mems: Vec<RawUav>,
+    /// The immutable ABI window base loaded in the entry block on first use.
+    pub uma_base_hi: Option<Value>,
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,

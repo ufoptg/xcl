@@ -3338,7 +3338,8 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let windows = 4;
+    let arena = crate::gpu::uma::Uma::with_windows(windows, 1 << 20).unwrap();
     let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
     assert_eq!(w1 - w0, 1 << 32);
     let base_hi = (w0 >> 32) as u32;
@@ -3357,6 +3358,16 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     *word(w0 + 0x4000) = 0xABCD_0123; // 32-bit hi=0 descriptor-table style read target
     *word(w1 + 0x5000) = 0x5566_7788; // valid strided V# buffer_load target
     *word(w1 + 0x0010) = 0x99AA_BBCC; // 64-bit carry target: (w0 + 0xFFFF_FFF0) + 0x20 == w1 + 0x10
+    *word(w1 + 0x18) = CANARY1;
+    *word(w1 + 0x14) = 0xfe;
+    *word(w1 + 0x1c) = CANARY1;
+    let counter = |win: usize, lane: usize| arena.window(win).0 as u64 + 0x7000 + 4 * lane as u64;
+    let initial = |win: usize, lane: usize| (win * 1000 + lane + 1) as u32;
+    for win in 0..windows {
+        for lane in 0..64 {
+            *word(counter(win, lane)) = initial(win, lane);
+        }
+    }
 
     let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         (n, "ENC_FLAT_GLBL", f.iter().map(|&(a, b)| (unsafe { std::mem::transmute::<&str, &'static str>(a) }, b)).collect(), None)
@@ -3385,13 +3396,24 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
         glbl("GLOBAL_LOAD_DWORD", &[("VDST", 17), ("ADDR", 16), ("SADDR", 20), ("OFFSET", 0)]),
         // 11. 64-bit signed borrow out of UMA: s[22:23] = w0 + 0x0 + (-16) -> (base_hi - 1, 0xFFFF_FFF0) -> dropped, reads 0 (v18)
         glbl("GLOBAL_LOAD_DWORD", &[("VDST", 18), ("ADDR", 0), ("SADDR", 22), ("OFFSET", 0xFF0)]),
+        glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 35), ("ADDR", 32), ("DATA", 34), ("SADDR", 0x7D), ("GLC", 1)]),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", vec![("VDATA", 39), ("VADDR", 38), ("SRSRC", 11), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 20)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 1), ("VADDR", 38), ("SRSRC", 11), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 28)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", vec![("VDATA", 41), ("VADDR", 38), ("SRSRC", 12), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
+        // Read the crossing halfword twice at the same instruction, shrinking the
+        // descriptor from 64 to 0 between iterations. Keep both results observable.
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 43), ("SRC0", V + 42)], None),
+        ("BUFFER_LOAD_USHORT", "ENC_MUBUF", vec![("VDATA", 42), ("SRSRC", 13), ("SOFFSET", 128), ("OFFSET", 3)], None),
+        ("S_SUB_U32", "ENC_SOP2", vec![("SDST", 54), ("SSRC0", 54), ("SSRC1", 192)], None),
+        ("S_CBRANCH_SCC0", "ENC_SOPP", vec![("SIMM16", 0xfffb)], None), // repeat until subtraction borrows
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mem_windows: windows as u32, heap_windows: heap, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
-    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil);
+    let dxil = direct_or(&p, &opt, hlsl_dxil);
 
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[0x1000, base_hi + 4]); // s[2:3]: out-of-UMA hi = base_hi + 4
@@ -3401,7 +3423,11 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     st.sgpr[16..20].copy_from_slice(&[0x3000, ((base_hi + 4) & 0xFFFF) | (4 << 16), 64, 0]); // out-of-UMA atomic V# (aliases w0 under & 3)
     st.sgpr[20..22].copy_from_slice(&[0xFFFF_FFF0, base_hi]); // carry base
     st.sgpr[22..24].copy_from_slice(&[0, base_hi]); // borrow base (0 - 16 borrows into base_hi - 1)
-    for r in st.vgpr.iter_mut() {
+    st.sgpr[44..48].copy_from_slice(&[0, base_hi, 64, 0]);
+    st.sgpr[48..52].copy_from_slice(&[0x20, base_hi, 64, 0]);
+    st.sgpr[52..56].copy_from_slice(&[0x10, base_hi + 1, 64, 0]);
+    st.sgpr[126..128].fill(0x5555_5555);
+    for (lane, r) in st.vgpr.iter_mut().enumerate() {
         r[0] = 0; // index 0
         r[1] = 0xBAD0_DEAD; // poison value to store
         r[2] = 0x7777_7777; // sentinel overwritten to 0 by out-of-UMA buffer_load
@@ -3418,6 +3444,14 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
         r[13] = 0xFFFF_FFFF; // out-of-UMA global_atomic_inc CAS loop
         r[16] = 0x20; // carry offset: 0xFFFF_FFF0 + 0x20 = 0x1_0000_0010 -> w1 + 0x10
         r[18] = 0x7777_7777;
+        r[32] = 0x7000 + 4 * lane as u32;
+        r[33] = base_hi + ((lane / 2) % (windows + 1)) as u32;
+        r[34] = 1;
+        r[35] = 0x7777_7777;
+        // Lane zero crosses 4 GiB into valid memory beyond the 64-byte descriptor.
+        r[38] = if lane == 0 { u32::MAX - 3 } else { 64 };
+        r[39] = 0x7777_7777;
+        r[41] = 7;
     }
 
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
@@ -3430,6 +3464,18 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     assert_eq!(r.vgpr[0][14], 0, "out-of-UMA buffer_atomic_add GLC must return 0");
     assert_eq!(r.vgpr[0][17], 0x99AA_BBCC, "64-bit carry global_load must cross from w0 into w1");
     assert_eq!(r.vgpr[0][18], 0, "64-bit signed borrow below window 0 must be rejected and read 0");
+    assert_eq!((r.vgpr[0][43], r.vgpr[0][42]), (0xfe99, 0), "crossing halfword, then zero after the descriptor shrinks");
+    assert_eq!((r.vgpr[0][39], *word(w1 + 0x18), r.vgpr[0][41], *word(w1 + 0x1c)), (0, CANARY1, 0, CANARY1),
+        "descriptor offset or access width wrapping across 4 GiB must reject the load, store and atomic");
+    for lane in 0..64 {
+        let selected = (lane / 2) % (windows + 1);
+        let active = lane % 2 == 0;
+        let expected = if !active { st.vgpr[lane][35] } else if selected < windows { initial(selected, lane) } else { 0 };
+        assert_eq!(r.vgpr[lane][35], expected, "atomic return for lane {lane}");
+        for win in 0..windows {
+            assert_eq!(*word(counter(win, lane)), initial(win, lane) + u32::from(active && win == selected), "window {win}, lane {lane}");
+        }
+    }
 
     assert_eq!(*word(w0 + 0x1000), CANARY0, "out-of-UMA global_store must not clobber w0");
     assert_eq!(*word(w1 + 0x1000), CANARY1, "out-of-UMA buffer_store must not clobber w1");

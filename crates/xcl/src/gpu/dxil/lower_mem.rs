@@ -205,6 +205,53 @@ impl Lw {
         }
         r
     }
+    /// A byte always fits in one aligned word. A halfword needs the next word
+    /// only when it starts in the last byte of the first.
+    fn buffer_subword(&mut self, a: Value, bytes: u32, in_range: Value) -> LResult<Value> {
+        let zero = self.c(0);
+        // Clamp invalid accesses before the read, then mask their result. Like
+        // dword loads this avoids a separate branch around each buffer access.
+        let a = self.sel(in_range, a, zero);
+        let word = self.mem_ld(a);
+        let byte = self.andc(a, 3);
+        let shift = self.shlc(byte, 3);
+        let low = self.bin(BinOp::LShr, word, shift);
+        let low = self.sel(in_range, low, zero);
+        if bytes == 1 {
+            return Ok(low);
+        }
+        let slot = self.tmp_var();
+        self.wr(slot, low);
+        let crosses = self.cmpc(Pred::Eq, byte, 3);
+        self.guarded(crosses, &mut |lw| {
+            let next = lw.addc(a, 1);
+            let next_word = lw.mem_ld(next);
+            let high = lw.shlc(next_word, 8);
+            let result = lw.or(low, high);
+            lw.wr(slot, result);
+            Ok(())
+        })?;
+        Ok(self.rd(slot))
+    }
+
+    /// An invalid buffer descriptor returns zero before issuing the unaligned reads.
+    fn checked_ld_raw(&mut self, a: Value, in_range: Value) -> LResult<[Value; 4]> {
+        let zero = self.c(0);
+        let slots: [u32; 4] = std::array::from_fn(|_| {
+            let slot = self.tmp_var();
+            self.wr(slot, zero);
+            slot
+        });
+        self.guarded(in_range, &mut |lw| {
+            let words = lw.ld_raw(a);
+            for (slot, word) in slots.into_iter().zip(words) {
+                lw.wr(slot, word);
+            }
+            Ok(())
+        })?;
+        Ok(slots.map(|slot| self.rd(slot)))
+    }
+
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
         let nm = self.not(m);
@@ -694,6 +741,21 @@ impl Lw {
 
     // ------------------------------------------------------------ MUBUF / MTBUF
 
+    /// A byte-addressed descriptor bounds the complete offset, even when the
+    /// physical effective address is inside a different bound window.
+    fn buffer_bytes_in_range(&mut self, voff: Value, off: Value, bytes: Value, records: Value) -> Value {
+        let end = self.add(off, bytes);
+        let valid = self.cmp(Pred::ULe, end, records);
+        if !self.windowed() {
+            return valid;
+        }
+        // off = voff + immediate. Reject carry from either unsigned addition.
+        let offset_fits = self.cmp(Pred::UGe, off, voff);
+        let end_fits = self.cmp(Pred::UGe, end, off);
+        let fits = self.land(offset_fits, end_fits);
+        self.land(valid, fits)
+    }
+
     pub fn mubuf(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         if name.starts_with("buffer_atomic_") {
             return self.buffer_atomic(d, name);
@@ -737,8 +799,7 @@ impl Lw {
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let idx_ok = self.cmp(Pred::ULt, index, d2);
         let in_range = |lw: &mut Lw, bytes: Value| -> Value {
-            let e = lw.add(off, bytes);
-            let ok = lw.cmp(Pred::ULe, e, d2);
+            let ok = lw.buffer_bytes_in_range(voff, off, bytes, d2);
             lw.sel(szero, ok, idx_ok)
         };
         if let Some((n, signed, store, half)) = d16s {
@@ -753,9 +814,7 @@ impl Lw {
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [data, z, z, z], nv));
             }
             return self.guarded(act, &mut |lw| {
-                let r = lw.ld_raw(a);
-                let z = lw.c(0);
-                let raw = lw.sel(ok, r[0], z);
+                let raw = lw.buffer_subword(a, n, ok)?;
                 let nv = lw.d16_merge(v, raw, n, signed, half);
                 lw.vset(vdata, nv);
                 Ok(())
@@ -772,16 +831,14 @@ impl Lw {
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [v, z, z, z], nv));
             }
             return self.guarded(act, &mut |lw| {
-                let r = lw.ld_raw(a);
+                let raw = lw.buffer_subword(a, n, ok)?;
                 let bits = 8 * n;
                 let val = if signed {
-                    let x = lw.shlc(r[0], 32 - bits);
+                    let x = lw.shlc(raw, 32 - bits);
                     lw.ashrc(x, 32 - bits)
                 } else {
-                    lw.andc(r[0], ((1u64 << bits) - 1) as u32)
+                    lw.andc(raw, ((1u64 << bits) - 1) as u32)
                 };
-                let z = lw.c(0);
-                let val = lw.sel(ok, val, z);
                 lw.vset(vdata, val);
                 Ok(())
             });
@@ -795,8 +852,9 @@ impl Lw {
                 self.guarded(act, &mut |lw| {
                     for i in 0..count {
                         let at = lw.addc(a, 4 * i as u32);
-                        let v = lw.mem_ld(at);
                         let z = lw.c(0);
+                        let at = lw.sel(oks[i as usize], at, z);
+                        let v = lw.mem_ld(at);
                         let v = lw.sel(oks[i as usize], v, z);
                         lw.vset(vdata + i, v);
                     }
@@ -841,7 +899,7 @@ impl Lw {
                 let ok = self.land(has, rng);
                 let cur: Vec<Value> = (0..count).map(|i| self.vreg(vdata + i)).collect();
                 self.guarded(act, &mut |lw| {
-                    let r = lw.ld_raw(a);
+                    let r = lw.checked_ld_raw(a, ok)?;
                     let c = [lw.fmt_comp(&r, info, 0), lw.fmt_comp(&r, info, 1), lw.fmt_comp(&r, info, 2), lw.fmt_comp(&r, info, 3)];
                     let z = lw.c(0);
                     if let Some((_, components, high)) = d16_format {
@@ -1210,8 +1268,8 @@ impl Lw {
         self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], true);
         let a = self.andc(a, !(bytes - 1));
         let szero = self.cmpc(Pred::Eq, stride, 0);
-        let e = self.addc(off, bytes);
-        let r1 = self.cmp(Pred::ULe, e, d2);
+        let size = self.c(bytes);
+        let r1 = self.buffer_bytes_in_range(voff, off, size, d2);
         let r2 = self.cmp(Pred::ULt, index, d2);
         let ok = self.sel(szero, r1, r2);
         let act = self.act();
