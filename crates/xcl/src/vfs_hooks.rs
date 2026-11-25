@@ -584,6 +584,15 @@ fn io_err_code(e: &std::io::Error, fallback: u32) -> u32 {
     e.raw_os_error().map(|c| c as u32).unwrap_or(fallback)
 }
 
+/// Win32 error for a copy/move source that does not exist, so callers can fail before
+/// `dest_of` creates any directories. Other metadata errors are left to the real Win32 call.
+fn missing_source_error(real: &str) -> Option<u32> {
+    match std::fs::metadata(real) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(io_err_code(&e, vfs::ERROR_FILE_NOT_FOUND)),
+        _ => None,
+    }
+}
+
 fn vfs_path_exists(v: &vfs::Vfs, path: &str) -> Result<bool, u32> {
     match source_of(v, path) {
         Ok((real, _)) => Ok(std::path::Path::new(&real).exists()),
@@ -740,6 +749,9 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                 Ok(())
             }
             None => {
+                if let Some(e) = missing_source_error(&rs) {
+                    return Err(e); // fail before dest_of creates overlay directories
+                }
                 if let Some(dr) = &drel_opt {
                     if std::path::Path::new(&rs).exists() {
                         if v.is_dir(dr) {
@@ -777,7 +789,18 @@ fn prepare_copy(v: &vfs::Vfs, s: &str, d: &str, fail_if_exists: bool) -> Result<
     if srel.is_some() && !std::path::Path::new(&rs).exists() {
         return Err(vfs::ERROR_FILE_NOT_FOUND);
     }
+    if let Some(e) = missing_source_error(&rs) {
+        return Err(e); // fail before dest_of creates overlay directories
+    }
+    if std::fs::metadata(&rs).is_ok_and(|m| m.is_dir()) {
+        return Err(vfs::ERROR_ACCESS_DENIED);
+    }
     if let Target::Game { rel: drel } = v.classify(d) {
+        // Copying a game file onto itself: let Win32 fail on the same path instead of
+        // copying the original into the overlay.
+        if srel.as_ref().is_some_and(|sr| sr.to_lowercase() == drel.to_lowercase()) {
+            return Ok((rs.clone(), rs, None));
+        }
         if std::path::Path::new(&rs).exists() {
             if v.is_dir(&drel) {
                 return Err(vfs::ERROR_ACCESS_DENIED);
@@ -1401,6 +1424,50 @@ mod tests {
     fn real_copy_2(s: *const u16, d: *const u16, params: *const c_void) -> i32 {
         // SAFETY: callers pass valid NUL-terminated UTF-16 paths and optional COPYFILE2_EXTENDED_PARAMETERS.
         unsafe { CopyFile2(s, d, params as *const COPYFILE2_EXTENDED_PARAMETERS) }
+    }
+
+    #[test]
+    fn copy_and_move_reject_bad_sources_before_staging_the_overlay() {
+        let f = HookFixture::new("bad_sources");
+        let v = &f.vfs;
+        std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
+        std::fs::create_dir_all(f.game().join("data").join("dir")).unwrap();
+        std::fs::write(f.game().join("data").join("café.txt"), b"original").unwrap();
+        let overlay_data = v.overlay_path("data");
+        let overlay_untouched = || {
+            assert!(!std::path::Path::new(&v.overlay_path("data\\hello.txt")).exists(), "self-copy staged an overlay file");
+            assert!(!std::path::Path::new(&v.overlay_path("data\\sub")).exists(), "a failed copy/move created overlay dirs");
+            assert!(!std::path::Path::new(&overlay_data).exists(), "a failed copy/move created the overlay data dir");
+        };
+
+        // Copying an un-overlaid game file onto itself (same path and case-differing) must fail.
+        for (src, dst) in [
+            ("G:\\data\\hello.txt", "G:\\data\\hello.txt"),
+            ("G:\\data\\hello.txt", "G:\\data\\HELLO.TXT"),
+            ("G:\\data\\café.txt", "G:\\data\\CAFÉ.txt"),
+        ] {
+            let ok = unsafe { copy_file_w_vfs(v, src, dst, 0, real_copy) };
+            assert_eq!(ok, 0, "self-copy {src} -> {dst} must fail");
+            overlay_untouched();
+        }
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::read(f.game().join("data").join("café.txt")).unwrap(), b"original");
+
+        // A directory source fails with ERROR_ACCESS_DENIED.
+        let ok = unsafe { copy_file_w_vfs(v, "G:\\data\\dir", "G:\\data\\sub\\d.txt", 0, real_copy) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ACCESS_DENIED);
+        overlay_untouched();
+
+        // A missing external source must not create overlay dirs for the destination.
+        let ok = unsafe { copy_file_w_vfs(v, "T:\\missing.txt", "G:\\data\\sub\\new.txt", 0, real_copy) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        overlay_untouched();
+        let ok = unsafe { move_file_vfs(v, "T:\\missing.txt", "G:\\data\\sub\\new.txt", 0, real_move) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        overlay_untouched();
     }
 
     #[test]
