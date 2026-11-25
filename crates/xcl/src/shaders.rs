@@ -1114,6 +1114,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let record_done = || {
+        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if d % 200 == 0 {
+            eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+        }
+    };
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
@@ -1138,10 +1144,16 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     break;
                 }
                 let (name, blob) = input.get(i);
-                let Some(blob) = blob else { continue };
-                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(blob) = blob else {
+                    record_done();
+                    continue;
+                };
+                let Some(sh) = xbox::parse(&blob) else {
+                    record_done();
+                    continue;
+                };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
-                    done.fetch_add(1, Ordering::Relaxed);
+                    record_done();
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
@@ -1162,10 +1174,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             failed.fetch_add(1, Ordering::Relaxed)
                         }
                     };
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 200 == 0 {
-                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                    }
+                    record_done();
                     continue;
                 }
                 for f in &sh.fssm {
@@ -1205,10 +1214,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     }
                 }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 200 == 0 {
-                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                }
+                record_done();
             });
         }
     });

@@ -248,6 +248,22 @@ fn shaders_folder_recurses_and_skips_side_files() {
 }
 
 #[test]
+fn precompile_progress_counts_filtered_and_unrecognized_records() {
+    let pixel = xbox_shader(0, &[]);
+    for (tag, record) in [("filtered", pixel.as_slice()), ("unrecognized", &b"not a shader"[..])] {
+        let dir = TempDir::new(tag);
+        for i in 0..200 {
+            std::fs::write(dir.path().join(format!("{i:03}.bin")), record).unwrap();
+        }
+        // Filter the pixel shaders out and skip adapter detection, so this needs neither DXC nor a GPU.
+        let out = run_shaders(dir.path(), &["--precompile", "--only", "cs", "--split", "0"]);
+        assert!(out.status.success(), "{out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.lines().any(|line| line.starts_with("  200/200 (")), "{tag}: {stderr}");
+    }
+}
+
+#[test]
 fn shaders_rpf9_pack_scans_records_and_counts_inflate_errors() {
     let dir = TempDir::new("rpf9");
     let pack_path = dir.path().join("shaders.rpf");
