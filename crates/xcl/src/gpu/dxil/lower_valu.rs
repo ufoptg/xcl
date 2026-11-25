@@ -54,7 +54,7 @@ impl Lw {
                     neg: [neg & 1 == 1, neg >> 1 & 1 == 1, neg >> 2 & 1 == 1],
                     omod: fv(e, "OMOD"),
                     clamp: bit(e, "CLAMP"),
-                    opsel: fv(e, "OP_SEL"),
+                    opsel: rdna2::op_sel(d),
                 }
             }
         }

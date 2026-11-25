@@ -2554,7 +2554,7 @@ impl Em {
                     neg: [neg & 1 == 1, neg >> 1 & 1 == 1, neg >> 2 & 1 == 1],
                     omod: fv(e, "OMOD"),
                     clamp: bit(e, "CLAMP"),
-                    opsel: fv(e, "OP_SEL"),
+                    opsel: rdna2::op_sel(d),
                 }
             }
         }
@@ -2917,8 +2917,9 @@ impl Em {
         Ok(())
     }
 
-    /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
-    /// high half per source), results go to the low half (op_sel[3]: high half) and the other
+    /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (the op_sel of a VOP3-only
+    /// opcode picks the high half per source, `rdna2::op_sel`), results go to the low half
+    /// (op_sel[3]: high half) and the other
     /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
     fn valu16(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);

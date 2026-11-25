@@ -568,7 +568,7 @@ fn gpu_f64_class_compare() {
 }
 
 /// Normalized f16 conversions – v_cvt_norm_u16_f16 / _i16_f16 (VOP1 single half-word
-/// result, VOP3 with op_sel picking source/destination halves) and v_cvt_pknorm_u16_f16 /
+/// result, also in VOP3, where op_sel is ignored) and v_cvt_pknorm_u16_f16 /
 /// _i16_f16 (VOP3, two f16 halves → a packed dword). Emitted text is deterministic.
 #[test]
 fn cvt_norm_f16_instructions() {
@@ -583,10 +583,10 @@ fn cvt_norm_f16_instructions() {
     assert!(t.complete(), "{:?}", t.unsupported);
     // single f16 source (low half) → unsigned / signed normalized short, 16-bit result
     assert!(t.hlsl.contains("cvt_norm_u16_f16(((v9) & 0xFFFFu))"), "{}", t.hlsl);
-    // op_sel[0] reads the source's high half, op_sel[3] writes the destination's high
-    // half preserving the low one; abs/neg apply directly on the binary16 sign bit
-    assert!(t.hlsl.contains("cvt_norm_i16_f16(((v9) >> 16))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v2 & 0xFFFFu) | (t") && t.hlsl.contains("<< 16), v2)"), "{}", t.hlsl);
+    // a VOP1 opcode in VOP3 ignores op_sel (RDNA2 silicon): the low half is read and written,
+    // the high half kept; abs/neg apply directly on the binary16 sign bit
+    assert!(t.hlsl.contains("cvt_norm_i16_f16(((v9) & 0xFFFFu))") && !t.hlsl.contains("cvt_norm_i16_f16(((v9) >> 16))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v2 & 0xFFFF0000u) | t") && !t.hlsl.contains("(v2 & 0xFFFFu) | (t"), "{}", t.hlsl);
     // packed: two whole dwords written; each source half picked by op_sel
     assert!(t.hlsl.contains("(cvt_norm_u16_f16((v9 & 0xFFFFu)) | (cvt_norm_u16_f16((v10 & 0xFFFFu)) << 16))"), "{}", t.hlsl);
     assert!(t.hlsl.contains("(cvt_norm_i16_f16((v9 >> 16)) | (cvt_norm_i16_f16((v10 >> 16)) << 16))"), "{}", t.hlsl);
@@ -669,6 +669,131 @@ fn gpu_cvt_norm_f16_exact_rounding_and_edge_cases() {
         assert_eq!(r.vgpr[l][9] & 0xFFFF, 0, "lane {l} neg(qNaN) i16");
         assert_eq!(r.vgpr[l][10] & 0xFFFF, (-16399i16) as u16 as u32, "lane {l} neg(0x3801) i16");
         assert_eq!(r.vgpr[l][11] & 0xFFFF, (-16399i16) as u16 as u32, "lane {l} -abs(0xB801) i16");
+    }
+}
+
+/// RDNA2 runs the VOP3 forms of VOP2 (opcodes 0x100–0x13F) and VOP1 (0x180–0x1FF) 16-bit
+/// instructions without op_sel: they read the low halves and write the low half, keeping the
+/// high one (`v_sat_pk_u8_i16` zeroes it). The VOP3-only 16-bit opcodes honour it. Every
+/// expected dword was measured on RDNA2 silicon (gfx1036, the Radeon iGPU of a Ryzen 7 9700X)
+/// running these encodings on these inputs, with the destinations at 0xBEEF_1234.
+#[test]
+fn gpu_vop3_forms_of_vop1_vop2_16_bit_ops_ignore_op_sel() {
+    if !gpu_ready() {
+        return;
+    }
+    // (instruction, source VGPRs, OP_SEL, expected destination, what)
+    let rows: &[(&str, &[u64], u64, u32, &str)] = &[
+        ("V_ADD_F16", &[10, 11], 0b0001, 0xBEEF_3D00, "v_add_f16 op_sel src0 ignored (VOP3 opcode 0x132)"),
+        ("V_ADD_F16", &[10, 11], 0b0010, 0xBEEF_3D00, "v_add_f16 op_sel src1 ignored (VOP3 opcode 0x132)"),
+        ("V_ADD_F16", &[10, 11], 0b1000, 0xBEEF_3D00, "v_add_f16 op_sel dst ignored (VOP3 opcode 0x132)"),
+        ("V_MUL_F16", &[10, 11], 0b0001, 0xBEEF_3400, "v_mul_f16 op_sel src0 ignored (VOP3 opcode 0x135)"),
+        ("V_MUL_F16", &[10, 11], 0b0010, 0xBEEF_3400, "v_mul_f16 op_sel src1 ignored (VOP3 opcode 0x135)"),
+        ("V_MUL_F16", &[10, 11], 0b1000, 0xBEEF_3400, "v_mul_f16 op_sel dst ignored (VOP3 opcode 0x135)"),
+        ("V_MAX_F16", &[10, 11], 0b0001, 0xBEEF_3C00, "v_max_f16 op_sel src0 ignored (VOP3 opcode 0x139)"),
+        ("V_MAX_F16", &[10, 11], 0b0010, 0xBEEF_3C00, "v_max_f16 op_sel src1 ignored (VOP3 opcode 0x139)"),
+        ("V_MAX_F16", &[10, 11], 0b1000, 0xBEEF_3C00, "v_max_f16 op_sel dst ignored (VOP3 opcode 0x139)"),
+        ("V_FMAC_F16", &[10, 11], 0b0001, 0xBEEF_3403, "v_fmac_f16 op_sel src0 ignored (VOP3 opcode 0x136)"),
+        ("V_FMAC_F16", &[10, 11], 0b0010, 0xBEEF_3403, "v_fmac_f16 op_sel src1 ignored (VOP3 opcode 0x136)"),
+        ("V_FMAC_F16", &[10, 11], 0b1000, 0xBEEF_3403, "v_fmac_f16 op_sel dst ignored (VOP3 opcode 0x136)"),
+        ("V_CVT_F32_F16", &[10], 0b0001, 0x3F80_0000, "v_cvt_f32_f16 op_sel src0 ignored (VOP3 opcode 0x18B)"),
+        ("V_CVT_F32_F16", &[10], 0b1000, 0x3F80_0000, "v_cvt_f32_f16 op_sel dst ignored (VOP3 opcode 0x18B)"),
+        ("V_SQRT_F16", &[10], 0b0001, 0xBEEF_3C00, "v_sqrt_f16 op_sel src0 ignored (VOP3 opcode 0x1D5)"),
+        ("V_SQRT_F16", &[10], 0b1000, 0xBEEF_3C00, "v_sqrt_f16 op_sel dst ignored (VOP3 opcode 0x1D5)"),
+        ("V_CVT_F16_U16", &[14], 0b0001, 0xBEEF_4200, "v_cvt_f16_u16 op_sel src0 ignored (VOP3 opcode 0x1D0)"),
+        ("V_CVT_F16_U16", &[14], 0b1000, 0xBEEF_4200, "v_cvt_f16_u16 op_sel dst ignored (VOP3 opcode 0x1D0)"),
+        ("V_CVT_F16_F32", &[17], 0b1000, 0xBEEF_4200, "v_cvt_f16_f32 op_sel dst ignored (VOP3 opcode 0x18A)"),
+        ("V_FMA_F16", &[10, 11, 12], 0b0001, 0xBEEF_3B00, "v_fma_f16 op_sel src0 honoured (VOP3 opcode 0x34B)"),
+        ("V_FMA_F16", &[10, 11, 12], 0b0010, 0xBEEF_4180, "v_fma_f16 op_sel src1 honoured (VOP3 opcode 0x34B)"),
+        ("V_FMA_F16", &[10, 11, 12], 0b0100, 0xBEEF_4440, "v_fma_f16 op_sel src2 honoured (VOP3 opcode 0x34B)"),
+        ("V_FMA_F16", &[10, 11, 12], 0b1000, 0x3C00_1234, "v_fma_f16 op_sel dst honoured (VOP3 opcode 0x34B)"),
+        ("V_MAD_U16", &[14, 15, 16], 0b0001, 0xBEEF_000B, "v_mad_u16 op_sel src0 honoured (VOP3 opcode 0x340)"),
+        ("V_MAD_U16", &[14, 15, 16], 0b0010, 0xBEEF_0016, "v_mad_u16 op_sel src1 honoured (VOP3 opcode 0x340)"),
+        ("V_MAD_U16", &[14, 15, 16], 0b0100, 0xBEEF_0011, "v_mad_u16 op_sel src2 honoured (VOP3 opcode 0x340)"),
+        ("V_MAD_U16", &[14, 15, 16], 0b1000, 0x0007_1234, "v_mad_u16 op_sel dst honoured (VOP3 opcode 0x340)"),
+        ("V_ADD_NC_U16", &[14, 15], 0b0001, 0xBEEF_0007, "v_add_nc_u16 op_sel src0 honoured (VOP3 opcode 0x303)"),
+        ("V_ADD_NC_U16", &[14, 15], 0b0010, 0xBEEF_000A, "v_add_nc_u16 op_sel src1 honoured (VOP3 opcode 0x303)"),
+        ("V_ADD_NC_U16", &[14, 15], 0b1000, 0x0005_1234, "v_add_nc_u16 op_sel dst honoured (VOP3 opcode 0x303)"),
+        ("V_PACK_B32_F16", &[10, 11], 0b0001, 0x3400_3800, "v_pack_b32_f16 op_sel src0 honoured (VOP3 opcode 0x311)"),
+        ("V_PACK_B32_F16", &[10, 11], 0b0010, 0x4000_3C00, "v_pack_b32_f16 op_sel src1 honoured (VOP3 opcode 0x311)"),
+        ("V_SUB_F16", &[10, 11], 0b0001, 0xBEEF_3A00, "v_sub_f16 op_sel src0 ignored (VOP3 opcode 0x133)"),
+        ("V_SUB_F16", &[10, 11], 0b0010, 0xBEEF_3A00, "v_sub_f16 op_sel src1 ignored (VOP3 opcode 0x133)"),
+        ("V_SUB_F16", &[10, 11], 0b1000, 0xBEEF_3A00, "v_sub_f16 op_sel dst ignored (VOP3 opcode 0x133)"),
+        ("V_SUBREV_F16", &[10, 11], 0b0001, 0xBEEF_BA00, "v_subrev_f16 op_sel src0 ignored (VOP3 opcode 0x134)"),
+        ("V_SUBREV_F16", &[10, 11], 0b0010, 0xBEEF_BA00, "v_subrev_f16 op_sel src1 ignored (VOP3 opcode 0x134)"),
+        ("V_SUBREV_F16", &[10, 11], 0b1000, 0xBEEF_BA00, "v_subrev_f16 op_sel dst ignored (VOP3 opcode 0x134)"),
+        ("V_MIN_F16", &[18, 11], 0b0001, 0xBEEF_3400, "v_min_f16 op_sel src0 ignored (VOP3 opcode 0x13A)"),
+        ("V_MIN_F16", &[18, 11], 0b0010, 0xBEEF_3400, "v_min_f16 op_sel src1 ignored (VOP3 opcode 0x13A)"),
+        ("V_MIN_F16", &[18, 11], 0b1000, 0xBEEF_3400, "v_min_f16 op_sel dst ignored (VOP3 opcode 0x13A)"),
+        ("V_LDEXP_F16", &[10, 19], 0b0001, 0xBEEF_4000, "v_ldexp_f16 op_sel src0 ignored (VOP3 opcode 0x13B)"),
+        ("V_LDEXP_F16", &[10, 19], 0b0010, 0xBEEF_4000, "v_ldexp_f16 op_sel src1 ignored (VOP3 opcode 0x13B)"),
+        ("V_LDEXP_F16", &[10, 19], 0b1000, 0xBEEF_4000, "v_ldexp_f16 op_sel dst ignored (VOP3 opcode 0x13B)"),
+        ("V_RCP_F16", &[10], 0b0001, 0xBEEF_3C00, "v_rcp_f16 op_sel src0 ignored (VOP3 opcode 0x1D4)"),
+        ("V_RCP_F16", &[10], 0b1000, 0xBEEF_3C00, "v_rcp_f16 op_sel dst ignored (VOP3 opcode 0x1D4)"),
+        ("V_FLOOR_F16", &[10], 0b0001, 0xBEEF_3C00, "v_floor_f16 op_sel src0 ignored (VOP3 opcode 0x1DB)"),
+        ("V_FLOOR_F16", &[10], 0b1000, 0xBEEF_3C00, "v_floor_f16 op_sel dst ignored (VOP3 opcode 0x1DB)"),
+        ("V_FREXP_EXP_I16_F16", &[10], 0b0001, 0xBEEF_0001, "v_frexp_exp_i16_f16 op_sel src0 ignored (VOP3 opcode 0x1DA)"),
+        ("V_FREXP_EXP_I16_F16", &[10], 0b1000, 0xBEEF_0001, "v_frexp_exp_i16_f16 op_sel dst ignored (VOP3 opcode 0x1DA)"),
+        ("V_CVT_U16_F16", &[10], 0b0001, 0xBEEF_0001, "v_cvt_u16_f16 op_sel src0 ignored (VOP3 opcode 0x1D2)"),
+        ("V_CVT_U16_F16", &[10], 0b1000, 0xBEEF_0001, "v_cvt_u16_f16 op_sel dst ignored (VOP3 opcode 0x1D2)"),
+        ("V_CVT_I16_F16", &[10], 0b0001, 0xBEEF_0001, "v_cvt_i16_f16 op_sel src0 ignored (VOP3 opcode 0x1D3)"),
+        ("V_CVT_I16_F16", &[10], 0b1000, 0xBEEF_0001, "v_cvt_i16_f16 op_sel dst ignored (VOP3 opcode 0x1D3)"),
+        ("V_CVT_F16_I16", &[14], 0b0001, 0xBEEF_4200, "v_cvt_f16_i16 op_sel src0 ignored (VOP3 opcode 0x1D1)"),
+        ("V_CVT_F16_I16", &[14], 0b1000, 0xBEEF_4200, "v_cvt_f16_i16 op_sel dst ignored (VOP3 opcode 0x1D1)"),
+        ("V_CVT_NORM_U16_F16", &[10], 0b0001, 0xBEEF_FFFF, "v_cvt_norm_u16_f16 op_sel src0 ignored (VOP3 opcode 0x1E4)"),
+        ("V_CVT_NORM_U16_F16", &[10], 0b1000, 0xBEEF_FFFF, "v_cvt_norm_u16_f16 op_sel dst ignored (VOP3 opcode 0x1E4)"),
+        ("V_SAT_PK_U8_I16", &[14], 0b1000, 0x0000_0503, "v_sat_pk_u8_i16 op_sel dst ignored (VOP3 opcode 0x1E2)"),
+        ("V_RSQ_F16", &[21], 0b0001, 0xBEEF_3C00, "v_rsq_f16 op_sel src0 ignored (VOP3 opcode 0x1D6)"),
+        ("V_RSQ_F16", &[21], 0b1000, 0xBEEF_3C00, "v_rsq_f16 op_sel dst ignored (VOP3 opcode 0x1D6)"),
+        ("V_LOG_F16", &[21], 0b0001, 0xBEEF_0000, "v_log_f16 op_sel src0 ignored (VOP3 opcode 0x1D7)"),
+        ("V_LOG_F16", &[21], 0b1000, 0xBEEF_0000, "v_log_f16 op_sel dst ignored (VOP3 opcode 0x1D7)"),
+        ("V_EXP_F16", &[21], 0b0001, 0xBEEF_4000, "v_exp_f16 op_sel src0 ignored (VOP3 opcode 0x1D8)"),
+        ("V_EXP_F16", &[21], 0b1000, 0xBEEF_4000, "v_exp_f16 op_sel dst ignored (VOP3 opcode 0x1D8)"),
+        ("V_FREXP_MANT_F16", &[21], 0b0001, 0xBEEF_3800, "v_frexp_mant_f16 op_sel src0 ignored (VOP3 opcode 0x1D9)"),
+        ("V_FREXP_MANT_F16", &[21], 0b1000, 0xBEEF_3800, "v_frexp_mant_f16 op_sel dst ignored (VOP3 opcode 0x1D9)"),
+        ("V_CEIL_F16", &[21], 0b0001, 0xBEEF_3C00, "v_ceil_f16 op_sel src0 ignored (VOP3 opcode 0x1DC)"),
+        ("V_CEIL_F16", &[21], 0b1000, 0xBEEF_3C00, "v_ceil_f16 op_sel dst ignored (VOP3 opcode 0x1DC)"),
+        ("V_TRUNC_F16", &[21], 0b0001, 0xBEEF_3C00, "v_trunc_f16 op_sel src0 ignored (VOP3 opcode 0x1DD)"),
+        ("V_TRUNC_F16", &[21], 0b1000, 0xBEEF_3C00, "v_trunc_f16 op_sel dst ignored (VOP3 opcode 0x1DD)"),
+        ("V_RNDNE_F16", &[21], 0b0001, 0xBEEF_3C00, "v_rndne_f16 op_sel src0 ignored (VOP3 opcode 0x1DE)"),
+        ("V_RNDNE_F16", &[21], 0b1000, 0xBEEF_3C00, "v_rndne_f16 op_sel dst ignored (VOP3 opcode 0x1DE)"),
+        ("V_FRACT_F16", &[21], 0b0001, 0xBEEF_0000, "v_fract_f16 op_sel src0 ignored (VOP3 opcode 0x1DF)"),
+        ("V_FRACT_F16", &[21], 0b1000, 0xBEEF_0000, "v_fract_f16 op_sel dst ignored (VOP3 opcode 0x1DF)"),
+        ("V_SIN_F16", &[22], 0b0001, 0xBEEF_3C00, "v_sin_f16 op_sel src0 ignored (VOP3 opcode 0x1E0)"),
+        ("V_SIN_F16", &[22], 0b1000, 0xBEEF_3C00, "v_sin_f16 op_sel dst ignored (VOP3 opcode 0x1E0)"),
+        ("V_COS_F16", &[21], 0b0001, 0xBEEF_3C00, "v_cos_f16 op_sel src0 ignored (VOP3 opcode 0x1E1)"),
+        ("V_COS_F16", &[21], 0b1000, 0xBEEF_3C00, "v_cos_f16 op_sel dst ignored (VOP3 opcode 0x1E1)"),
+        ("V_CVT_NORM_I16_F16", &[20], 0b1001, 0xBEEF_8001, "v_cvt_norm_i16_f16 op_sel 0b1001 ignored (VOP3 opcode 0x1E3)"),
+    ];
+    let fields: Vec<Vec<(&str, u64)>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, srcs, sel, _, _))| {
+            let mut f = vec![("VDST", 30 + i as u64), ("OP_SEL", sel)];
+            f.extend(srcs.iter().zip(["SRC0", "SRC1", "SRC2"]).map(|(&s, n)| (n, V + s)));
+            f
+        })
+        .collect();
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = rows.iter().zip(&fields).map(|(r, f)| (r.0, "ENC_VOP3", f.as_slice(), None)).collect();
+    let p = prog(&list);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        (r[10], r[11], r[12]) = (0x3800_3C00, 0x4000_3400, 0x4400_3A00); // f16 (hi, lo): (0.5, 1.0) (2.0, 0.25) (4.0, 0.75)
+        (r[14], r[15], r[16]) = (0x0005_0003, 0x0007_0002, 0x000B_0001); // 16-bit (hi, lo): (5, 3) (7, 2) (11, 1)
+        r[17] = 0x4040_0000; // f32 3.0
+        r[18] = 0x3000_3C00; // f16 (0.125, 1.0)
+        r[19] = 0x0003_0001; // i16 (3, 1)
+        r[20] = 0x3800_BC00; // f16 (0.5, -1.0)
+        (r[21], r[22]) = (0x4100_3C00, 0x0000_3400); // f16 (2.5, 1.0) (0.0, 0.25)
+        for k in 30..30 + rows.len() {
+            r[k] = 0xBEEF_1234;
+        }
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        for (i, &(_, _, _, want, what)) in rows.iter().enumerate() {
+            assert_eq!(r.vgpr[l][30 + i], want, "lane {l} {what}");
+        }
     }
 }
 
@@ -2712,7 +2837,7 @@ fn gpu_valu_16_and_64_bit() {
     }
     let p = prog(&[
         ("V_ADD_F16", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None), // low halves, high kept
-        ("V_MUL_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b1001)], None), // src0.hi * src1.lo → dst.hi
+        ("V_MUL_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b1001)], None), // op_sel ignored: src0.lo * src1.lo → dst.lo
         ("V_LSHRREV_B16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 132), ("SRC1", V + 5)], None),
         ("V_CMP_LT_F16", "ENC_VOPC", &[("SRC0", V + 6), ("VSRC1", 7)], None),
         ("V_LSHLREV_B64", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 10), ("SRC1", V + 12)], None),
@@ -2758,7 +2883,8 @@ fn gpu_valu_16_and_64_bit() {
     for l in 0..64usize {
         let v = &r.vgpr[l];
         assert_eq!(v[2], 0xBEEF_0000 | h(3.75), "lane {l} v_add_f16 keeps the high half");
-        assert_eq!(v[3], 0x1111 | h(-4.5) << 16, "lane {l} v_mul_f16 op_sel");
+        // a VOP2 opcode in VOP3 ignores op_sel: 0x0000_42C0 on RDNA2 silicon (gfx1036)
+        assert_eq!(v[3], h(1.5 * 2.25), "lane {l} v_mul_f16 op_sel ignored");
         assert_eq!(v[4], 0xCAFE_0842, "lane {l} v_lshrrev_b16");
         assert_eq!(v[8] as u64 | (v[9] as u64) << 32, 1u64 << l, "lane {l} v_lshlrev_b64");
         let c = if l % 2 == 1 { u64::MAX } else { l as u64 };
@@ -4711,7 +4837,8 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(vop3("V_CVT_PKNORM_U16_F16", &[("VDST", 84), ("SRC0", vv(82)), ("SRC1", vv(83))]));
     code.extend(vop3("V_CVT_PKNORM_I16_F16", &[("VDST", 85), ("SRC0", vv(82)), ("SRC1", vv(83)), ("OP_SEL", 3)]));
     code.extend(vop3("V_CVT_NORM_U16_F16", &[("VDST", 86), ("SRC0", vv(82))]));
-    code.extend(vop3("V_CVT_NORM_I16_F16", &[("VDST", 86), ("SRC0", vv(83)), ("OP_SEL", 9)]));
+    // a VOP1 opcode in VOP3 ignores op_sel (RDNA2 silicon): v83.lo −1.0 → v88.lo
+    code.extend(vop3("V_CVT_NORM_I16_F16", &[("VDST", 88), ("SRC0", vv(83)), ("OP_SEL", 9)]));
     code.extend(enc("V_CVT_NORM_U16_F16", "ENC_VOP1", &[("VDST", 87), ("SRC0", 242)]));
     code.extend(enc("V_SWAP_B32", "ENC_VOP1", &[("VDST", 80), ("SRC0", vv(81))]));
     code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
@@ -4787,7 +4914,7 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
         assert_eq!((f32::from_bits(v[69]), f32::from_bits(v[70]), f32::from_bits(v[71])), (3.5, f32::INFINITY, 16.0), "lane {l}: div_fixup / fixup(x/0) / div_fmas");
         assert_eq!((f32::from_bits(v[72]), v[73]), (7.0, 0x7FFF_FFFF), "lane {l}: v_div_scale_f32 / v_add_nc_i32 clamp");
         assert_eq!((v[74], v[75], v[79]), (0x0005_FFFF, 13, 0x8000_FFFF), "lane {l}: cvt_pk_u16_u32 / mad_u32_u16 / cvt_pknorm_u16_f32");
-        assert_eq!((v[84], v[85], v[86], v[87]), (0x0000_8000, 0xC000_7FFF, 0xC000_8000, 0xFFFF), "lane {l}: cvt norm f16 (unorm/snorm, packed, hi halves)");
+        assert_eq!((v[84], v[85], v[86], v[87], v[88]), (0x0000_8000, 0xC000_7FFF, 0x0000_8000, 0xFFFF, 0x0000_8001), "lane {l}: cvt norm f16 (unorm/snorm, packed, op_sel ignored)");
         assert_eq!((v[80], v[81]), (2, 1), "lane {l}: v_swap_b32");
     }
     assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");

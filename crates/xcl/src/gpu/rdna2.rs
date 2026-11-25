@@ -486,6 +486,18 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
     (r, w)
 }
 
+/// The OP_SEL field as RDNA2 executes it. The VOP3 forms of VOP2 (opcodes 0x100–0x13F) and
+/// VOP1 (0x180–0x1FF) instructions ignore it: their 16-bit operations read the low halves and
+/// write the low half whatever it holds (all 31 of them measured on gfx1036; LLVM's GFX10
+/// tests, `tests/data/llvm-amdgpu/gfx10_vop3.txt`, set it on none of these opcodes). The
+/// VOP3-only 16-bit opcodes and VOP3P honour it.
+pub fn op_sel(d: &Decoded) -> u64 {
+    if d.enc.name == "ENC_VOP3" && matches!(d.ienc.opcode, 0x100..=0x13F | 0x180..=0x1FF) {
+        return 0;
+    }
+    field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0)
+}
+
 /// Target of a direct branch (s_branch, s_cbranch_*), or None for anything else
 /// (including indirect jumps like s_setpc_b64).
 pub fn branch_target(d: &Decoded) -> Option<u64> {
@@ -715,6 +727,25 @@ mod tests {
         assert_eq!(d.inst.name, "V_NOP");
         assert_eq!(d.len, 12);
         assert_eq!(format(&d), "v_nop ; lit 0x9d476646");
+    }
+
+    #[test]
+    fn op_sel_as_rdna2_runs_it() {
+        let sel = |n: &str, e: &str, f: &[(&str, u64)]| op_sel(&decode(&encode(n, e, f, None).unwrap(), 0).unwrap());
+        let f = [("VDST", 1), ("SRC0", 258), ("SRC1", 259), ("OP_SEL", 0b1011)];
+        // the VOP3 forms of VOP2 (0x132, 0x13B) and VOP1 (0x18A, 0x1D0, 0x1E4) opcodes: ignored
+        for n in ["V_ADD_F16", "V_LDEXP_F16", "V_CVT_F16_F32", "V_CVT_F16_U16", "V_CVT_NORM_U16_F16"] {
+            assert_eq!(sel(n, "ENC_VOP3", &f), 0, "{n}");
+        }
+        // the shader-hash v_nop (VOP3 0x180) carries OP_SEL 6
+        let d = decode(&[0xdb, 0xb7, 0x80, 0xd5, 0xb9, 0x33, 0xff, 0x03, 0x46, 0x66, 0x47, 0x9d], 0).unwrap();
+        assert_eq!((field_value(d.enc, &d.words, "OP_SEL"), op_sel(&d)), (Some(6), 0));
+        // VOP3-only opcodes (0x303, 0x34B, 0x311) and the 16-bit compares (VOPC in VOP3): kept
+        for n in ["V_ADD_NC_U16", "V_FMA_F16", "V_PACK_B32_F16", "V_CMP_LT_F16"] {
+            assert_eq!(sel(n, "ENC_VOP3", &f), 0b1011, "{n}");
+        }
+        // VOP3P: its own 3-bit OP_SEL
+        assert_eq!(sel("V_PK_ADD_F16", "ENC_VOP3P", &[("VDST", 1), ("SRC0", 258), ("SRC1", 259), ("OP_SEL", 0b011)]), 0b011);
     }
 
     #[test]
