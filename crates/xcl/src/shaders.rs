@@ -705,6 +705,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     };
     let top = opt("--top").unwrap_or(60);
     let json = args.iter().any(|a| a == "--json");
+    let direct = args.iter().any(|a| a == "--direct");
     let compile = opt("--compile").unwrap_or(0);
     let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
     let iface_on = args.iter().any(|a| a == "--iface");
@@ -730,8 +731,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
-            // one shader file: the record to export or measure
+        } else if export_dir.is_some() || measure.is_some() || direct {
+            // one shader file: the record to export, measure or translate directly
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
@@ -781,7 +782,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let windows = runtime_windows();
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
-    if args.iter().any(|a| a == "--direct") {
+    if direct {
         return direct_sweep(&input, args, top, json, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);

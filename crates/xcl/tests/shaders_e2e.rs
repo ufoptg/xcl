@@ -296,3 +296,27 @@ fn shaders_handles_non_console_file_and_missing_path() {
     let stderr = String::from_utf8(err_out.stderr).unwrap();
     assert!(stderr.contains("xcl shaders:"), "{stderr}");
 }
+
+#[test]
+fn direct_mode_accepts_a_single_shader_file() {
+    let dir = TempDir::new("direct-single");
+    let file = dir.path().join("ps.bin");
+    std::fs::write(&file, xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    // Exclude the program before translation so this routing test needs no GPU or DXC.
+    let args = ["--direct", "--json", "--max-bytes", "1", "--threads", "1"];
+    let folder = run_shaders(dir.path(), &args);
+    let single = run_shaders(&file, &args);
+    assert!(folder.status.success(), "{folder:?}");
+    assert!(single.status.success(), "{single:?}");
+    let folder_json: serde_json::Value = serde_json::from_slice(&folder.stdout).unwrap();
+    let single_json: serde_json::Value = serde_json::from_slice(&single.stdout).unwrap();
+    assert_eq!(folder_json["all"]["total"], 0);
+    assert_eq!(single_json, folder_json, "single-file and folder direct reports differ");
+
+    let text = run_shaders(&file, &["--direct", "--max-bytes", "1", "--threads", "1"]);
+    assert!(text.status.success(), "{text:?}");
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(stdout.contains("direct DXIL coverage"), "{stdout}");
+    assert!(stdout.contains("1 over 1 B skipped"), "{stdout}");
+}
