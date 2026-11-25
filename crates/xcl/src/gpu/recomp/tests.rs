@@ -1627,6 +1627,108 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn gpu_typed_buffer_unorm8_rounds_to_nearest() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("OFFEN", 1), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 16), ("VADDR", 1), ("OFFEN", 1), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 18), ("VADDR", 1), ("OFFEN", 1), ("SRSRC", 3), ("SOFFSET", 128)], None),
+    ]);
+    let mut st = KernelState::default();
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 256, ident | 56 << 12]); // 8_8_8_8_UNORM
+    st.sgpr[16..20].copy_from_slice(&[0x200, 0, 1, ident | 1 << 12]); // 8_UNORM
+    let mut mem = [0; 0x200 / 4 + 5];
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        regs[1] = 4 * lane as u32;
+        mem[0x100 / 4 + lane] = u32::from_le_bytes(std::array::from_fn(|c| (4 * lane + c) as u8));
+    }
+    mem[0x200 / 4] = 0xFE;
+    let result = runner::run_code(&code, &st, &mem).unwrap();
+    for (lane, regs) in result.vgpr.iter().enumerate() {
+        // gfx1036 measured these bits for 254 / 255 in #1414.
+        assert_eq!(regs[14], 0x3F7E_FEFF, "lane {lane}: 8_UNORM(0xFE) produced {:#010x}", regs[14]);
+        for (first, count) in [(10, 4), (16, 2), (18, 3)] {
+            for (c, bits) in regs[first..first + count].iter().enumerate() {
+                let byte = 4 * lane + c;
+                let expected = (byte as f64 / 255.0) as f32;
+                assert_eq!(*bits, expected.to_bits(), "{count}-component UNORM8 load, byte {byte:#04x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_normalized_buffer_formats_round_to_nearest_f32() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("OFFEN", 1), ("SRSRC", 3), ("SOFFSET", 128)], None),
+    ]);
+    let formats: &[(u32, &[u32])] = &[
+        (1, &[8]), (7, &[16]), (14, &[8, 8]), (23, &[16, 16]), (30, &[11, 11, 10]),
+        (37, &[10, 11, 11]), (44, &[2, 10, 10, 10]), (50, &[10, 10, 10, 2]),
+        (56, &[8, 8, 8, 8]), (65, &[16, 16, 16, 16]),
+    ];
+    let mut failures = Vec::new();
+    for &(unorm, widths) in formats {
+        let stride = (widths.iter().sum::<u32>() / 8) as usize;
+        for signed in [false, true] {
+            let format = unorm + u32::from(signed);
+            let mut st = KernelState::default();
+            let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+            st.sgpr[12..16].copy_from_slice(&[0x100, 0, (64 * stride) as u32, ident | format << 12]);
+            let mut bytes = vec![0; 0x100 + 64 * stride + 20];
+            let mut expected = [[0; 4]; 64];
+            for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+                regs[1] = (lane * stride) as u32;
+                let mut packed = 0u64;
+                let mut shift = 0;
+                for (c, &w) in widths.iter().enumerate() {
+                    let sign = 1 << (w - 1);
+                    let mask = (1 << w) - 1;
+                    let value = match lane {
+                        0 => 0, 1 => 1, 2 => sign - 1, 3 => sign, 4 => mask - 1, 5 => mask,
+                        _ => (lane as u32).wrapping_mul(0x9e37_79b9).rotate_left(5 * c as u32) & mask,
+                    };
+                    packed |= u64::from(value) << shift;
+                    shift += w;
+                    let norm = if signed {
+                        let signed_value = (value ^ sign) as i32 - sign as i32;
+                        (signed_value as f64 / (sign - 1) as f64).max(-1.0)
+                    } else {
+                        value as f64 / mask as f64
+                    };
+                    expected[lane][c] = (norm as f32).to_bits();
+                }
+                let at = 0x100 + lane * stride;
+                bytes[at..at + stride].copy_from_slice(&packed.to_le_bytes()[..stride]);
+            }
+            let mem: Vec<_> = bytes.chunks_exact(4).map(|d| u32::from_le_bytes(d.try_into().unwrap())).collect();
+            let result = runner::run_code(&code, &st, &mem).unwrap();
+            let mut mismatches = 0;
+            let mut example = None;
+            for (lane, regs) in result.vgpr.iter().enumerate() {
+                for c in 0..widths.len() {
+                    if regs[10 + c] != expected[lane][c] {
+                        mismatches += 1;
+                        example.get_or_insert((lane, c, regs[10 + c], expected[lane][c]));
+                    }
+                }
+            }
+            if let Some((lane, c, got, want)) = example {
+                failures.push(format!("format {format}: {mismatches} mismatches, lane {lane} component {c}: {got:#010x} != {want:#010x}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

@@ -1781,8 +1781,9 @@ impl Em {
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                let f32_output = d16_format.is_none();
                 self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
+                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u, {f32_output}), fmt_comp({t}_r, {t}_info, 1u, {f32_output}), fmt_comp({t}_r, {t}_info, 2u, {f32_output}), fmt_comp({t}_r, {t}_info, 3u, {f32_output}));"
                 ));
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
@@ -5290,7 +5291,29 @@ float uf_small(uint v, uint mb) {
     return select(e == 31u, special, select(e == 0u, fm * exp2(-14.0f), exp2((float)e - 15.0f) * (1.0f + fm)));
 }
 uint fmt_bytes(uint info) { return (((info >> 8) & 63u) + ((info >> 14) & 63u) + ((info >> 20) & 63u) + ((info >> 26) & 63u)) / 8u; }
-uint fmt_comp(uint4 r, uint info, uint c) {
+uint fmt_norm_f32(uint v, int sv, uint width, bool is_signed) {
+    bool negative = and(is_signed, sv < 0);
+    uint magnitude = select(negative, 0u - (uint)sv, v);
+    uint n = width - (uint)and(is_signed, width != 0u);
+    uint limit = (1u << (n & 31u)) - 1u;
+
+    // magnitude / (2^n - 1) repeats the n-bit magnitude in binary. Align its leading
+    // one and copy four periods to obtain 24 significant bits and the rounding bit.
+    uint top = firstbithigh(magnitude | 1u);
+    uint stream = magnitude << (31u - top);
+    stream |= stream >> (n & 31u);
+    stream |= stream >> ((2u * n) & 31u);
+    uint significand = ((stream >> 7u) + 1u) >> 1u;
+    uint bits = ((126u + top - n) << 23u) + significand;
+
+    // The remaining widths are 1 and 2. Width 1 has only endpoints.
+    uint thirds = select(magnitude == 1u, 0x3EAAAAABu, 0x3F2AAAABu);
+    bits = select(n <= 2u, thirds, bits);
+    bits = select(magnitude >= limit, 0x3F800000u, bits);
+    bits = select(magnitude == 0u, 0u, bits);
+    return bits | select(negative, 0x80000000u, 0u);
+}
+uint fmt_comp(uint4 r, uint info, uint c, bool f32_output) {
     uint n = info & 7u; uint ty = (info >> 3) & 7u;
     bool isint = or(ty == 4u, ty == 5u);
     uint off = select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
@@ -5298,14 +5321,19 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint v = bits_at(r, off, w);
     uint sh = (32u - w) & 31u;
     int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
-    float maxu = select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u));
-    float maxs = select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u));
     float fv = (float)v; float fsv = (float)sv;
-    // exact endpoints (the hardware conversion is exact; DXC divides approximately)
-    uint f_un = asuint(select(v == 0u, 0.0f, select(fv >= maxu, 1.0f, fv / maxu)));
-    uint f_sn = asuint(select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f))));
+    uint norm;
+    if (f32_output) {
+        norm = fmt_norm_f32(v, sv, w, ty == 1u);
+    } else {
+        float maxu = select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u));
+        float maxs = select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u));
+        float un = select(v == 0u, 0.0f, select(fv >= maxu, 1.0f, fv / maxu));
+        float sn = select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f)));
+        norm = asuint(select(ty == 1u, sn, un));
+    }
     uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
-    uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
+    uint res = select(ty <= 1u, norm, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt)))));
     return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
