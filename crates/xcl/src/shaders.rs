@@ -309,6 +309,24 @@ struct RecompAgg {
     wave_resolved: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
+    /// `lane_masks` (direct DXIL): programs analysed, those with no guard left, vector
+    /// instructions, those still guarded, lane branches, uniform branches; failures by reason
+    lanes: [usize; 6],
+    lanes_failed: BTreeMap<String, usize>,
+    /// compute programs, per-lane DXIL (`lower_dxil`) vs #1426's per-instruction form: tried,
+    /// per-lane ok, per-instruction ok, both ok, per-lane bytes and per-instruction bytes where
+    /// both are ok; why the per-lane form refused (first words of the reason)
+    cs_forms: [usize; 6],
+    cs_lane_why: BTreeMap<String, usize>,
+    /// survey of every refusal, per stage (CS, MS): tried, wave64, per-lane ok, per-instruction
+    /// ok, both ok, per-lane refused only for instructions (no structural reason), the same with
+    /// the per-instruction form ok, refused by the lane-mask analysis
+    forms: BTreeMap<String, [usize; 8]>,
+    /// "stage | reason" → programs (each reason once per program): every per-lane reason, the
+    /// structural ones that are a program's only structural reason, the per-instruction reasons
+    lane_every: BTreeMap<String, usize>,
+    lane_sole: BTreeMap<String, usize>,
+    inst_why: BTreeMap<String, usize>,
 }
 
 impl RecompAgg {
@@ -349,12 +367,48 @@ impl RecompAgg {
             e.1 += b;
         }
         self.hlsl_bytes += o.hlsl_bytes;
+        for (a, b) in self.lanes.iter_mut().zip(o.lanes) {
+            *a += b;
+        }
+        for (k, v) in o.lanes_failed {
+            *self.lanes_failed.entry(k).or_default() += v;
+        }
+        for (a, b) in self.cs_forms.iter_mut().zip(o.cs_forms) {
+            *a += b;
+        }
+        for (k, v) in o.cs_lane_why {
+            *self.cs_lane_why.entry(k).or_default() += v;
+        }
+        for (k, v) in o.forms {
+            for (a, b) in self.forms.entry(k).or_default().iter_mut().zip(v) {
+                *a += b;
+            }
+        }
+        for (m, o) in [(&mut self.lane_every, o.lane_every), (&mut self.lane_sole, o.lane_sole), (&mut self.inst_why, o.inst_why)] {
+            for (k, v) in o {
+                *m.entry(k).or_default() += v;
+            }
+        }
     }
 
     fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
         // `XCL_RECOMP_ONLY=<hash>` (the hex prefix of an `XCL_DUMP_HLSL` file): that program alone
         if let Ok(only) = std::env::var("XCL_RECOMP_ONLY") {
             if format!("{:016x}", name_hash(name)) != only {
+                return;
+            }
+        }
+        // `XCL_RECOMP_STAGES=CS,MS`: only programs of these stages
+        if let Ok(st) = std::env::var("XCL_RECOMP_STAGES") {
+            let l = match &mode {
+                recomp::Mode::Vertex(_) => "VS",
+                recomp::Mode::Pixel(_) => "PS",
+                recomp::Mode::Kernel => "kernel",
+                recomp::Mode::Mesh(_) => "MS",
+                recomp::Mode::Geometry(_) => "GS",
+                recomp::Mode::Compute(_) => "CS",
+            };
+            if !st.split(',').any(|x| x == l) {
                 return;
             }
         }
@@ -388,6 +442,69 @@ impl RecompAgg {
             } else {
                 self.graphics_wave32 += 1;
             }
+        }
+        if let recomp::Mode::Compute(cs) = &mode {
+            let lane = recomp::lower_dxil::compute_code(code, cs, wave64);
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let inst = crate::gpu::dxil::kernel::translate_compute(code, o, cs).map(|k| k.dxil);
+            self.cs_forms[0] += 1;
+            self.cs_forms[1] += lane.is_ok() as usize;
+            self.cs_forms[2] += inst.is_ok() as usize;
+            if let (Ok(a), Ok(b)) = (&lane, &inst) {
+                self.cs_forms[3] += 1;
+                self.cs_forms[4] += a.len();
+                self.cs_forms[5] += b.len();
+            }
+            if let Err(e) = &lane {
+                let key: String = e.split([':', '(']).next().unwrap_or("").split_whitespace().take(5).collect::<Vec<_>>().join(" ");
+                *self.cs_lane_why.entry(key).or_default() += 1;
+            }
+        }
+        let survey_cs = match &mode {
+            recomp::Mode::Compute(cs) => Some(("CS", cs.clone())),
+            // the mesh pass is a compute pass of the NGG program: its threads in a 1-D group
+            recomp::Mode::Mesh(ms) => Some(("MS", recomp::CsInterface { threads: [ms.threads, 1, 1], tid_components: 1, ..Default::default() })),
+            _ => None,
+        };
+        if let Some((st, cs)) = survey_cs {
+            let lane = recomp::lower_dxil::survey_compute_code(code, &cs, wave64);
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let inst = match &mode {
+                recomp::Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).map(|_| ()),
+                _ => crate::gpu::dxil::kernel::translate_compute(code, o, &cs).map(|_| ()),
+            };
+            let mut keys: Vec<(String, bool)> = lane.iter().map(|r| (survey_key(r), survey_structural(r))).collect();
+            keys.sort();
+            keys.dedup();
+            let structural: Vec<&String> = keys.iter().filter(|k| k.1).map(|k| &k.0).collect();
+            let lm = lane.len() == 1 && ["lane conditions", "indirect jump", "branch to the entry", "irreducible", "no fixpoint", "cannot decode"].iter().any(|w| lane[0].starts_with(w));
+            let f = self.forms.entry(st.to_string()).or_default();
+            let bridge = !lane.is_empty() && structural.is_empty();
+            for (i, c) in [true, wave64, lane.is_empty(), inst.is_ok(), lane.is_empty() && inst.is_ok(), bridge, bridge && inst.is_ok(), lm].into_iter().enumerate() {
+                f[i] += c as usize;
+            }
+            for (k, _) in &keys {
+                *self.lane_every.entry(format!("{st} | {k}")).or_default() += 1;
+            }
+            if let [k] = structural[..] {
+                *self.lane_sole.entry(format!("{st} | {k}")).or_default() += 1;
+            }
+            if let Err(e) = &inst {
+                *self.inst_why.entry(format!("{st} | {}", survey_key(e.lines().next().unwrap_or("")))).or_default() += 1;
+            }
+        }
+        match recomp::lane_masks::analyze_code(code, wave64) {
+            Ok(s) => {
+                let counts = [1, s.guarded.is_empty() as usize, s.vector, s.guarded.len(), s.lane_branches, s.uniform_branches];
+                for (a, b) in self.lanes.iter_mut().zip(counts) {
+                    *a += b;
+                }
+            }
+            Err(why) => *self.lanes_failed.entry(why.to_string()).or_default() += 1,
+        }
+        // `XCL_RECOMP_NO_HLSL=1`: the direct DXIL survey alone
+        if std::env::var("XCL_RECOMP_NO_HLSL").is_ok() {
+            return;
         }
         // `XCL_RECOMP_WINDOWS=4`: as a title with unified memory translates (`pso::mem_windows`)
         let mem_windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -780,6 +897,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+    }
+    if args.iter().any(|a| a == "--time-forms") {
+        return time_forms(&input, args, t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1493,6 +1613,45 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
             rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
         );
+        let c = &rc.cs_forms;
+        let mut why: Vec<_> = rc.cs_lane_why.iter().collect();
+        why.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "compute programs, direct DXIL: {} tried; per-lane form {} ok, per-instruction form (#1426) {} ok; where both are ok ({}): per-lane {} KB, per-instruction {} KB of DXIL; per-lane refused for: {:?}",
+            c[0], c[1], c[2], c[3], c[4] / 1024, c[5] / 1024, &why[..why.len().min(15)]
+        );
+        for (st, f) in &rc.forms {
+            println!(
+                "{st} programs, every refusal: {} tried ({} wave64); per-lane ok {}, per-instruction ok {}, both {}; per-lane refused for instructions only {} (per-instruction ok on {} of them); lane-mask analysis refused {}",
+                f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]
+            );
+        }
+        for (title, m) in [
+            ("per-lane reasons (stage | reason → programs; [S] structural)", &rc.lane_every),
+            ("the only structural reason of a program (stage | reason → programs)", &rc.lane_sole),
+            ("per-instruction form (#1426) refused (stage | first line → programs)", &rc.inst_why),
+        ] {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            println!("{title}:");
+            for (k, n) in v.iter().take(top.max(40)) {
+                let tag = if survey_structural(k.split(" | ").nth(1).unwrap_or("")) { "[S] " } else { "" };
+                println!("  {n:>6}  {tag}{k}");
+            }
+        }
+        let l = &rc.lanes;
+        println!(
+            "lane masks (direct DXIL, no EXEC emulation): analysed {} of {} programs, {} with no guard left; vector instructions {}, still guarded {} ({:.1}%); branches per lane {}, uniform {}; not analysed: {:?}",
+            l[0],
+            rc.programs,
+            l[1],
+            l[2],
+            l[3],
+            l[3] as f64 * 100.0 / l[2].max(1) as f64,
+            l[4],
+            l[5],
+            rc.lanes_failed
+        );
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
 {x}");
@@ -1713,6 +1872,14 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
     let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
     let skipped = AtomicUsize::new(0);
+    // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
+    // translates, its DXIL size against the per-instruction form's, and the refusals ranked
+    let lanes = args.iter().any(|a| a == "--lanes");
+    let lanes_tried = AtomicUsize::new(0);
+    let lanes_ok = AtomicUsize::new(0);
+    let lanes_bytes = AtomicUsize::new(0);
+    let lanes_vs = AtomicUsize::new(0);
+    let lanes_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
@@ -1767,6 +1934,26 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
                         let time = t.elapsed();
+                        if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
+                            lanes_tried.fetch_add(1, Ordering::Relaxed);
+                            // under the sweep's timeout too (the thread is left to finish)
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (c, csc) = (code.to_vec(), cs.clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
+                            });
+                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
+                                Ok(k) => {
+                                    lanes_ok.fetch_add(1, Ordering::Relaxed);
+                                    lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
+                                    lanes_vs.fetch_add(r.as_ref().map_or(0, |d| d.len()), Ordering::Relaxed);
+                                    if trace {
+                                        eprintln!("per-lane: {name} FSSM#{fi}: {} B, per-instruction {:?} B", k.dxil.len(), r.as_ref().map(|d| d.len()));
+                                    }
+                                }
+                                Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
+                            }
+                        }
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
                                 let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
@@ -1809,8 +1996,294 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
         println!("{}", rep.json(top));
     } else {
         println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
+        if lanes {
+            let mut why: Vec<(String, usize)> = lanes_why.into_inner().unwrap().into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            why.truncate(top);
+            println!("per-lane form: {} of {} compute programs; where it translates, {} B against {} B per instruction; refused for: {why:?}", lanes_ok.load(Ordering::Relaxed), lanes_tried.load(Ordering::Relaxed), lanes_bytes.load(Ordering::Relaxed), lanes_vs.load(Ordering::Relaxed));
+        }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
     0
+}
+
+/// `--time-forms [--windows W] [--heap] [--split 0|1] [--timeout S] [--limit N] [--threads T]
+/// [--warm] [--all N] [--max-hlsl MB] [--max-dxil KB] [--no-hlsl] [--dump DIR] [--out FILE]`: for each
+/// compute program the per-lane form translates, the same program in four forms, each made
+/// into a compute pipeline one at a time (no XCL cache, no concurrency): the per-lane form,
+/// #1426's per-instruction form, the HLSL path with W windows and the HLSL path with heap
+/// windows. Per form: translation time (+ DXC for HLSL), DXIL bytes and
+/// `CreateComputePipelineState` time. One CSV row per program, by record index and record hash
+/// (`shader::fnv64` of the record, as runtime logs name it; no names). Translations and pipeline
+/// builds run on threads of their own (256 MB stack) under `--timeout`: a cell with no result
+/// in that time reads `timeout` and the sweep goes on. That is a build still running (it keeps
+/// its thread) or one whose thread died without unwinding: under Wine, dxil-spirv's endless
+/// recursion on some programs overflows even the 256 MB stack (#1805).
+/// The driver's own shader cache is turned off for the process (`ShaderCacheControl`, needs
+/// Windows developer mode; vkd3d-proton does not implement it); `--warm` keeps it. The first
+/// row includes the driver's warm-up.
+/// `--heap`: the two direct forms with heap windows instead of W. `--no-hlsl`: the HLSL
+/// columns stay empty. `--dump DIR`: each form's DXIL as `DIR/<idx>_<pl|pi|hl|hh>.dxil`.
+fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
+    use std::time::{Duration, Instant};
+    // driver compilers recurse deeply on big programs (a 2 MB stack overflowed under Wine)
+    const BIG_STACK: usize = 256 << 20;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
+    let windows = opt("--windows").unwrap_or(4) as u32;
+    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    let timeout = Duration::from_secs(opt("--timeout").unwrap_or(120));
+    let limit = opt("--limit").map(|v| v as usize).unwrap_or(usize::MAX);
+    let out_path = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).cloned();
+    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or(8);
+    // `--all N`: a size-spread sample of N compute programs of every size (the 10 largest
+    // always in), not only the ones the per-lane form takes (its columns are empty where it
+    // refuses one)
+    let all = opt("--all").map(|v| v as usize);
+    let heap = args.iter().any(|a| a == "--heap");
+    let no_hlsl = args.iter().any(|a| a == "--no-hlsl");
+    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    if let Some(d) = &dump_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let dump = |idx: usize, form: &str, dxil: &[u8]| {
+        if let Some(d) = &dump_dir {
+            let _ = std::fs::write(d.join(format!("{idx}_{form}.dxil")), dxil);
+        }
+    };
+    // caps for the giants: no DXC above `--max-hlsl` MB of HLSL, no driver build above
+    // `--max-dxil` KB of DXIL (sizes are still recorded)
+    let max_hlsl = opt("--max-hlsl").unwrap_or(16) as usize * (1 << 20);
+    let max_dxil = opt("--max-dxil").unwrap_or(4096) as usize * 1024;
+    std::panic::set_hook(Box::new(|_| {}));
+
+    // phase 1 (parallel): the compute programs and whether the per-lane form takes them
+    struct Prog {
+        idx: usize,
+        blob: Vec<u8>,
+        code: Vec<u8>,
+        cs: recomp::CsInterface,
+        o: crate::gpu::dxil::kernel::KernelOptions,
+    }
+    let run_timed = |f: Box<dyn FnOnce() -> Result<crate::gpu::dxil::kernel::Kernel, String> + Send>| -> (Result<crate::gpu::dxil::kernel::Kernel, String>, Duration) {
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("panic".into())));
+        });
+        if let Err(e) = spawned {
+            return (Err(format!("no thread: {e}")), t.elapsed());
+        }
+        let r = rx.recv_timeout(timeout).unwrap_or_else(|_| Err("timeout".into()));
+        (r, t.elapsed())
+    };
+    let next = AtomicUsize::new(0);
+    let tried = AtomicUsize::new(0);
+    let covered: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let ri = next.fetch_add(1, Ordering::Relaxed);
+                if ri >= input.len() {
+                    break;
+                }
+                let (_, Some(blob)) = input.get(ri) else { continue };
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
+                let Some(recomp::Mode::Compute(cs)) = recomp::interface(&blob, &sh, f) else { continue };
+                let Some(p) = f.programs.first() else { continue };
+                let code = f.data[p.offset..p.offset + p.len].to_vec();
+                tried.fetch_add(1, Ordering::Relaxed);
+                let wave64 = recomp::detect_wave64(&code);
+                let mem_windows = if heap { windows | recomp::HEAP_WINDOWS } else { windows };
+                let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows, sampler_base: 0 };
+                if all.is_some() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                    continue;
+                }
+                let (c2, cs2) = (code.clone(), cs.clone());
+                let (r, _) = run_timed(Box::new(move || recomp::lower_dxil::compute_with(&c2, &cs2, o)));
+                if r.is_ok() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                }
+            });
+        }
+    });
+    let mut progs = covered.into_inner().unwrap();
+    if let Some(n) = all {
+        // evenly spaced over the programs ranked by size, plus the 10 largest
+        progs.sort_by_key(|p| (p.code.len(), p.idx));
+        let len = progs.len();
+        let mut keep: std::collections::BTreeSet<usize> = (0..n.min(len)).map(|i| i * len / n.max(1)).collect();
+        keep.extend(len.saturating_sub(10)..len);
+        progs = progs.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, p)| p).collect();
+        eprintln!("time-forms: --all: {} of {len} compute programs, by size", progs.len());
+    }
+    progs.sort_by_key(|p| p.idx);
+    if all.is_none() {
+        eprintln!("time-forms: per-lane form takes {} of {} compute programs ({:.0} s)", progs.len(), tried.load(Ordering::Relaxed), t0.elapsed().as_secs_f64());
+    }
+    eprintln!("time-forms: timing {} programs one at a time", progs.len().min(limit));
+    progs.truncate(limit);
+
+    // phase 2 (serial): every form of every covered program, translated then made
+    let pipelines = match Pipelines::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("time-forms: no D3D12 device: {e}");
+            return 1;
+        }
+    };
+    // cold driver builds: the driver's own shader cache off for this process (developer mode)
+    if args.iter().all(|a| a != "--warm") {
+        use windows::core::Interface;
+        let r = pipelines.dev.cast::<ID3D12Device9>().and_then(|d9| unsafe {
+            d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+        });
+        match r {
+            Ok(()) => eprintln!("time-forms: the driver's shader cache is off for this process"),
+            Err(e) => {
+                eprintln!("time-forms: cannot turn the driver's shader cache off ({e}): it needs Windows developer mode, and vkd3d-proton does not implement it; pass --warm to time with the driver's cache as it is (turn it off yourself for cold builds)");
+                return 1;
+            }
+        }
+    }
+    let fmt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
+    // a pipeline build on a thread of its own under `--timeout`: its ms, "" if refused, "timeout"
+    struct Dev(ID3D12Device);
+    // SAFETY: ID3D12Device is free-threaded
+    unsafe impl Send for Dev {}
+    let make = |dxil: &[u8], samplers: &[recomp::pso::StaticSampler]| -> String {
+        let (dev, dxil, samplers) = (Dev(pipelines.dev.clone()), dxil.to_vec(), samplers.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
+            let dev = dev;
+            let built = (|| {
+                let rs = recomp::pso::abi_root_signature_with(&dev.0, true, &samplers).ok()?;
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let r = unsafe { dev.0.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                r.ok().map(|_| ms)
+            })();
+            let _ = tx.send(built);
+        });
+        if spawned.is_err() {
+            return String::new();
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(ms) => fmt(ms),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "timeout".into(),
+            Err(_) => String::new(),
+        }
+    };
+    let mut csv = String::from("idx,hash,wave64,code_bytes,pl_tr_ms,pl_dxil,pl_pso_ms,pi_tr_ms,pi_dxil,pi_pso_ms,hl_tr_ms,hl_src,hl_dxc_ms,hl_dxil,hl_pso_ms,hh_tr_ms,hh_src,hh_dxc_ms,hh_dxil,hh_pso_ms\n");
+    for (n, p) in progs.iter().enumerate() {
+        let mut row = vec![p.idx.to_string(), format!("{:016x}", shader::fnv64(&p.blob)), (p.o.wave64 as u8).to_string(), p.code.len().to_string()];
+        // per-lane and per-instruction forms
+        for per_lane in [true, false] {
+            let (c, cs, o) = (p.code.clone(), p.cs.clone(), p.o);
+            let (r, tr) = run_timed(Box::new(move || if per_lane { recomp::lower_dxil::compute_with(&c, &cs, o) } else { crate::gpu::dxil::kernel::translate_compute(&c, o, &cs) }));
+            if let Ok(k) = &r {
+                dump(p.idx, if per_lane { "pl" } else { "pi" }, &k.dxil);
+            }
+            match r {
+                Ok(k) => row.extend([fmt(Some(tr.as_secs_f64() * 1000.0)), k.dxil.len().to_string(), if k.dxil.len() <= max_dxil { make(&k.dxil, &k.static_samplers) } else { String::new() }]),
+                Err(_) => row.extend([String::new(), String::new(), String::new()]),
+            }
+        }
+        // the HLSL path: W windows, then heap windows
+        for w in [windows, windows | recomp::HEAP_WINDOWS] {
+            if no_hlsl {
+                row.extend(std::iter::repeat_n(String::new(), 5));
+                continue;
+            }
+            let t = Instant::now();
+            let tr = recomp::pso::console_translation_compute(&p.blob, w, p.o.split);
+            let tr_ms = t.elapsed().as_secs_f64() * 1000.0;
+            match tr {
+                Ok((t_, _)) if t_.hlsl.len() > max_hlsl => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), String::new(), String::new(), String::new()]),
+                Ok((t_, profile)) => {
+                    let t = Instant::now();
+                    let d = recomp::dxc::compile(&t_.hlsl, "main", profile, &[]);
+                    let dxc_ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(d) = &d {
+                        dump(p.idx, if w & recomp::HEAP_WINDOWS != 0 { "hh" } else { "hl" }, d);
+                    }
+                    match d {
+                        Ok(d) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), d.len().to_string(), if d.len() <= max_dxil { make(&d, &t_.static_samplers) } else { String::new() }]),
+                        Err(_) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), String::new(), String::new()]),
+                    }
+                }
+                Err(_) => row.extend(std::iter::repeat_n(String::new(), 5)),
+            }
+        }
+        csv.push_str(&row.join(","));
+        csv.push('\n');
+        if let Some(path) = &out_path {
+            let _ = std::fs::write(path, &csv);
+        }
+        if all.is_some() || (n + 1) % 10 == 0 {
+            eprintln!("  {} / {} ({:.0} s)", n + 1, progs.len(), t0.elapsed().as_secs_f64());
+        }
+    }
+    if out_path.is_none() {
+        print!("{csv}");
+    }
+    eprintln!("time-forms: done, {} programs, {:.0} s", progs.len(), t0.elapsed().as_secs_f64());
+    0
+}
+
+/// A survey reason without its program's numbers: registers as `sN`, other numbers as `N`
+/// (an `s_setreg`'s hardware register is kept), at most eight words.
+fn survey_key(r: &str) -> String {
+    let r = r.split(" (").next().unwrap_or(r);
+    let words: Vec<&str> = r.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, raw) in words.iter().enumerate() {
+        let w = raw.trim_end_matches([':', ',']);
+        let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+        let w = if w.strip_prefix('s').is_some_and(digits) {
+            "sN".to_string()
+        } else if digits(w) && !(i > 0 && words[i - 1] == "hwreg") {
+            "N".to_string()
+        } else {
+            w.to_string()
+        };
+        out.push(if raw.ends_with(':') { format!("{w}:") } else { w });
+        if out.len() == 8 {
+            break;
+        }
+    }
+    out.join(" ")
+}
+
+/// A per-lane refusal no instruction lowering removes (the CFG, masks across joins, lanes
+/// elsewhere, the group shape), as opposed to an instruction the per-lane form lacks.
+fn survey_structural(r: &str) -> bool {
+    [
+        "2-D / 3-D",
+        "elsewhere",
+        "read as a number",
+        "read as a mask",
+        "across two masks",
+        "successors",
+        "unsupported branch",
+        "neither a number nor a mask",
+        "empty program",
+        "lane conditions",
+        "indirect jump",
+        "branch to the entry",
+        "irreducible",
+        "no fixpoint",
+        "cannot decode",
+    ]
+    .iter()
+    .any(|w| r.contains(w))
 }
