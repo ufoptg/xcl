@@ -464,6 +464,15 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
 }
 
 pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    // this process is the title's: what it asks for itself goes where VirtualAlloc puts it –
+    // graphics memory, a sparse window, the unified region – and not into plain Windows memory
+    // the GPU has no address for (`sanitize_alloc_type` drops MEM_GRAPHICS)
+    // this process is the title's: what it asks for itself goes where VirtualAlloc puts it –
+    // graphics memory, a sparse window, the unified region – and not into plain Windows memory
+    // the GPU has no address for (`sanitize_alloc_type` drops MEM_GRAPHICS)
+    if proc_ == thr::GetCurrentProcess() {
+        return VirtualAlloc(addr, size, t, p);
+    }
     mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
@@ -2855,6 +2864,26 @@ mod tests {
                 assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
                 assert!(!in_graphics_reservation(a));
             }
+        }
+    }
+
+    /// `VirtualAllocEx(GetCurrentProcess(), …)` is the title asking for its own memory: it must
+    /// be the title's (graphics memory here), not a plain Windows reservation the GPU cannot see.
+    #[test]
+    fn virtual_alloc_ex_for_this_process_is_the_titles_allocator() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return;
+            }
+            let cur = thr::GetCurrentProcess();
+            let q = VirtualAllocEx(cur, std::ptr::null(), 0x1_0000, mem::MEM_RESERVE | MEM_GRAPHICS, mem::PAGE_READWRITE);
+            assert!(!q.is_null(), "a graphics reservation");
+            let a = q as usize;
+            assert!(
+                crate::gpu::uma::get().is_some_and(|u| u.contains(a) || u.is_sparse(a)),
+                "VirtualAllocEx(GetCurrentProcess()) must land in the title's memory, got {a:#x}"
+            );
+            assert_eq!(VirtualFreeEx(cur, q, 0, mem::MEM_RELEASE), 1);
         }
     }
 
