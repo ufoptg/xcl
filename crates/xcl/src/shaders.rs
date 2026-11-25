@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -998,7 +998,8 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
-/// cache the runtime reads at startup. Nothing runs on the GPU.
+/// cache the runtime reads at startup. Resumable: pipelines already in the driver cache are
+/// skipped. Nothing runs on the GPU.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
@@ -1009,10 +1010,92 @@ struct Pipelines {
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// after one cached `.pso` blob is accepted by this device/driver, skip `CreateComputePipelineState`
+    /// on further existing blobs; if a cached blob is rejected (stale/corrupt), verify every blob
+    cache_trust: CacheTrust,
 }
 
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
+
+/// Trust state of the on-disk driver cache for this `--pipelines` run.
+struct CacheTrust(AtomicU8);
+
+impl CacheTrust {
+    const UNCHECKED: u8 = 0;
+    const TRUSTED: u8 = 1;
+    const VERIFY_ALL: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::UNCHECKED))
+    }
+
+    fn can_skip(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::TRUSTED
+    }
+
+    fn record(&self, accepted: bool) {
+        if accepted {
+            let _ = self.0.compare_exchange(Self::UNCHECKED, Self::TRUSTED, Ordering::AcqRel, Ordering::Acquire);
+        } else {
+            self.0.store(Self::VERIFY_ALL, Ordering::Release);
+        }
+    }
+}
+
+/// Whether `path` already holds a non-empty cached driver blob on disk.
+fn has_cached_blob(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// RAII permit for `Pipelines::running`: releases the slot on early return or panic.
+struct RunningSlot<'a>(&'a (Mutex<usize>, std::sync::Condvar));
+
+impl<'a> RunningSlot<'a> {
+    fn acquire(running: &'a (Mutex<usize>, std::sync::Condvar), most: usize) -> Self {
+        let (count, cv) = running;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= most {
+            n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        Self(running)
+    }
+}
+
+impl Drop for RunningSlot<'_> {
+    fn drop(&mut self) {
+        let (count, cv) = self.0;
+        *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
+}
+
+/// RAII wrapper around `D3D12_COMPUTE_PIPELINE_STATE_DESC` so its `ManuallyDrop` root signature
+/// COM reference is always released, including on panic unwind.
+struct ComputePsoDesc(windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC);
+
+impl Drop for ComputePsoDesc {
+    fn drop(&mut self) {
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0.pRootSignature) };
+    }
+}
+
+/// `(graphics_split, compute_split)` for `--precompile`: explicit `--split` overrides both;
+/// otherwise ask the `--pipelines` device directly rather than pinning `runner::GPU`'s singleton.
+fn resolve_split_flags<F, G>(split: Option<bool>, from_device: Option<F>, from_runner: G) -> (bool, bool)
+where
+    F: FnOnce() -> (bool, bool),
+    G: FnOnce() -> (bool, bool),
+{
+    if let Some(s) = split {
+        return (s, s);
+    }
+    if let Some(f) = from_device {
+        return f();
+    }
+    from_runner()
+}
 
 impl Pipelines {
     fn new() -> Result<Pipelines, String> {
@@ -1024,13 +1107,26 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, cache_trust: CacheTrust::new() })
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
+    /// The compute pipeline of `c` (made and released, or skipped when the driver cache is trusted).
     fn make(&self, c: &recomp::pso::Compiled) {
+        use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::*;
+
+        let path = driver_cache::path(&c.dxil, 0);
+        if self.cache_trust.can_skip() && path.as_deref().is_some_and(has_cached_blob) {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let slot = RunningSlot::acquire(&self.running, self.most);
+        // Another worker may have verified the canary or written this blob while this one waited.
+        if self.cache_trust.can_skip() && path.as_deref().is_some_and(has_cached_blob) {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -1048,31 +1144,26 @@ impl Pipelines {
                 },
             }
         };
-        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        let mut desc = ComputePsoDesc(D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
-        };
-        {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
-            }
-            *n += 1;
-        }
-        use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
-        let cached = path.as_deref().and_then(driver_cache::load);
-        let from_cache = cached.as_ref().and_then(|bytes| {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
         });
-        let r = if let Some(pso) = from_cache {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        if let Some(bytes) = path.as_deref().and_then(driver_cache::load) {
+            desc.0.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
+            let reused = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc.0) }.is_ok();
+            desc.0.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            drop(bytes);
+            self.cache_trust.record(reused);
+            if reused {
+                drop(desc);
+                drop(slot);
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        let ok = {
+            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc.0) };
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1082,14 +1173,14 @@ impl Pipelines {
                     }
                 }
             }
-            pso
+            pso.is_ok()
         };
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+        drop(desc);
+        drop(slot);
+        let done = if ok {
+            self.made.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.refused.fetch_add(1, Ordering::Relaxed) + 1
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
@@ -1119,9 +1210,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     // no title runs: only a little commit is kept free besides the compiles
     recomp::dxc::set_memory_reserve(2);
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
-    // `--split` sets both
-    let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
+    // `--split` sets both. With `--pipelines`, query `p.dev` directly instead of pinning
+    // `runner::GPU`'s process-wide D3D12 device singleton.
+    let (graphics_split, split) = resolve_split_flags(
+        split,
+        pipelines.map(|p| move || (recomp::pso::graphics_wave32_for_device(&p.dev), recomp::pso::wave32_only_for_device(&p.dev))),
+        || (recomp::runner::graphics_wave32(), recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w)),
+    );
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -1222,7 +1317,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     );
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
-        println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        println!("pipelines already in the driver cache {}", p.reused.load(Ordering::Relaxed));
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
@@ -1662,6 +1757,140 @@ mod tests {
         assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
+    }
+
+    #[test]
+    fn has_cached_blob_requires_non_empty_file() {
+        let dir = std::env::temp_dir().join(format!("xcl-shaders-cached-blob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+
+        let missing = dir.join("missing.pso");
+        assert!(!has_cached_blob(&missing));
+        assert!(!has_cached_blob(&dir), "directory is not a cached blob");
+
+        let empty = dir.join("empty.pso");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!has_cached_blob(&empty));
+
+        let present = dir.join("present.pso");
+        std::fs::write(&present, b"blob").unwrap();
+        assert!(has_cached_blob(&present));
+    }
+
+    #[test]
+    fn running_slot_releases_on_drop_and_unwind() {
+        let running = (Mutex::new(0usize), std::sync::Condvar::new());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = RunningSlot::acquire(&running, 1);
+            assert_eq!(*running.0.lock().unwrap(), 1);
+            panic!("simulated failure while holding slot");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(*running.0.lock().unwrap(), 0);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let first = RunningSlot::acquire(&running, 1);
+            let running_ref = &running;
+            s.spawn(move || {
+                entered_tx.send(()).unwrap();
+                let _second = RunningSlot::acquire(running_ref, 1);
+                acquired_tx.send(()).unwrap();
+            });
+            entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert!(acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+            drop(first);
+            acquired_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        });
+        assert_eq!(*running.0.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_split_flags_prefers_explicit_then_device_then_runner() {
+        let mut dev_called = false;
+        let mut runner_called = false;
+        assert_eq!(
+            resolve_split_flags(
+                Some(true),
+                Some(|| {
+                    dev_called = true;
+                    (false, false)
+                }),
+                || {
+                    runner_called = true;
+                    (false, false)
+                },
+            ),
+            (true, true)
+        );
+        assert!(!dev_called && !runner_called);
+
+        assert_eq!(
+            resolve_split_flags(
+                Some(false),
+                Some(|| {
+                    dev_called = true;
+                    (true, true)
+                }),
+                || {
+                    runner_called = true;
+                    (true, true)
+                },
+            ),
+            (false, false)
+        );
+        assert!(!dev_called && !runner_called);
+
+        assert_eq!(
+            resolve_split_flags(
+                None,
+                Some(|| {
+                    dev_called = true;
+                    (true, false)
+                }),
+                || {
+                    runner_called = true;
+                    (false, true)
+                },
+            ),
+            (true, false)
+        );
+        assert!(dev_called && !runner_called);
+
+        assert_eq!(
+            resolve_split_flags(
+                None,
+                None::<fn() -> (bool, bool)>,
+                || {
+                    runner_called = true;
+                    (false, true)
+                },
+            ),
+            (false, true)
+        );
+        assert!(runner_called);
+    }
+
+    #[test]
+    fn cache_trust_skips_after_canary_hit_and_verifies_all_after_reject() {
+        let trust = CacheTrust::new();
+        assert!(!trust.can_skip());
+        trust.record(true);
+        assert!(trust.can_skip());
+        trust.record(false);
+        assert!(!trust.can_skip());
+        // Once a stale or corrupt blob is seen, a later hit must not re-enable blind skipping.
+        trust.record(true);
+        assert!(!trust.can_skip());
     }
 }
 

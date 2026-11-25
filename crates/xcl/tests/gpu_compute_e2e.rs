@@ -104,24 +104,35 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
             .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
             .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
         text
     };
-    run(false);
+    let disabled = run(false);
+    assert!(disabled.contains("pipelines made on the GPU 1, refused 0"), "{disabled}");
     assert!(!cache.join("driver").exists());
-    run(true);
+    let cold = run(true);
+    assert!(cold.contains("pipelines made on the GPU 1, refused 0"), "{cold}");
+    assert!(cold.contains("pipelines already in the driver cache 0"), "{cold}");
     let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
         .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
     let dxil = fs::read(dxil_file).unwrap();
     let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
     let driver_file = cache.join("driver").join(name);
-    assert!(driver_file.metadata().unwrap().len() > 0);
+    let blob_bytes = fs::read(&driver_file).unwrap();
+    assert!(!blob_bytes.is_empty());
     let warm = run(true);
-    // A blob from an earlier driver can be refused. The normal build must still succeed.
+    assert!(warm.contains("pipelines made on the GPU 0, refused 0"), "{warm}");
+    assert!(warm.contains("pipelines already in the driver cache 1"), "{warm}");
+    assert_eq!(fs::read(&driver_file).unwrap(), blob_bytes);
+    // A stale/corrupt cached blob is rejected by the canary check and rebuilt on the GPU.
     fs::write(&driver_file, b"invalid cached pipeline").unwrap();
-    run(true);
+    let rebuilt = run(true);
+    let rebuilt_bytes = fs::read(&driver_file).unwrap();
     let _ = fs::remove_dir_all(&dir);
-    assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+    assert!(rebuilt.contains("pipelines made on the GPU 1, refused 0"), "{rebuilt}");
+    assert!(rebuilt.contains("pipelines already in the driver cache 0"), "{rebuilt}");
+    assert!(!rebuilt_bytes.is_empty());
+    assert_ne!(rebuilt_bytes, b"invalid cached pipeline");
 }
 
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
