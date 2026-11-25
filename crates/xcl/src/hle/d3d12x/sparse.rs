@@ -641,13 +641,20 @@ impl State {
         h
     }
 
+    fn reap_retired_pools(&mut self) {
+        if self.retired.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let done = unsafe { self.fence.GetCompletedValue() };
+        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+    }
+
     /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
     /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
-        let now = std::time::Instant::now();
-        let done = unsafe { self.fence.GetCompletedValue() };
-        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        self.reap_retired_pools();
         if self.free.len() < POOL_TILES as usize {
             return;
         }
@@ -660,10 +667,21 @@ impl State {
             return;
         }
         self.free.retain(|&(h, _)| !gone.contains(&(h as usize)));
+        let now = std::time::Instant::now();
         for h in gone {
             if let Some(heap) = self.pools[h].take() {
                 self.retired.push((heap, self.value, now));
             }
+        }
+    }
+
+    unsafe fn prepare_submit(&mut self) {
+        // The next title submission must see the old pages unmapped.
+        if self.flush_parked() {
+            self.retire_free_pools();
+        } else {
+            // A steady workload may submit for a long time without unmapping more tiles.
+            self.reap_retired_pools();
         }
     }
 
@@ -1460,10 +1478,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
-    // the title's work sees what was decommitted unmapped, as it was
-    if s.flush_parked() {
-        s.retire_free_pools();
-    }
+    s.prepare_submit();
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
     let zero_runs = std::mem::take(&mut s.to_zero);
@@ -1702,6 +1717,22 @@ mod tests {
                 runs: None,
                 scratch_runs: Vec::new(),
             };
+
+            let (idle_tile, _) = s.take_tile().expect("a tile for the submit checks");
+            s.free.push(idle_tile);
+            s.retire_free_pools();
+            assert!(s.parked.is_empty());
+            s.prepare_submit();
+            assert_eq!(s.retired.len(), 1, "a recent pool remains available for reuse");
+
+            s.retired[0].1 = 1;
+            s.retired[0].2 -= std::time::Duration::from_secs(3);
+            s.prepare_submit();
+            assert_eq!(s.retired.len(), 1, "an old pool still waits for the GPU fence");
+
+            s.fence.Signal(1).expect("complete the sparse fence");
+            s.prepare_submit();
+            assert!(s.retired.is_empty(), "an ordinary submit releases an expired pool even with no parked mappings");
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
             assert!(!reused, "a new pool's tile needs no clearing");
