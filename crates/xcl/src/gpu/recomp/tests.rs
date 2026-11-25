@@ -7730,3 +7730,399 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// #1751's first measurement: GPU time of the emulated traversal against the GPU's own ray
+/// tracing hardware, on the same scene and rays. The emulated side walks a console-format BVH
+/// from `bvh::build` with a short stack and the `bvh_intersect` of the translated programs
+/// (taken from a translation, so it is the code titles run); the host side builds a DXR
+/// BLAS + TLAS from the same triangles and traces with inline `RayQuery`. Both must find the
+/// same closest hits. `XCL_BENCH_GRID` sets the terrain's quads per side (default 256:
+/// 131 072 triangles), `XCL_BENCH_RAYS` the rays per side (default 1024).
+#[test]
+#[ignore]
+fn gpu_bvh_host_dxr_vs_emulated_traversal() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    let env = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (grid, side) = (env("XCL_BENCH_GRID", 256), env("XCL_BENCH_RAYS", 1024));
+    // a terrain: grid × grid quads over [0, grid]², heights from a few sines
+    let h = |x: f32, y: f32| 4.0 * (x * 0.07).sin() * (y * 0.05).cos() + 1.5 * (x * 0.31 + y * 0.17).sin();
+    let mut tris: Vec<crate::gpu::bvh::Triangle> = Vec::new();
+    for y in 0..grid {
+        for x in 0..grid {
+            let p = |x: u32, y: u32| [x as f32, y as f32, h(x as f32, y as f32)];
+            tris.push([p(x, y), p(x + 1, y), p(x, y + 1)]);
+            tris.push([p(x + 1, y), p(x + 1, y + 1), p(x, y + 1)]);
+        }
+    }
+    let bvh = crate::gpu::bvh::build(&tris, 0);
+
+    // the emulated node test, as the translator emits it
+    let probe = prog(&[("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 15)], None)]);
+    let hlsl = translate(&probe, &Options::default()).unwrap().hlsl;
+    let func = |sig: &str| -> String {
+        let at = hlsl.find(sig).unwrap_or_else(|| panic!("{sig} not in the translation"));
+        let (mut depth, mut end) = (0i32, at);
+        for (k, c) in hlsl[at..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = at + k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        hlsl[at..end].to_string()
+    };
+    let helpers = format!("{}\n{}\n", func("uint pick4("), func("uint4 bvh_intersect("));
+
+    // rays: 0 = a camera over the terrain (coherent), 1 = random directions from points just
+    // above it (incoherent, as GI / shadow rays)
+    let rays = format!(
+        r#"
+#define SIDE {side}u
+#define GRID {grid}.0f
+uint hash(uint x) {{ x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }}
+float unit(uint x) {{ return (float)(hash(x) & 0xFFFFFFu) / 16777216.0f; }}
+void ray(uint kind, uint2 p, out float3 o, out float3 d) {{
+    if (kind == 0u) {{
+        float2 uv = (float2(p) + 0.5f) / (float)SIDE * 2.0f - 1.0f;
+        o = float3(GRID * 0.5f, -GRID * 0.3f, GRID * 0.35f);
+        d = normalize(float3(uv.x * 0.8f, 1.0f, -0.45f + uv.y * 0.4f));
+    }} else {{
+        uint s = p.y * SIDE + p.x;
+        o = float3(unit(s * 4u) * GRID, unit(s * 4u + 1u) * GRID, 7.0f);
+        float z = unit(s * 4u + 2u) * 2.0f - 1.0f, a = unit(s * 4u + 3u) * 6.2831853f;
+        float r = sqrt(max(0.0f, 1.0f - z * z));
+        d = float3(r * cos(a), r * sin(a), -abs(z) - 0.05f);
+    }}
+}}
+"#
+    );
+    let emulated = format!(
+        r#"
+RWByteAddressBuffer mem : register(u0);
+RWStructuredBuffer<float> out_t : register(u1);
+cbuffer c : register(b0) {{ uint kind; }}
+{helpers}{rays}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    float3 o, d; ray(kind, id.xy, o, d);
+    float3 inv = 1.0f / d;
+    float best = 1e30f;
+    uint stack[64]; uint sp = 0u; uint node = {root}u;
+    [loop] for (uint it = 0u; it < 100000u; it++) {{
+        uint4 r = bvh_intersect(node & 7u, (node & ~7u) << 3, best, o, d, inv, true);
+        if ((node & 7u) >= 4u) {{
+            // children closest first: pushed farthest first
+            [unroll] for (int k = 3; k >= 0; k--) {{ if (r[k] != 0xFFFFFFFFu && sp < 64u) {{ stack[sp] = r[k]; sp++; }} }}
+        }} else {{
+            float t = asfloat(r.x) / asfloat(r.y);
+            if (t >= 0.0f && t < best) best = t;
+        }}
+        if (sp == 0u) break;
+        sp--; node = stack[sp];
+    }}
+    out_t[id.y * SIDE + id.x] = best;
+}}
+"#,
+        root = bvh.root
+    );
+    let host = format!(
+        r#"
+RaytracingAccelerationStructure scene : register(t0);
+RWStructuredBuffer<float> out_t : register(u1);
+cbuffer c : register(b0) {{ uint kind; }}
+{rays}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    float3 o, d; ray(kind, id.xy, o, d);
+    RayDesc r; r.Origin = o; r.Direction = d; r.TMin = 0.0f; r.TMax = 1e30f;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, r);
+    while (q.Proceed()) {{}}
+    out_t[id.y * SIDE + id.x] = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : 1e30f;
+}}
+"#
+    );
+    let cs_emulated = super::dxc::compile(&emulated, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{emulated}"));
+    let cs_host = super::dxc::compile(&host, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{host}"));
+
+    unsafe {
+        // the adapter the other GPU tests run on (`XCL_ADAPTER`), so the label names the GPU
+        // that was measured
+        use windows::Win32::Graphics::Dxgi::*;
+        use crate::gpu::adapter::{self, Selector};
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            runner::skip_test("no DXGI factory");
+            return;
+        };
+        let sel = Selector::from_env_or("auto");
+        let picked = if sel == Selector::Warp {
+            factory.EnumWarpAdapter::<IDXGIAdapter1>().ok().map(|a| (a, "WARP (software renderer)".to_string()))
+        } else {
+            adapter::candidates(&factory, &sel).into_iter().next().map(|(a, d)| (a, adapter::name(&d)))
+        };
+        let Some((gpu, gpu_name)) = picked else {
+            runner::skip_test("no GPU");
+            return;
+        };
+        let Some(dev) = crate::gpu::agility::create_device(&gpu, D3D_FEATURE_LEVEL_12_1).ok().and_then(|d| d.cast::<ID3D12Device5>().ok()) else {
+            runner::skip_test("no D3D12 device 5");
+            return;
+        };
+        let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        let _ = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &mut o5 as *mut _ as *mut _, std::mem::size_of_val(&o5) as u32);
+        if o5.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+            runner::skip_test("no DXR 1.1");
+            return;
+        }
+        let buffer = |size: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+            let hp = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(256),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, None, &mut r).unwrap();
+            r.unwrap()
+        };
+        let upload = |bytes: &[u8]| -> ID3D12Resource {
+            let b = buffer(bytes.len() as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p = std::ptr::null_mut();
+            b.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+            b.Unmap(0, None);
+            b
+        };
+        let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList4 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut fv = 0u64;
+        let mut run = |list: &ID3D12GraphicsCommandList4| {
+            list.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            fv += 1;
+            q.Signal(&fence, fv).unwrap();
+            while fence.GetCompletedValue() < fv {
+                assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed");
+                std::thread::yield_now();
+            }
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+        };
+        let qheap: ID3D12QueryHeap = {
+            let mut h: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 64, NodeMask: 0 }, &mut h).unwrap();
+            h.unwrap()
+        };
+        let ticks = q.GetTimestampFrequency().unwrap() as f64;
+        let stamps = buffer(64 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let read_stamps = |n: usize| -> Vec<u64> {
+            let mut p = std::ptr::null_mut();
+            stamps.Map(0, None, Some(&mut p)).unwrap();
+            let v = std::slice::from_raw_parts(p as *const u64, n).to_vec();
+            stamps.Unmap(0, None);
+            v
+        };
+
+        // the host structures from the same triangles
+        let verts: Vec<u8> = tris.iter().flatten().flatten().flat_map(|f| f.to_le_bytes()).collect();
+        let vb = upload(&verts);
+        let geom = D3D12_RAYTRACING_GEOMETRY_DESC {
+            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                    VertexCount: (tris.len() * 3) as u32,
+                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE { StartAddress: vb.GetGPUVirtualAddress(), StrideInBytes: 12 },
+                    ..Default::default()
+                },
+            },
+        };
+        let mut bottom = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { pGeometryDescs: &geom },
+        };
+        let mut pre = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        dev.GetRaytracingAccelerationStructurePrebuildInfo(&bottom, &mut pre);
+        let blas = buffer(pre.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        let blas_size = pre.ResultDataMaxSizeInBytes;
+        let scratch = buffer(pre.ScratchDataSizeInBytes.max(1 << 20), D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let mut inst = [0u8; 64];
+        for (k, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0].iter().enumerate() {
+            inst[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        inst[48..52].copy_from_slice(&(0xFFu32 << 24).to_le_bytes());
+        inst[56..64].copy_from_slice(&blas.GetGPUVirtualAddress().to_le_bytes());
+        let ib = upload(&inst);
+        let mut top = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { InstanceDescs: ib.GetGPUVirtualAddress() },
+        };
+        let mut pre_top = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        dev.GetRaytracingAccelerationStructurePrebuildInfo(&top, &mut pre_top);
+        let tlas = buffer(pre_top.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        let scratch_top = buffer(pre_top.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let uav_barrier = |r: &ID3D12Resource| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::transmute_copy(r) }) },
+        };
+        list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        let b = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: blas.GetGPUVirtualAddress(),
+            Inputs: bottom,
+            ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+            ..Default::default()
+        };
+        list.BuildRaytracingAccelerationStructure(&b, None);
+        list.ResourceBarrier(&[uav_barrier(&blas)]);
+        list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        let t = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: tlas.GetGPUVirtualAddress(),
+            Inputs: top,
+            ScratchAccelerationStructureData: scratch_top.GetGPUVirtualAddress(),
+            ..Default::default()
+        };
+        list.BuildRaytracingAccelerationStructure(&t, None);
+        list.ResourceBarrier(&[uav_barrier(&tlas)]);
+        list.ResolveQueryData(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &stamps, 0);
+        run(&list);
+        let s = read_stamps(2);
+        let blas_ms = (s[1] - s[0]) as f64 / ticks * 1e3;
+        let _ = (&mut bottom, &mut top);
+
+        // the console structure for the emulated walk, at address 0 of its buffer
+        let bvh_up = upload(&bvh.data);
+        let bvh_buf = buffer(bvh.data.len() as u64, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_COPY_DEST);
+        list.CopyBufferRegion(&bvh_buf, 0, &bvh_up, 0, bvh.data.len() as u64);
+        let to_uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&bvh_buf),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                }),
+            },
+        };
+        list.ResourceBarrier(&[to_uav]);
+        run(&list);
+
+        // one root signature for both: u0 the console BVH, u1 the results, t0 the TLAS, b0 the ray kind
+        let params = [
+            D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+            D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+            D3D12_ROOT_PARAMETER { ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV, Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } }, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 1 } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rsd = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), ..Default::default() };
+        let mut blob = None;
+        D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).unwrap();
+        let blob = blob.unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).unwrap();
+        let pso = |cs: &[u8]| -> ID3D12PipelineState {
+            let mut d = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+            d.pRootSignature = std::mem::transmute_copy(&rs);
+            d.CS = D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() };
+            dev.CreateComputePipelineState(&d).unwrap()
+        };
+        let (p_emulated, p_host) = (pso(&cs_emulated), pso(&cs_host));
+        let n = (side * side) as usize;
+        let out = buffer((n * 4) as u64, D3D12_HEAP_TYPE_DEFAULT, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let back = buffer((n * 4) as u64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let to = |state_before, state_after| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&out),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: state_before,
+                    StateAfter: state_after,
+                }),
+            },
+        };
+        const REPEAT: u32 = 5;
+        // GPU ms (best of REPEAT) and the closest t of every ray
+        let mut trace = |p: &ID3D12PipelineState, kind: u32| -> (f64, Vec<f32>) {
+            list.SetComputeRootSignature(&rs);
+            list.SetPipelineState(p);
+            list.SetComputeRootUnorderedAccessView(0, bvh_buf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(2, tlas.GetGPUVirtualAddress());
+            list.SetComputeRoot32BitConstant(3, kind, 0);
+            for k in 0..REPEAT {
+                list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
+                list.Dispatch(side / 8, side / 8, 1);
+                list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
+                list.ResourceBarrier(&[uav_barrier(&out)]);
+            }
+            list.ResolveQueryData(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * REPEAT, &stamps, 0);
+            list.ResourceBarrier(&[to(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyResource(&back, &out);
+            list.ResourceBarrier(&[to(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            run(&list);
+            let s = read_stamps(2 * REPEAT as usize);
+            let ms = (0..REPEAT as usize).map(|k| (s[2 * k + 1] - s[2 * k]) as f64 / ticks * 1e3).fold(f64::INFINITY, f64::min);
+            let mut p = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut p)).unwrap();
+            let v = std::slice::from_raw_parts(p as *const f32, n).to_vec();
+            back.Unmap(0, None);
+            (ms, v)
+        };
+        println!(
+            "{gpu_name}: {} triangles; console BVH {} KB, host BLAS {} KB built in {blas_ms:.2} ms; {n} rays per run",
+            tris.len(),
+            bvh.data.len() / 1024,
+            blas_size / 1024
+        );
+        for (kind, what) in [(0u32, "coherent (camera)"), (1, "incoherent (random directions)")] {
+            let (ms_e, t_e) = trace(&p_emulated, kind);
+            let (ms_h, t_h) = trace(&p_host, kind);
+            let same = t_e.iter().zip(&t_h).filter(|(a, b)| (**a >= 1e29 && **b >= 1e29) || (**a - **b).abs() <= 1e-3 * a.abs().max(1.0)).count();
+            let hits = t_h.iter().filter(|t| **t < 1e29).count();
+            println!(
+                "{what}: emulated {ms_e:.3} ms ({:.0} Mrays/s), host RayQuery {ms_h:.3} ms ({:.0} Mrays/s), {:.1}x; {hits} hits; same closest t on {same} of {n} rays",
+                n as f64 / ms_e / 1e3,
+                n as f64 / ms_h / 1e3,
+                ms_e / ms_h
+            );
+            // the two walks find the same hits (rays grazing an edge shared by two triangles may differ)
+            assert!(same as f64 >= 0.999 * n as f64, "{what}: only {same} of {n} rays agree");
+        }
+    }
+}
