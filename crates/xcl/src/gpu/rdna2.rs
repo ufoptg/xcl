@@ -449,6 +449,9 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
 }
 
 pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
+    if d.enc.name == "ENC_MIMG" {
+        return mimg_vgpr_uses(d);
+    }
     let (mut r, mut w) = (Vec::new(), Vec::new());
     for o in d.ienc.operands {
         let Some(f) = o.field else { continue };
@@ -484,6 +487,78 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         r.extend(w.iter().copied());
     }
     (r, w)
+}
+
+/// `vgpr_uses` of an image instruction, counted as it uses them (the operand tables give the
+/// largest case: four data registers, the address of a 3-D sample with every modifier). The
+/// address is VADDR and the registers after it, or with NSA VADDR then one register per byte of
+/// the extra dwords (VADDRA, VADDRB, …). The data: the DMASK components (D16: two per register),
+/// four for a gather and for BVH; an atomic reads its data (a compare-swap two registers: the
+/// new value, then the compare value) and with GLC gets the value before back in the first.
+fn mimg_vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let name = d.inst.name;
+    let (vaddr, n) = (f("VADDR"), mimg_address_dwords(d));
+    let mut r: Vec<u64> = match f("NSA") {
+        0 => (vaddr..vaddr + n).collect(),
+        nsa => {
+            let extra = (0..(n - 1).min(4 * nsa)).map(|j| bits(&d.words, 64 + 8 * j as u32, 8));
+            std::iter::once(vaddr).chain(extra).collect()
+        }
+    };
+    let dmask = (f("DMASK").count_ones() as u64).max(1);
+    let (reads, writes) = if name.starts_with("IMAGE_BVH") {
+        (0, 4)
+    } else if name.starts_with("IMAGE_ATOMIC") {
+        let cmpswap = name.contains("CMPSWAP");
+        let n = if cmpswap { dmask.max(2) } else { dmask };
+        let back = if cmpswap { n / 2 } else { n };
+        (n, if f("GLC") == 1 { back } else { 0 })
+    } else {
+        let n = if name.starts_with("IMAGE_GATHER") || name == "IMAGE_MSAA_LOAD" { 4 } else { dmask };
+        let n = if f("D16") == 1 && name != "IMAGE_GET_RESINFO" { n.div_ceil(2) } else { n };
+        if name.starts_with("IMAGE_STORE") { (n, 0) } else { (0, n + (f("TFE") | f("LWE"))) }
+    };
+    let vdata = f("VDATA");
+    r.extend(vdata..vdata + reads);
+    r.retain(|&v| v < 256);
+    (r, (vdata..(vdata + writes).min(256)).collect())
+}
+
+/// The address dwords of an image instruction, in the order and packing `recomp::emit` and
+/// `dxil::lower_image` read them: offset, bias, z-compare, derivatives, the DIM's coordinates,
+/// then LOD (or mip level) and clamp. With A16 the 16-bit components pair up in dwords; the
+/// offset, z-compare and derivatives stay 32-bit.
+fn mimg_address_dwords(d: &Decoded) -> u64 {
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (name, a16) = (d.inst.name, f("A16") == 1);
+    match name {
+        "IMAGE_BVH_INTERSECT_RAY" => return if a16 { 8 } else { 11 },
+        "IMAGE_BVH64_INTERSECT_RAY" => return if a16 { 9 } else { 12 },
+        "IMAGE_GET_RESINFO" => return 1,
+        _ => {}
+    }
+    let dim = f("DIM") as usize;
+    let coords = [1, 2, 3, 3, 2, 3, 3, 4][dim];
+    let mods: Vec<&str> = name.split('_').skip(2).collect();
+    let has = |m: &str| mods.contains(&m) as usize;
+    // the components in address order: true for a 16-bit one
+    let mut halves: Vec<bool> = Vec::new();
+    if name.starts_with("IMAGE_SAMPLE") || name.starts_with("IMAGE_GATHER") {
+        let grads = if has("D") + has("CD") > 0 { [1, 2, 3, 2, 1, 2, 2, 2][dim] } else { 0 };
+        halves.extend(std::iter::repeat_n(false, has("O")));
+        halves.extend(std::iter::repeat_n(a16, has("B")));
+        halves.extend(std::iter::repeat_n(false, has("C") + 2 * grads));
+        halves.extend(std::iter::repeat_n(a16, coords + has("L") + has("CL")));
+    } else {
+        halves.extend(std::iter::repeat_n(a16, coords + has("MIP")));
+    }
+    // in 16-bit units; a 32-bit component starts a dword
+    let mut at = 0u64;
+    for half in halves {
+        at = if half { at + 1 } else { at.next_multiple_of(2) + 2 };
+    }
+    at.div_ceil(2)
 }
 
 /// Target of a direct branch (s_branch, s_cbranch_*), or None for anything else
@@ -740,6 +815,83 @@ mod tests {
         assert_eq!(format(&d), "v_madmk_f32 v1, v2, 0x3f800000, v3");
         // spec instructions keep their opcodes
         assert_eq!(decode(&[0x01, 0x05, 0x0a, 0x56], 0).unwrap().inst.name, "V_FMAC_F32");
+    }
+
+    /// An image instruction; `nsa`: the address registers after VADDR, in the NSA dwords.
+    fn mimg(name: &str, fields: &[(&str, u64)], nsa: &[u8]) -> Decoded {
+        let mut f = fields.to_vec();
+        f.push(("NSA", nsa.len().div_ceil(4) as u64));
+        let mut b = encode(name, "ENC_MIMG", &f, None).unwrap();
+        for c in nsa.chunks(4) {
+            b.extend((0..4).map(|k| c.get(k).copied().unwrap_or(0)));
+        }
+        let d = decode(&b, 0).unwrap();
+        assert_eq!(d.len, b.len(), "{name}");
+        d
+    }
+
+    #[test]
+    fn image_register_uses() {
+        let uses = |name: &str, fields: &[(&str, u64)], nsa: &[u8]| vgpr_uses(&mimg(name, fields, nsa));
+        let at = |v: u64, n: u64| (v..v + n).collect::<Vec<u64>>();
+        // 2-D load: two coordinates, the DMASK components (x and z) only
+        let load = [("VDATA", 14), ("VADDR", 3), ("DMASK", 0x5), ("DIM", 1)];
+        assert_eq!(uses("IMAGE_LOAD", &load, &[]), (at(3, 2), at(14, 2)));
+        // NSA1: the y coordinate from VADDRA (the dword's other bytes are padding); NSA2 / NSA3:
+        // an offset, z-compare, 2-D derivatives and coordinates (8 addresses), BVH's 11 and
+        // BVH64's 12, scattered
+        assert_eq!(uses("IMAGE_LOAD", &load, &[40]), (vec![3, 40], at(14, 2)));
+        let nsa = [200, 3, 150, 77, 9, 180, 61, 33, 222, 140, 95];
+        let sample = [("VDATA", 20), ("VADDR", 100), ("DMASK", 0x1), ("DIM", 1)];
+        let mut want: Vec<u64> = std::iter::once(100).chain(nsa[..7].iter().map(|&v| v as u64)).collect();
+        assert_eq!(uses("IMAGE_SAMPLE_C_D_O", &sample, &nsa[..7]), (want.clone(), vec![20]));
+        let bvh = [("VDATA", 20), ("VADDR", 100), ("DMASK", 0xF)];
+        want.extend(nsa[7..10].iter().map(|&v| v as u64));
+        assert_eq!(uses("IMAGE_BVH_INTERSECT_RAY", &bvh, &nsa[..10]), (want.clone(), at(20, 4)));
+        want.push(95);
+        assert_eq!(uses("IMAGE_BVH64_INTERSECT_RAY", &bvh, &nsa), (want, at(20, 4)));
+        // A16 pairs 16-bit components: a 2-D sample at an LOD in two dwords, BVH's direction and
+        // inverse in three
+        let a16 = [("VDATA", 20), ("VADDR", 30), ("DMASK", 0xF), ("DIM", 1), ("A16", 1)];
+        assert_eq!(uses("IMAGE_SAMPLE_L", &a16, &[]).0, at(30, 2));
+        assert_eq!(uses("IMAGE_BVH_INTERSECT_RAY", &[("VDATA", 20), ("VADDR", 0), ("A16", 1)], &[]).0, at(0, 8));
+        // a 3-D sample with derivatives: 6 + 3 dwords
+        assert_eq!(uses("IMAGE_SAMPLE_D", &[("VDATA", 20), ("VADDR", 30), ("DMASK", 0xF), ("DIM", 2)], &[]).0, at(30, 9));
+        // D16: two components per register; a gather returns four whatever DMASK selects
+        let d16 = [("VDATA", 20), ("VADDR", 30), ("DMASK", 0x7), ("DIM", 1), ("D16", 1)];
+        assert_eq!(uses("IMAGE_SAMPLE_LZ", &d16, &[]).1, at(20, 2));
+        assert_eq!(uses("IMAGE_STORE", &d16, &[]), (vec![30, 31, 20, 21], vec![]));
+        assert_eq!(uses("IMAGE_GATHER4_LZ", &[("VDATA", 40), ("VADDR", 33), ("DMASK", 0x1), ("DIM", 1)], &[]).1, at(40, 4));
+        // atomics read their data and give the value before back with GLC only; a compare-swap
+        // reads the new value and the compare value
+        let atomic = |glc: u64, dmask: u64| [("VDATA", 7), ("VADDR", 35), ("DMASK", dmask), ("DIM", 1), ("GLC", glc)];
+        assert_eq!(uses("IMAGE_ATOMIC_ADD", &atomic(0, 0x1), &[]), (vec![35, 36, 7], vec![]));
+        assert_eq!(uses("IMAGE_ATOMIC_ADD", &atomic(1, 0x1), &[]), (vec![35, 36, 7], vec![7]));
+        assert_eq!(uses("IMAGE_ATOMIC_CMPSWAP", &atomic(1, 0x3), &[60]), (vec![35, 60, 7, 8], vec![7]));
+        assert!(uses("IMAGE_ATOMIC_CMPSWAP", &atomic(0, 0x3), &[]).1.is_empty());
+        // no register past v255
+        assert_eq!(uses("IMAGE_SAMPLE_LZ", &[("VDATA", 254), ("VADDR", 255), ("DMASK", 0xF), ("DIM", 1)], &[]), (vec![255], vec![254, 255]));
+    }
+
+    /// The address count against the operand tables, which give the largest case: the 3-D (or
+    /// cube, 2-D array) address of each sample and gather without A16, with every modifier. The
+    /// G16 samples count more: the tables pack their derivatives as 16-bit pairs, which the
+    /// translators do not (they read them as 32-bit, as without G16).
+    #[test]
+    fn image_address_counts_reach_the_operand_tables() {
+        for inst in all_instructions().filter(|i| i.encs.iter().any(|e| ENCODINGS[e.encoding as usize].name == "ENC_MIMG")) {
+            let size = inst.encs[0].operands.iter().find(|o| o.field == Some("VADDR")).unwrap().size as u64 / 32;
+            let most = (0..6).map(|dim| mimg_address_dwords(&mimg(inst.name, &[("DIM", dim)], &[]))).max().unwrap();
+            let sampling = inst.name.starts_with("IMAGE_SAMPLE") || inst.name.starts_with("IMAGE_GATHER") || inst.name.starts_with("IMAGE_BVH");
+            if inst.name.ends_with("_G16") {
+                assert!(most > size, "{}: {most} against {size}", inst.name);
+            } else if sampling || inst.name == "IMAGE_GET_RESINFO" {
+                assert_eq!(most, size, "{}", inst.name);
+            } else {
+                // loads, stores and atomics: the tables count a 2-D MSAA array's four coordinates
+                assert!(most <= size, "{}: {most} against {size}", inst.name);
+            }
+        }
     }
 
     #[test]
