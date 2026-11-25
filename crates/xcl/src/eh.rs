@@ -647,6 +647,34 @@ unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTE
     out
 }
 
+/// Frames of a thread dump line from the top of the stack.
+const DUMP_FRAMES: usize = 14;
+/// How deep a thread dump unwinds to find the title's frames under them (a retail title's
+/// thread building a compute pipeline in a bind had its first one 34 and 47 frames deep, under
+/// XCL and NVIDIA's compiler).
+const DUMP_UNWIND: usize = 96;
+/// The title's frames a line adds when none of the top ones is the title's.
+const DUMP_TITLE_FRAMES: usize = 4;
+
+/// A thread dump line's frames: the top `DUMP_FRAMES`. When none of them is in the title's code
+/// but a deeper one is (a title thread in XCL, the driver or DXC: a pipeline it builds in a bind,
+/// a compile it waits for), then also the number of frames left out and the title's first
+/// `DUMP_TITLE_FRAMES` frames from there: which of the title's calls led down there. Without
+/// them such a thread looked like one of XCL's own, its 14 frames all in XCL or the driver.
+fn dump_frames(frames: &[usize], in_title: impl Fn(usize) -> bool, describe: impl Fn(usize) -> String) -> String {
+    let top = &frames[..frames.len().min(DUMP_FRAMES)];
+    let mut parts: Vec<String> = top.iter().map(|&a| describe(a)).collect();
+    if !top.iter().any(|&a| in_title(a)) {
+        if let Some(k) = frames.iter().skip(top.len()).position(|&a| in_title(a)).map(|i| i + top.len()) {
+            if k > top.len() {
+                parts.push(format!("… {} frames …", k - top.len()));
+            }
+            parts.extend(frames[k..frames.len().min(k + DUMP_TITLE_FRAMES)].iter().map(|&a| describe(a)));
+        }
+    }
+    parts.join(" < ")
+}
+
 /// `XCL_THREAD_DUMP_AT`: every other thread of the process stopped for a moment – where it is
 /// (RIP) and the calls on its stack that lead there, in the log.
 pub fn dump_threads() {
@@ -682,8 +710,8 @@ pub fn dump_threads() {
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
-                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
+                        let frames = dump_frames(&unwind(&mut c.0, DUMP_UNWIND), |a| modules::image_base_for_addr(a).is_some(), modules::describe_address);
+                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames));
                     }
                     CloseHandle(h);
                 }
@@ -973,6 +1001,35 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// frames 0x1000, 0x1001, …; those at or above `title` are the title's
+    fn frames_line(n: usize, title: usize) -> String {
+        let frames: Vec<usize> = (0..n).map(|i| 0x1000 + i).collect();
+        dump_frames(&frames, |a| a >= 0x1000 + title, |a| format!("{a:#x}"))
+    }
+
+    #[test]
+    fn a_dump_line_reaches_the_title_frames_under_a_deep_stack() {
+        // a title thread deep in XCL or the driver: the top 14, the gap, the title's first 4
+        assert_eq!(
+            frames_line(30, 20),
+            "0x1000 < 0x1001 < 0x1002 < 0x1003 < 0x1004 < 0x1005 < 0x1006 < 0x1007 < 0x1008 < 0x1009 < 0x100a < 0x100b < 0x100c < 0x100d < … 6 frames … < 0x1014 < 0x1015 < 0x1016 < 0x1017"
+        );
+        // the title's frames right after the top ones: no gap; fewer than 4 left: those
+        assert_eq!(frames_line(16, 14), (0..16).map(|i| format!("{:#x}", 0x1000 + i)).collect::<Vec<_>>().join(" < "));
+    }
+
+    #[test]
+    fn a_dump_line_is_the_top_frames_otherwise() {
+        let top: String = (0..14).map(|i| format!("{:#x}", 0x1000 + i)).collect::<Vec<_>>().join(" < ");
+        // a title frame among the top ones: nothing added
+        assert_eq!(frames_line(30, 3), top);
+        // none of the title's at all (one of XCL's threads): nothing added
+        assert_eq!(frames_line(30, 99), top);
+        // a short stack
+        assert_eq!(frames_line(2, 99), "0x1000 < 0x1001");
+        assert_eq!(frames_line(0, 0), "");
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
