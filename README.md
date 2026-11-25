@@ -120,6 +120,18 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+To stop an offline precompile when its sampled private commit reaches a budget, run it through
+`scripts/precompile-budget.ps1` on Windows:
+
+```powershell
+.\scripts\precompile-budget.ps1 -ShaderInput 'D:\data\shaders.rpf' -MaxCommitMiB 24576 -XclArgs @('--only', 'cs', '--pipelines')
+```
+
+Choose a budget for your machine. The script checks the XCL process every 100 ms, so a fast
+allocation can overshoot the threshold. It returns exit code 4 when it ends XCL for reaching the
+budget and otherwise returns XCL's exit code. Completed cache entries are reused on the next run.
+Use `-Xcl` if the executable is outside `target\release\xcl.exe`.
+
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
