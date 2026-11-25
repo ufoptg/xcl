@@ -47,7 +47,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAM
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
-use crate::util::{HRESULT, S_OK};
+use crate::util::{HRESULT, S_OK, E_OUTOFMEMORY};
 
 const DLL: &str = "xcrdapi.dll";
 
@@ -264,16 +264,21 @@ fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESUL
             Ok(blocks)
         }
         Err(e) => {
+            let hr = if matches!(&e, &super::bcpack::Error::OutOfMemory) {
+                E_OUTOFMEMORY
+            } else {
+                E_DECOMPRESSION
+            };
             let k = UNPACKED.failed[i].fetch_add(1, Ordering::Relaxed) + 1;
             // one warning per mode and kind of failure, then a running count
             warn_once(
                 &format!("BCPack {} stream ({})", bcpack_name(bc), e.kind()),
-                format_args!("{e} (packed={}, dst={n}); the request fails with E_DECOMPRESSION", packed.len()),
+                format_args!("{e} (packed={}, dst={n}); the request fails with {hr:#010x}", packed.len()),
             );
             if k <= 16 || k.is_power_of_two() {
                 crate::xlog_info!("DirectStorage: BCPack {} streams not unpacked so far: {k}", bcpack_name(bc));
             }
-            Err(E_DECOMPRESSION)
+            Err(hr)
         }
     }
 }
@@ -723,6 +728,14 @@ impl Request {
         if self.destination == 0 || (self.memory_source() && self.source == 0) {
             return Err(E_ACCESS_VIOLATION);
         }
+        // Keep guest-controlled DirectStorage allocations within the existing 256 MiB limit.
+        const MAX_REQUEST_SIZE: u32 = 256 * 1024 * 1024;
+        if self.source_size > MAX_REQUEST_SIZE
+            || self.destination_size > MAX_REQUEST_SIZE
+            || self.intermediate_size > MAX_REQUEST_SIZE
+        {
+            return Err(E_OUTOFMEMORY);
+        }
         if self.options & !KNOWN_OPTIONS_MASK != 0 {
             warn_once("DSTORAGE_REQUEST_OPTIONS", format_args!("unknown high option bits {:#x}", self.options & !KNOWN_OPTIONS_MASK));
         }
@@ -838,6 +851,13 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
     Ok(())
 }
 
+fn zeroed_buffer(len: usize) -> Result<Vec<u8>, HRESULT> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| E_OUTOFMEMORY)?;
+    buffer.resize(len, 0);
+    Ok(buffer)
+}
+
 static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -877,24 +897,37 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
-        let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
-            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
+            let mut b = zeroed_buffer(r.source_size as usize)?;
+            if !crate::hle::kernelx::read_physical_pages(
+                pages,
+                r.source_page_offset as usize,
+                &mut b,
+            ) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            b
         } else {
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            let mut b = zeroed_buffer(r.source_size as usize)?;
             if !b.is_empty() {
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
             }
+            b
         }
-        b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = vec![0u8; r.source_size as usize];
+        let end = r.offset.checked_add(r.source_size as u64).ok_or(E_END_OF_FILE)?;
+        let file_len = f.metadata()
+            .map_err(|e| e.raw_os_error().map_or(E_ABORT, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32))?
+            .len();
+        if end > file_len {
+            return Err(E_END_OF_FILE);
+        }
+        let mut b = zeroed_buffer(r.source_size as usize)?;
         read_exact_at(&f, r.offset, &mut b)?;
         b
     };
@@ -907,7 +940,15 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     // the stages in the console's order: zlib, then BCPack
     let stage1: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let mut d = zeroed_buffer(stage1_len)?;
+        let written = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+            &mut d,
+            std::iter::once(src.as_slice()),
+            true,
+            false,
+        )
+        .map_err(|_| E_ZLIB_DATA)?;
+        d.truncate(written);
         // zlib yields `intermediate_size` bytes; when the title names none, the destination's
         // size, or before BCPack a stream of any size up to it. That last case is XCL's
         // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
@@ -2661,5 +2702,10 @@ mod tests {
             queue_release(q);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn zeroed_buffer_rejects_impossible_allocation() {
+        assert!(matches!(zeroed_buffer(usize::MAX), Err(E_OUTOFMEMORY)));
     }
 }

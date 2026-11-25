@@ -17,11 +17,17 @@
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Error(pub &'static str);
+pub enum Error {
+    Decode(&'static str),
+    OutOfMemory,
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BCPack: {}", self.0)
+        match self {
+            Self::Decode(message) => write!(f, "BCPack: {message}"),
+            Self::OutOfMemory => write!(f, "BCPack: output allocation failed"),
+        }
     }
 }
 
@@ -101,15 +107,18 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
-        _ => return Err(Error("unsupported BC format")),
+        _ => return Err(Error::Decode("unsupported BC format")),
     };
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
-        return Err(Error("destination is not a whole number of blocks"));
+        return Err(Error::Decode("destination is not a whole number of blocks"));
     }
     let blocks = dst.len() / block;
     let (widths, per) = lane_layout(bc);
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
+    let record_len = blocks.checked_mul(stride).ok_or(Error::OutOfMemory)?;
+let mut records = Vec::new();
+    records.try_reserve_exact(record_len).map_err(|_| Error::OutOfMemory)?;
+    records.resize(record_len, 0);
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
     let records = records.chunks_exact(stride);
@@ -312,7 +321,7 @@ fn lanes(
         // Nothing read and nothing delivered for a few rounds: no lane can go on.
         idle = if taken > 0 || moved { 0 } else { idle + 1 };
         if idle > 3 {
-            return Err(Error("the stream ends early or is corrupt"));
+            return Err(Error::Decode("the stream ends early or is corrupt"));
         }
     }
     Ok(())
@@ -617,7 +626,7 @@ fn bc7<'a>(
         let (ep_ref, ix_ref) = references(s, true);
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
         if ctrl == 0 {
-            return Err(Error("unused BC7 control code"));
+            return Err(Error::Decode("unused BC7 control code"));
         }
         let mode = usize::from(ctrl & 7);
         let subsets = usize::from((ctrl & 0xff) >> 6);
@@ -929,7 +938,7 @@ fn bc6<'a>(
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);
         if !(1..=14).contains(&mode) {
-            return Err(Error("BC6H mode out of range"));
+            return Err(Error::Decode("BC6H mode out of range"));
         }
         let two = mode < 11;
         let shift = BC6_BITS[usize::from(mode)].map(|b| 16 - u32::from(b));

@@ -17,6 +17,7 @@ pub enum Error {
     OutputSize,
     /// the stream is truncated, malformed, or ends in a bad lane state
     Decode(&'static str),
+    OutOfMemory,
 }
 
 impl Error {
@@ -26,6 +27,7 @@ impl Error {
             Error::Unsupported => "unsupported",
             Error::OutputSize => "output size",
             Error::Decode(_) => "decode",
+            Error::OutOfMemory => "out of memory",
         }
     }
 }
@@ -36,6 +38,7 @@ impl std::fmt::Display for Error {
             Error::Unsupported => write!(f, "no decoder for this mode"),
             Error::OutputSize => write!(f, "the output size is not a whole number of blocks"),
             Error::Decode(why) => write!(f, "{why}"),
+            Error::OutOfMemory => write!(f, "BCPack output allocation failed"),
         }
     }
 }
@@ -60,9 +63,14 @@ pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     if out_len == 0 || out_len % block != 0 {
         return Err(Error::OutputSize);
     }
-    let mut out = vec![0u8; out_len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(out_len).map_err(|_| Error::OutOfMemory)?;
+    out.resize(out_len, 0);
     victory::decode(mode, src, &mut out, victory::Tables::builtin())
-        .map_err(|e| Error::Decode(e.0))?;
+        .map_err(|e| match e {
+            victory::Error::OutOfMemory => Error::OutOfMemory,
+            victory::Error::Decode(message) => Error::Decode(message),
+        })?;
     Ok(out)
 }
 
