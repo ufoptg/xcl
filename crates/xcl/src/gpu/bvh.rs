@@ -223,6 +223,13 @@ fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
         [a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0), a(0, 1) * a(2, 0) - a(0, 0) * a(2, 1), a(0, 0) * a(1, 1) - a(0, 1) * a(1, 0)],
     ]
     .map(|row| row.map(|x| x / det));
+    // a singular transform (a zero scale on an axis, say) has no inverse: an infinite / NaN
+    // matrix would make the shader's object-space ray NaN, where an instance of no volume is
+    // simply never hit. Zeros map every point to the object origin and every direction to 0,
+    // which the triangle test misses.
+    if det == 0.0 || !inv.iter().flatten().all(|x| x.is_finite()) {
+        return [0.0; 12];
+    }
     let t = [0, 1, 2].map(|r| -(inv[r][0] * a(0, 3) + inv[r][1] * a(1, 3) + inv[r][2] * a(2, 3)));
     let mut out = [0f32; 12];
     for r in 0..3 {
@@ -520,6 +527,31 @@ pub(crate) mod tests {
         assert_eq!(w2o, [-5.0, -6.0, -7.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
         // instance box = the bottom level's bounds moved to the instance
         assert_eq!(top.bounds(), ([4.0, 5.0, 6.0], [6.0, 7.0, 8.0]));
+    }
+
+    /// A zero scale on an axis has no inverse: the instance is of no volume, and its
+    /// world → object matrix must not be Inf / NaN (a NaN object-space ray in the shader).
+    #[test]
+    fn a_singular_instance_transform_has_a_zero_inverse() {
+        let mut inst = Instance {
+            transform: [[1.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 6.0], [0.0, 0.0, 1.0, 7.0]], // y squashed flat
+            id: 1,
+            mask: 0xFF,
+            contribution: 0,
+            flags: 0,
+            blas_address: 0x10_0000,
+            blas_root: 0,
+            blas_bounds: ([-1.0; 3], [1.0; 3]),
+        };
+        let at = HEADER_BYTES + BOX_BYTES;
+        let top = build_top(std::slice::from_ref(&inst));
+        let w2o: Vec<f32> = (0..12).map(|k| f32::from_bits(word(&top.data, at + 64 + 4 * k))).collect();
+        assert_eq!(w2o, [0.0; 12], "a singular transform is written as zeros, not Inf / NaN");
+        // a rank-3 transform keeps its inverse (and stays finite)
+        inst.transform[1] = [0.0, 1.0, 0.0, 6.0];
+        let top = build_top(&[inst]);
+        let w2o: Vec<f32> = (0..12).map(|k| f32::from_bits(word(&top.data, at + 64 + 4 * k))).collect();
+        assert_eq!(w2o, [-5.0, -6.0, -7.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 
     /// Two levels: 3 bottom levels, 24 instances (rotated + scaled + moved, some only moved),
