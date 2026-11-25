@@ -327,7 +327,126 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show_compiling(hwnd);
             LRESULT(0)
         }
+        // before the title's first frame: its splash screen, as the console's shell shows it
+        WM_ERASEBKGND if splash().is_some() => LRESULT(1),
+        WM_PAINT if splash().is_some() => {
+            paint_splash(hwnd, splash().unwrap());
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// The title's shell images (`ShellVisuals` of MicrosoftGame.config).
+fn shell() -> &'static crate::launcher::ShellVisuals {
+    static SHELL: std::sync::OnceLock<crate::launcher::ShellVisuals> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| crate::state::boot().map(|b| crate::launcher::shell_visuals(&b.game_root)).unwrap_or_default())
+}
+
+struct Splash {
+    width: u32,
+    height: u32,
+    /// top-down rows of 32-bit BGRA
+    pixels: Vec<u8>,
+    /// COLORREF (0x00BBGGRR) of the title's `BackgroundColor`, black without one
+    background: u32,
+}
+
+static SPLASH: std::sync::OnceLock<Option<Splash>> = std::sync::OnceLock::new();
+
+/// The splash screen while the title has presented nothing yet; the swap chain covers the
+/// window from the first frame on.
+fn splash() -> Option<&'static Splash> {
+    SPLASH.get()?.as_ref().filter(|_| PRESENTS.load(Ordering::Relaxed) == 0)
+}
+
+/// Decodes the title's splash image (WIC, any format Windows reads) on the window thread.
+unsafe fn load_splash() -> Option<Splash> {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    let path = shell().splash.as_ref()?;
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let decode = || -> windows::core::Result<(u32, u32, Vec<u8>)> {
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let decoder = wic.CreateDecoderFromFilename(&HSTRING::from(path.as_os_str()), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+        let bgra = WICConvertBitmapSource(&GUID_WICPixelFormat32bppBGRA, &decoder.GetFrame(0)?)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        bgra.GetSize(&mut w, &mut h)?;
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return Err(windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG));
+        }
+        let mut pixels = vec![0u8; w as usize * h as usize * 4];
+        bgra.CopyPixels(std::ptr::null(), w * 4, &mut pixels)?;
+        Ok((w, h, pixels))
+    };
+    match decode() {
+        Ok((width, height, pixels)) => {
+            crate::xlog_info!("XCL window: the title's splash screen {} ({width}x{height}) until its first frame", path.display());
+            Some(Splash { width, height, pixels, background: colorref(shell().background.unwrap_or(0)) })
+        }
+        Err(e) => {
+            crate::xlog_warn!("XCL window: the splash screen {} could not be read ({e})", path.display());
+            None
+        }
+    }
+}
+
+/// 0xRRGGBB as a GDI COLORREF (0x00BBGGRR).
+fn colorref(rgb: u32) -> u32 {
+    ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
+}
+
+/// Where an image of `iw`x`ih` goes in a `cw`x`ch` client area: as large as fits, its aspect
+/// kept, centred (x, y, width, height).
+fn fit(iw: u32, ih: u32, cw: i32, ch: i32) -> (i32, i32, i32, i32) {
+    if iw == 0 || ih == 0 || cw <= 0 || ch <= 0 {
+        return (0, 0, 0, 0);
+    }
+    let s = (cw as f64 / iw as f64).min(ch as f64 / ih as f64);
+    let (w, h) = ((iw as f64 * s).round() as i32, (ih as f64 * s).round() as i32);
+    ((cw - w) / 2, (ch - h) / 2, w, h)
+}
+
+unsafe fn paint_splash(hwnd: HWND, s: &Splash) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::*;
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let brush = CreateSolidBrush(COLORREF(s.background));
+    FillRect(dc, &rc, brush);
+    let _ = DeleteObject(brush.into());
+    let (x, y, w, h) = fit(s.width, s.height, rc.right - rc.left, rc.bottom - rc.top);
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: s.width as i32,
+            biHeight: -(s.height as i32), // top-down rows
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    SetStretchBltMode(dc, HALFTONE);
+    StretchDIBits(dc, x, y, w, h, 0, 0, s.width as i32, s.height as i32, Some(s.pixels.as_ptr().cast()), &bi, DIB_RGB_COLORS, SRCCOPY);
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// The title's small logo as the window's icon (title bar, taskbar, Alt+Tab). Windows reads a
+/// PNG as icon data itself.
+unsafe fn load_icon() -> Option<HICON> {
+    let bytes = std::fs::read(shell().logo.as_ref()?).ok()?;
+    CreateIconFromResourceEx(&bytes, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR).ok()
+}
+
+/// With a splash screen the XCL window opens when the title starts and shows it until the
+/// first frame, as the console's shell does; without one it opens with the first frame.
+pub fn open_early() {
+    if enabled() && shell().splash.is_some() {
+        let _ = ensure_window();
     }
 }
 
@@ -417,11 +536,13 @@ fn window_thread() {
     unsafe {
         let Ok(inst) = GetModuleHandleW(PCWSTR::null()) else { return };
         let class = windows::core::w!("XCLGameWindow");
+        let _ = SPLASH.set(load_splash());
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: inst.into(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: load_icon().unwrap_or_default(),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -1002,6 +1123,25 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_splash_screen_fits_the_window_with_its_aspect_kept() {
+        // 1920x1080 in a 1280x720 client: the whole area
+        assert_eq!(fit(1920, 1080, 1280, 720), (0, 0, 1280, 720));
+        // a taller window: bars above and below
+        assert_eq!(fit(1920, 1080, 1280, 1024), (0, 152, 1280, 720));
+        // a wider window: bars left and right, and a small image is scaled up
+        assert_eq!(fit(480, 270, 1600, 720), (160, 0, 1280, 720));
+        // a minimised window or an empty image: nothing to draw
+        assert_eq!(fit(1920, 1080, 0, 0), (0, 0, 0, 0));
+        assert_eq!(fit(0, 1080, 1280, 720), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn background_colour_goes_to_gdi_as_bgr() {
+        assert_eq!(colorref(0x1A2B3C), 0x003C2B1A);
+        assert_eq!(colorref(0x000000), 0);
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {

@@ -132,6 +132,42 @@ pub fn display_name(root: &Path) -> Option<String> {
     xml_attr(&xml, "ShellVisuals", "DefaultDisplayName").filter(|n| !n.trim().is_empty() && !n.starts_with("ms-resource:"))
 }
 
+/// What the console's shell shows for the title before its first frame (`ShellVisuals` of
+/// MicrosoftGame.config): the splash screen on its background colour, and the small logo
+/// (the XCL window's icon). Only files of the package count: a name with a drive, a root or
+/// `..` is ignored, as is a file that is not there.
+#[derive(Debug, Default, PartialEq)]
+pub struct ShellVisuals {
+    pub splash: Option<PathBuf>,
+    pub logo: Option<PathBuf>,
+    /// `BackgroundColor` as 0xRRGGBB
+    pub background: Option<u32>,
+}
+
+pub fn shell_visuals(root: &Path) -> ShellVisuals {
+    let Some(xml) = std::fs::read(root.join("MicrosoftGame.config")).ok().and_then(|raw| decode_game_config(&raw)) else {
+        return ShellVisuals::default();
+    };
+    let file = |attr: &str| {
+        let name = xml_attr(&xml, "ShellVisuals", attr)?;
+        let rel = Path::new(name.trim());
+        if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+            return None;
+        }
+        let p = root.join(rel);
+        p.is_file().then_some(p)
+    };
+    let background = xml_attr(&xml, "ShellVisuals", "BackgroundColor").and_then(|c| {
+        let hex = c.trim().strip_prefix('#')?;
+        (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten()
+    });
+    ShellVisuals {
+        splash: file("SplashScreenImage"),
+        logo: file("Square44x44Logo").or_else(|| file("Square150x150Logo")).or_else(|| file("StoreLogo")),
+        background,
+    }
+}
+
 pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
     let p = root.join("MicrosoftGame.config");
     let Some(xml) = std::fs::read(p).ok().and_then(|raw| decode_game_config(&raw)) else { return (Vec::new(), None) };
@@ -559,6 +595,29 @@ mod tests {
         assert_eq!(display_name(&dir.0), None);
         std::fs::remove_file(dir.0.join("MicrosoftGame.config")).unwrap();
         assert_eq!(display_name(&dir.0), None);
+    }
+
+    #[test]
+    fn shell_visuals_are_files_of_the_package() {
+        let dir = TempDir::new("shell_visuals");
+        std::fs::create_dir_all(dir.0.join("Art")).unwrap();
+        for f in ["Art/splash.png", "logo150.png", "store.png"] {
+            std::fs::write(dir.0.join(f), b"\x89PNG").unwrap();
+        }
+        let config = |attrs: &str| std::fs::write(dir.0.join("MicrosoftGame.config"), format!(r#"<Game><ShellVisuals DefaultDisplayName="X" {attrs}/></Game>"#)).unwrap();
+        // the small logo is missing: the next one there is the icon
+        config(r##"SplashScreenImage="Art\splash.png" Square44x44Logo="logo44.png" Square150x150Logo="logo150.png" StoreLogo="store.png" BackgroundColor="#1A2b3C""##);
+        let v = shell_visuals(&dir.0);
+        assert_eq!(v.splash, Some(dir.0.join("Art\\splash.png")));
+        assert_eq!(v.logo, Some(dir.0.join("logo150.png")));
+        assert_eq!(v.background, Some(0x1A2B3C));
+        // names that leave the package, and colours that are not #RRGGBB, are not taken
+        config(r##"SplashScreenImage="..\splash.png" Square44x44Logo="C:\Windows\x.png" StoreLogo="\store.png" BackgroundColor="transparent""##);
+        assert_eq!(shell_visuals(&dir.0), ShellVisuals::default());
+        config(r##"SplashScreenImage="" BackgroundColor="#12345""##);
+        assert_eq!(shell_visuals(&dir.0), ShellVisuals::default());
+        std::fs::remove_file(dir.0.join("MicrosoftGame.config")).unwrap();
+        assert_eq!(shell_visuals(&dir.0), ShellVisuals::default());
     }
 
     #[test]
