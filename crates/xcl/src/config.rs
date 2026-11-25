@@ -247,6 +247,34 @@ impl Config {
     }
 }
 
+pub const ENV_TITLE_COMMIT_CAP_MB: &str = "XCL_TITLE_COMMIT_CAP_MB";
+
+/// Parses an opt-in process commit cap in MiB (`XCL_TITLE_COMMIT_CAP_MB`).
+/// `None`, empty/whitespace, or `"0"` disables the cap (`Ok(None)`).
+pub fn parse_title_commit_cap_mb(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(mb) => Ok(Some(mb)),
+        Err(_) => Err(format!("invalid {ENV_TITLE_COMMIT_CAP_MB}={raw:?} (expected a non-negative integer in MiB)")),
+    }
+}
+
+/// Reads `XCL_TITLE_COMMIT_CAP_MB` from the process environment.
+pub fn title_commit_cap_mb_from_env() -> Result<Option<u64>, String> {
+    let Some(raw) = std::env::var_os(ENV_TITLE_COMMIT_CAP_MB) else {
+        return Ok(None);
+    };
+    let s = raw
+        .to_str()
+        .ok_or_else(|| format!("invalid {ENV_TITLE_COMMIT_CAP_MB}: value is not valid UTF-8"))?;
+    parse_title_commit_cap_mb(Some(s))
+}
+
 pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
     if mode.eq_ignore_ascii_case("off") || mode.eq_ignore_ascii_case("none") || mode == "0" {
         Some(0)
@@ -376,5 +404,18 @@ mod tests {
         assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
         assert_eq!(parse_raytracing_tier("1.1"), Some(11));
         assert_eq!(parse_raytracing_tier("11"), Some(11));
+    }
+
+    #[test]
+    fn title_commit_cap_mb_parsing() {
+        assert_eq!(parse_title_commit_cap_mb(None), Ok(None));
+        assert_eq!(parse_title_commit_cap_mb(Some("")), Ok(None));
+        assert_eq!(parse_title_commit_cap_mb(Some("   ")), Ok(None));
+        assert_eq!(parse_title_commit_cap_mb(Some("0")), Ok(None));
+        assert_eq!(parse_title_commit_cap_mb(Some(" 00 ")), Ok(None));
+        assert_eq!(parse_title_commit_cap_mb(Some("64")), Ok(Some(64)));
+        assert_eq!(parse_title_commit_cap_mb(Some(" 20480 ")), Ok(Some(20480)));
+        assert!(parse_title_commit_cap_mb(Some("-1")).is_err());
+        assert!(parse_title_commit_cap_mb(Some("abc")).is_err());
     }
 }

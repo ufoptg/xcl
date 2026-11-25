@@ -12,6 +12,28 @@ use super::ops_core::op;
 use crate::gpu::rdna2::{self, Decoded};
 
 impl Lw {
+    /// The sampler of the MIMG at `pc`: a static sampler (bound at `s<i>, space1` in order of
+    /// first use) when the console bound one there, else the heap sampler the S# indexes.
+    fn mimg_sampler(&mut self, pc: u64, has_c: bool, s3: Value) -> Sampler {
+        match self.static_samplers.get(&pc).copied() {
+            Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
+                Some(u) => u.2,
+                None => {
+                    let k = self.static_used.len() as u32;
+                    let cur = self.cur();
+                    self.s.m.set_block(self.init.entry);
+                    let h = self.s.sampler(self.sampler_base + k, 1, has_c);
+                    self.s.m.set_block(cur);
+                    self.static_used.push((w, has_c, h));
+                    h
+                }
+            },
+            None => {
+                let si = self.andc(s3, 0xFFF);
+                self.s.heap_sampler(si, has_c, true)
+            }
+        }
+    }
     fn f3(&mut self, a: [Value; 3], b: [Value; 3], op: fn(&mut Lw, Value, Value) -> Value) -> [Value; 3] {
         [op(self, a[0], b[0]), op(self, a[1], b[1]), op(self, a[2], b[2])]
     }
@@ -32,15 +54,6 @@ impl Lw {
         let f32 = self.s.m.f32();
         self.s.op(55, "dot3", Some(f32), f32, &[a[0], a[1], a[2], b[0], b[1], b[2]], super::module::FnAttrs::ReadNone)
     }
-    fn load3f(&mut self, at: Value) -> [Value; 3] {
-        let mut r = [at; 3];
-        for (k, slot) in r.iter_mut().enumerate() {
-            let a = self.addc(at, 4 * k as u32);
-            let v = self.mem_ld(a);
-            *slot = self.f(v);
-        }
-        r
-    }
 
     /// `bvh_intersect`: one BVH node → 4 result dwords (written to temporaries).
     #[allow(clippy::too_many_arguments)]
@@ -52,27 +65,34 @@ impl Lw {
         for box32 in [true, false] {
             let is = self.cmpc(Pred::Eq, ty, if box32 { 5 } else { 4 });
             self.guarded(is, &mut |lw| {
-                let mut child = [ones; 4];
-                for (k, c) in child.iter_mut().enumerate() {
-                    let a = lw.addc(at, 4 * k as u32);
-                    *c = lw.mem_ld(a);
-                }
+                // Box32 is 28 contiguous dwords (4 children + 4×6 box floats);
+                // Box16 is 16 contiguous dwords (4 children + 4×3 packed f16 pairs).
+                // Load the whole node in one window switch using 4-dword rawBufferLoads.
+                let at_al = lw.andc(at, !3);
+                let chunks = if box32 { 7usize } else { 4usize };
+                let words = lw.with_mem_i32s(None, chunks * 4, &mut |lw, m| {
+                    let mut out = Vec::with_capacity(chunks * 4);
+                    for j in 0..chunks {
+                        let a = lw.addc(at_al, 16 * j as u32);
+                        out.extend(lw.s.raw_load(m, a, 0xF));
+                    }
+                    out
+                });
+                let child = [words[0], words[1], words[2], words[3]];
                 let ninf = lw.s.m.f32c(0xFF80_0000);
                 let pinf = lw.s.m.f32c(0x7F80_0000);
                 let mut tn = [pinf; 4];
                 let mut id = [ones; 4];
-                for k in 0..4u32 {
+                for k in 0..4usize {
                     let (mn, mx) = if box32 {
-                        let a = lw.addc(at, 16 + 24 * k);
-                        let b = lw.addc(at, 28 + 24 * k);
-                        (lw.load3f(a), lw.load3f(b))
+                        let b = 4 + 6 * k;
+                        (
+                            [lw.f(words[b]), lw.f(words[b + 1]), lw.f(words[b + 2])],
+                            [lw.f(words[b + 3]), lw.f(words[b + 4]), lw.f(words[b + 5])],
+                        )
                     } else {
-                        let a = lw.addc(at, 16 + 12 * k);
-                        let mut h = [ones; 3];
-                        for (j, slot) in h.iter_mut().enumerate() {
-                            let x = lw.addc(a, 4 * j as u32);
-                            *slot = lw.mem_ld(x);
-                        }
+                        let b = 4 + 3 * k;
+                        let h = [words[b], words[b + 1], words[b + 2]];
                         let hx16 = lw.lshrc(h[0], 16);
                         let hy16 = lw.lshrc(h[1], 16);
                         let hz16 = lw.lshrc(h[2], 16);
@@ -102,7 +122,7 @@ impl Lw {
                     let a = lw.fmax(a, lo[2]);
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
-                    let cv = lw.cmpc(Pred::Ne, child[k as usize], u32::MAX);
+                    let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
                     let mut all = cv;
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
@@ -115,8 +135,8 @@ impl Lw {
                     let hit = lw.land(all, ab);
                     let x = lw.land(b0, at_);
                     let hit = lw.land(hit, x);
-                    tn[k as usize] = lw.sel(hit, a, pinf);
-                    id[k as usize] = lw.sel(hit, child[k as usize], ones);
+                    tn[k] = lw.sel(hit, a, pinf);
+                    id[k] = lw.sel(hit, child[k], ones);
                 }
                 for (i, j) in [(0usize, 1usize), (2, 3), (0, 2), (1, 3), (1, 2)] {
                     let lt = lw.fcmp(Pred::FOLt, tn[j], tn[i]);
@@ -145,9 +165,20 @@ impl Lw {
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
             let p2 = lw.addc(at, 24);
-            let v0 = lw.load3f(p0);
-            let v1 = lw.load3f(p1);
-            let v2 = lw.load3f(p2);
+            let p60 = lw.addc(at, 60);
+            let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
+            let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
+                let mut out = Vec::with_capacity(10);
+                out.extend(lw.s.raw_load(m, p0, 0x7));
+                out.extend(lw.s.raw_load(m, p1, 0x7));
+                out.extend(lw.s.raw_load(m, p2, 0x7));
+                out.push(lw.s.raw_load(m, p60, 0x1)[0]);
+                out
+            });
+            let v0 = [lw.f(words[0]), lw.f(words[1]), lw.f(words[2])];
+            let v1 = [lw.f(words[3]), lw.f(words[4]), lw.f(words[5])];
+            let v2 = [lw.f(words[6]), lw.f(words[7]), lw.f(words[8])];
+            let tw = words[9];
             let e1 = lw.f3(v1, v0, Lw::fsub);
             let e2 = lw.f3(v2, v0, Lw::fsub);
             let p = lw.cross(dir, e2);
@@ -176,8 +207,6 @@ impl Lw {
             let di = lw.fsub(det, i);
             let b0 = lw.fsub(di, j);
             let bc = [b0, i, j, z];
-            let p60 = lw.addc(at, 60);
-            let tw = lw.mem_ld(p60);
             let sh = lw.shlc(ty, 3);
             let tid = lw.shr_masked(tw, sh);
             let s0 = lw.andc(tid, 3);
@@ -459,25 +488,7 @@ impl Lw {
             let ps = self.gfx.as_ref().is_some_and(|g| g.ps.is_some());
             let spatial: Vec<Value> = coords[..kind.grads().min(coords.len())].to_vec();
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
-                // the console's static samplers: bound at s<i>, space1 in order of first use
-                Some(w) => match self.static_used.iter().find(|u| u.0 == w && u.1 == has_c) {
-                    Some(u) => u.2,
-                    None => {
-                        let k = self.static_used.len() as u32;
-                        let cur = self.cur();
-                        self.s.m.set_block(self.init.entry);
-                        let h = self.s.sampler(self.sampler_base + k, 1, has_c);
-                        self.s.m.set_block(cur);
-                        self.static_used.push((w, has_c, h));
-                        h
-                    }
-                },
-                None => {
-                    let si = self.andc(s3, 0xFFF);
-                    self.s.heap_sampler(si, has_c, true)
-                }
-            };
+            let smp: Sampler = self.mimg_sampler(d.pc, has_c, s3);
             if let Some(o) = ovgpr {
                 // texel offset / size of the sampled mip (0 for lz / gather; else the LOD given, else 0)
                 let level = match (&lod, has_lz || gather) {
@@ -613,9 +624,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -623,8 +631,7 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp = self.mimg_sampler(d.pc, false, s3);
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
