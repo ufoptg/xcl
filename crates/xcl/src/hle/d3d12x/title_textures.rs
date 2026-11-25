@@ -659,8 +659,10 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
     own_work(|| refresh_once(queue));
+    super::sparse::note_look(t0.elapsed());
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -708,7 +710,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(watch_t0.elapsed(), dirty_len, ranges.iter().map(|r| r.1).sum());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)

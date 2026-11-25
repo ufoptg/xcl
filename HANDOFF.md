@@ -1810,6 +1810,8 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
     translated as the mesh shader they are, the title rendered nothing from then on (black every run). Open: what
     it expects of them.
   - `XCL_ACTIVITY` logs the process's commit, local / non-local video memory, target pages, arenas and sparse pools.
+    And the CPU time of XCL's looks before the title's submits (`looks before submits`): in all and as a share of
+    the 2 s, the write-watch scan with the MB it watched a look, the copies into sparse video memory, the rest.
   - Open: arenas for D32S8 targets still take 2.8 GB (one per 256 MB of addresses; a D32S8 → R32 + separate stencil
     split, or exact-size heaps, would cut it); the debug layer's resource-state errors (538) and sparse
     simultaneous-access errors (1047); buffer views outside unified memory still get an empty V#.

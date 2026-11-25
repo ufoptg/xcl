@@ -1443,14 +1443,48 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
-static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line;
+/// then the looks, the bytes they watched and the µs of the whole looks (`XCL_ACTIVITY`)
+static WATCH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-pub fn note_watch(t: std::time::Duration, pages: usize) {
+/// A look's write-watch scan: `t` long, `pages` found written in `watched` bytes.
+pub fn note_watch(t: std::time::Duration, pages: usize, watched: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    WATCH[2].fetch_add(1, Ordering::Relaxed);
+    WATCH[3].fetch_add(watched as u64, Ordering::Relaxed);
+}
+
+/// A whole look before a title's submit (`title_textures::refresh`: the scan, the copies of
+/// CPU writes, the textures uploaded again), `t` long.
+pub fn note_look(t: std::time::Duration) {
+    WATCH[4].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// What the looks before the title's submits cost so far: [whole looks µs, write-watch µs,
+/// pages written, looks, bytes watched, sparse copies µs (lock wait, chunk scan, upload)].
+pub fn look_counters() -> [u64; 6] {
+    let w = |i: usize| WATCH[i].load(Ordering::Relaxed);
+    let copies = PHASES[..3].iter().map(|x| x.load(Ordering::Relaxed)).sum();
+    [w(4), w(0), w(1), w(2), w(3), copies]
+}
+
+/// The `XCL_ACTIVITY` line for `d`, two `look_counters()` subtracted, `secs` apart: how much
+/// of the title's submitting threads' time XCL's looks took, and where it went.
+pub fn look_line(d: [u64; 6], secs: u64) -> String {
+    let [all, watch, pages, looks, watched, copies] = d;
+    let ms = |us: u64| us / 1000;
+    format!(
+        "looks before submits ({secs} s): {looks} looks took {} ms ({:.1} % of the time): write-watch {} ms ({:.1} MB watched a look, {pages} pages written), copies into sparse video memory {} ms, the rest {} ms",
+        ms(all),
+        all as f64 / (secs.max(1) * 10_000) as f64,
+        ms(watch),
+        watched as f64 / looks.max(1) as f64 / (1 << 20) as f64,
+        ms(copies),
+        ms(all.saturating_sub(watch + copies))
+    )
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -1603,6 +1637,18 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `XCL_ACTIVITY` line: the parts of the looks, the share of the 2 s, and no division by
+    /// zero for a period without a look.
+    #[test]
+    fn the_look_line_splits_the_time() {
+        let line = look_line([830_000, 610_000, 4_800, 240, 240 * 1_641 << 20, 120_000], 2);
+        assert!(line.contains("240 looks took 830 ms (41.5 % of the time)"), "{line}");
+        assert!(line.contains("write-watch 610 ms (1641.0 MB watched a look, 4800 pages written)"), "{line}");
+        assert!(line.contains("copies into sparse video memory 120 ms, the rest 100 ms"), "{line}");
+        let idle = look_line([0; 6], 2);
+        assert!(idle.contains("0 looks took 0 ms (0.0 % of the time)") && idle.contains("0.0 MB watched a look"), "{idle}");
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
