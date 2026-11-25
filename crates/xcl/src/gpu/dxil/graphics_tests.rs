@@ -1193,3 +1193,48 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+/// The dependency sets of `compute_deps`: components on both sides of the 128 held inline.
+#[test]
+fn component_sets_insert_merge_and_list_in_order() {
+    let mut a = Comps::default();
+    for c in [5, 0, 127, 128, 191, 192, 300, 5] {
+        a.insert(c);
+    }
+    assert_eq!(a.iter().collect::<Vec<_>>(), [0, 5, 127, 128, 191, 192, 300]);
+    let mut b = Comps::default();
+    b.insert(64);
+    b.insert(130);
+    // the longer set into the shorter one, and the other way round
+    let (mut ab, mut ba) = (b.clone(), a.clone());
+    ab.extend(a);
+    ba.extend(b);
+    let all = [0, 5, 64, 127, 128, 130, 191, 192, 300];
+    assert_eq!(ab.iter().collect::<Vec<_>>(), all);
+    assert_eq!(ba.iter().collect::<Vec<_>>(), all);
+    assert_eq!(Comps::default().iter().count(), 0);
+}
+
+/// An input placed past row 32 (components from 128 on) reaches the dependency table like
+/// any other.
+#[test]
+fn dependencies_on_input_rows_past_32_reach_the_table() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let lo = io.input(SigElement::user("LO", 0, CompType::F32, 1));
+    let hi = io.input(SigElement::user("HI", 0, CompType::F32, 4).at(40, 0));
+    let o = io.output(SigElement::user("O", 0, CompType::F32, 2));
+    let a = io.load_input(&mut s, lo, 0, 0);
+    let b = io.load_input(&mut s, hi, 0, 3);
+    let sum = s.m.fbin(BinOp::Add, a, b, 0);
+    io.store_output(&mut s, o, 0, 0, sum);
+    io.store_output(&mut s, o, 0, 1, b);
+    s.m.ret();
+    let (ins, outs, prims) = (io.place(Dir::In), io.place(Dir::Out), io.place(Dir::Prim));
+    let (n_in, n_out) = (components(&ins), components(&outs));
+    assert_eq!((n_in, n_out), (164, 2));
+    let deps = compute_deps(&s, &ins, &outs, &prims);
+    // a word per input component: bit k is set when output component k depends on it
+    let want: Vec<u32> = (0..n_in).map(|i| [(0, 0b01), (163, 0b11)].iter().find(|w| w.0 == i).map_or(0, |w| w.1)).collect();
+    assert_eq!(dep_table(&deps, 0, n_in, n_out), want);
+}

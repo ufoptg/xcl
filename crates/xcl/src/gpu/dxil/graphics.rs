@@ -9,7 +9,7 @@
 //! packing is DXC's default prefix-stable first fit, the PSV0 dependency
 //! tables are recomputed from the emitted code the way the validator does.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use super::container::{self, PsvFull, PsvSigElement, SigPartElement, Stage};
 use super::module::{Block, FnAttrs, InstInfo, Md, Ty, Value};
@@ -634,10 +634,53 @@ fn psv_elems(p: &[Placed]) -> Vec<PsvSigElement> {
         .collect()
 }
 
+/// A set of signature components (`row * 4 + col`), one bit each. `compute_deps` copies
+/// and merges one at every operand of every instruction: as `BTreeSet`s that was two fifths
+/// of the time a retail pack's vertex and pixel shaders took to translate.
+#[derive(Clone, Default)]
+struct Comps {
+    /// components 0..128 (rows 0..32): no allocation for a signature of the usual size
+    low: u128,
+    /// components from 128 on, 64 a word
+    high: Vec<u64>,
+}
+
+impl Comps {
+    fn insert(&mut self, c: u32) {
+        if c < 128 {
+            self.low |= 1 << c;
+            return;
+        }
+        let w = ((c - 128) / 64) as usize;
+        if w >= self.high.len() {
+            self.high.resize(w + 1, 0);
+        }
+        self.high[w] |= 1 << (c % 64);
+    }
+
+    /// Adds the components of `o`.
+    fn extend(&mut self, o: Comps) {
+        self.low |= o.low;
+        if o.high.len() > self.high.len() {
+            self.high.resize(o.high.len(), 0);
+        }
+        for (a, b) in self.high.iter_mut().zip(&o.high) {
+            *a |= b;
+        }
+    }
+
+    /// The components, ascending.
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let low = (0..128u32).filter(|&c| self.low >> c & 1 != 0);
+        let high = self.high.iter().enumerate().flat_map(|(w, &bits)| (0..64u32).filter(move |&b| bits >> b & 1 != 0).map(move |b| 128 + w as u32 * 64 + b));
+        low.chain(high)
+    }
+}
+
 /// Input component → set of output components (`row * 4 + col`), from the code.
 struct Deps {
     /// For each output component, the input components it depends on.
-    out: HashMap<(u8, u32), BTreeSet<u32>>,
+    out: HashMap<(u8, u32), Comps>,
 }
 
 /// Input components each value depends on, through data flow, memory and
@@ -751,44 +794,68 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             ctrl[v].push(a);
         }
     }
-    // Instruction → block.
-    let mut block_of: HashMap<u32, usize> = HashMap::new();
+    // The base of each instruction's pointer chain (`root`), found once: the walk below
+    // asks for it at every instruction with two operands or more.
+    let mut roots: Vec<Option<Value>> = Vec::new();
+    let mut root_of = |p: Value| -> Value {
+        let mut chain: Vec<u32> = Vec::new();
+        let mut p = p;
+        let r = loop {
+            let Value::Inst(i) = p else { break p };
+            if let Some(Some(r)) = roots.get(i as usize) {
+                break *r;
+            }
+            match m.inst_info(i) {
+                InstInfo::Other(ops) if !ops.is_empty() => {
+                    chain.push(i);
+                    p = ops[0];
+                }
+                _ => break p,
+            }
+        };
+        for i in chain {
+            if roots.len() <= i as usize {
+                roots.resize(i as usize + 1, None);
+            }
+            roots[i as usize] = Some(r);
+        }
+        r
+    };
     let mut root_stores: HashMap<Value, Vec<Value>> = HashMap::new();
     for b in 0..nb {
         for &i in m.block_insts(Block(b as u32)) {
-            block_of.insert(i, b);
-            if let InstInfo::Store(p, v) = m.inst_info(i) {
-                root_stores.entry(root(s, p)).or_default().push(v);
-            }
-            if let InstInfo::Other(ops) = m.inst_info(i) {
+            match m.inst_info(i) {
+                InstInfo::Store(p, v) => root_stores.entry(root_of(p)).or_default().push(v),
                 // atomics write memory too
-                if ops.len() >= 2 {
-                    if let Value::Global(_) = root(s, ops[0]) {
-                        root_stores.entry(root(s, ops[0])).or_default().extend_from_slice(&ops[1..]);
+                InstInfo::Other(ops) if ops.len() >= 2 => {
+                    let r = root_of(ops[0]);
+                    if let Value::Global(_) = r {
+                        root_stores.entry(r).or_default().extend_from_slice(&ops[1..]);
                     }
                 }
+                _ => {}
             }
         }
     }
     let in_base: Vec<Option<u32>> = inputs.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect();
-    let mut memo: HashMap<Value, BTreeSet<u32>> = HashMap::new();
-    let mut ctrl_memo: HashMap<usize, BTreeSet<u32>> = HashMap::new();
+    // by instruction and by block
+    let mut memo: Vec<Option<Comps>> = Vec::new();
+    let mut ctrl_memo: Vec<Option<Comps>> = vec![None; nb];
 
     struct Cx<'a> {
         s: &'a Shader,
-        block_of: &'a HashMap<u32, usize>,
         ctrl: &'a Vec<Vec<usize>>,
         cond: &'a Vec<Option<Value>>,
         root_stores: &'a HashMap<Value, Vec<Value>>,
         in_base: &'a [Option<u32>],
         inputs: &'a [Placed],
     }
-    fn block_deps(cx: &Cx, b: usize, memo: &mut HashMap<Value, BTreeSet<u32>>, cm: &mut HashMap<usize, BTreeSet<u32>>) -> BTreeSet<u32> {
-        if let Some(d) = cm.get(&b) {
+    fn block_deps(cx: &Cx, b: usize, memo: &mut Vec<Option<Comps>>, cm: &mut Vec<Option<Comps>>) -> Comps {
+        if let Some(d) = &cm[b] {
             return d.clone();
         }
-        cm.insert(b, BTreeSet::new());
-        let mut d = BTreeSet::new();
+        cm[b] = Some(Comps::default());
+        let mut d = Comps::default();
         for &a in &cx.ctrl[b] {
             if let Some(c) = cx.cond[a] {
                 d.extend(value_deps(cx, c, memo, cm));
@@ -797,17 +864,21 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
                 d.extend(block_deps(cx, a, memo, cm));
             }
         }
-        cm.insert(b, d.clone());
+        cm[b] = Some(d.clone());
         d
     }
-    fn value_deps(cx: &Cx, v: Value, memo: &mut HashMap<Value, BTreeSet<u32>>, cm: &mut HashMap<usize, BTreeSet<u32>>) -> BTreeSet<u32> {
-        let Value::Inst(i) = v else { return BTreeSet::new() };
-        if let Some(d) = memo.get(&v) {
+    fn value_deps(cx: &Cx, v: Value, memo: &mut Vec<Option<Comps>>, cm: &mut Vec<Option<Comps>>) -> Comps {
+        let Value::Inst(i) = v else { return Comps::default() };
+        let at = i as usize;
+        if memo.len() <= at {
+            memo.resize(at + 1, None);
+        }
+        if let Some(d) = &memo[at] {
             return d.clone();
         }
-        memo.insert(v, BTreeSet::new());
+        memo[at] = Some(Comps::default());
         let m = &cx.s.m;
-        let mut d = BTreeSet::new();
+        let mut d = Comps::default();
         match m.inst_info(i) {
             InstInfo::Call(name, args) if name.starts_with("dx.op.loadInput.") => {
                 let id = m.const_u64(args[1]).unwrap() as usize;
@@ -855,13 +926,12 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             }
             InstInfo::Store(..) | InstInfo::Term(..) => {}
         }
-        let _ = cx.block_of;
-        memo.insert(v, d.clone());
+        memo[at] = Some(d.clone());
         d
     }
 
-    let cx = Cx { s, block_of: &block_of, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
-    let mut out: HashMap<(u8, u32), BTreeSet<u32>> = HashMap::new();
+    let cx = Cx { s, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
+    let mut out: HashMap<(u8, u32), Comps> = HashMap::new();
     let bases = |p: &[Placed]| -> Vec<Option<u32>> { p.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect() };
     let (ob, pb) = (bases(outputs), bases(prims));
     for b in 0..nb {
@@ -912,7 +982,7 @@ fn dep_table(deps: &Deps, dir: u8, n_in: u32, n_out: u32) -> Vec<u32> {
         if d != dir || o >= n_out {
             continue;
         }
-        for &i in ins {
+        for i in ins.iter() {
             if i < n_in {
                 t[i as usize * words + (o / 32) as usize] |= 1 << (o % 32);
             }
