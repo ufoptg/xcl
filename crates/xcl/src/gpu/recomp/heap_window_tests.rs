@@ -52,8 +52,16 @@ fn device() -> Option<(ID3D12Device, String)> {
             return None;
         }
         let (a, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()?;
+        let name = crate::gpu::adapter::name(&desc);
         let dev = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0).ok()?;
-        Some((dev, crate::gpu::adapter::name(&desc)))
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+        if dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32).is_err()
+            || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+        {
+            println!("{}", crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state()));
+            return None;
+        }
+        Some((dev, name))
     }
 }
 
