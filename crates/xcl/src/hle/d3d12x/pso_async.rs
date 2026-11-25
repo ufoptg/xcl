@@ -140,10 +140,51 @@ static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a bind is waiting for a pipeline still being built: one of the title's threads is
-/// held where a console title never waits (`kernelx::Sleep` does not count that time).
+/// PC calls one of the title's threads is in right now, each with when it began (`pc_call`)
+static PC_CALLS: Mutex<Vec<(u64, std::time::Instant)>> = Mutex::new(Vec::new());
+/// From this long on a PC call holds the title: the console's call returns at once.
+const PC_CALL_HOLDS_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether one of the title's threads is held where a console title never waits: a bind is
+/// waiting for a pipeline still being built, or a PC call has kept its thread for long
+/// (`pc_call`). `kernelx::Sleep` does not count that time.
 pub fn title_held() -> bool {
-    HELD.load(Ordering::Acquire) != 0
+    HELD.load(Ordering::Acquire) != 0 || held_by_pc_call()
+}
+
+fn held_by_pc_call() -> bool {
+    PC_CALLS.lock().unwrap().iter().any(|(_, since)| since.elapsed() >= PC_CALL_HOLDS_AFTER)
+}
+
+/// A call of the title into D3D12 that XCL or the PC's driver can keep for long where the
+/// console's takes no time: a submission (XCL's uploads and tile mappings before the lists, the
+/// driver's compiling in them), a texture's placement, a pipeline built in the call. While it
+/// lasts, from `PC_CALL_HOLDS_AFTER` on, the title is held (`title_held`).
+pub struct PcCall(u64);
+
+pub fn pc_call() -> PcCall {
+    pc_call_since(std::time::Instant::now())
+}
+
+fn pc_call_since(since: std::time::Instant) -> PcCall {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    PC_CALLS.lock().unwrap().push((id, since));
+    PcCall(id)
+}
+
+impl Drop for PcCall {
+    fn drop(&mut self) {
+        let mut calls = PC_CALLS.lock().unwrap();
+        if let Some(i) = calls.iter().position(|c| c.0 == self.0) {
+            calls.swap_remove(i);
+        }
+    }
+}
+
+/// Whether this thread is building a pipeline for `build` (a worker, not one of the title's).
+pub(super) fn building_here() -> bool {
+    BUILDING.with(|b| b.borrow().is_some())
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
@@ -385,6 +426,20 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// A PC call that has kept one of the title's threads for long holds the title
+    /// (`title_held`), a short one does not, and the hold ends with the call.
+    #[test]
+    fn a_long_pc_call_holds_the_title() {
+        let short = pc_call();
+        assert!(!held_by_pc_call(), "a call that has just begun holds the title");
+        let Some(began) = std::time::Instant::now().checked_sub(2 * PC_CALL_HOLDS_AFTER) else { return };
+        let long = pc_call_since(began);
+        assert!(held_by_pc_call() && title_held(), "a PC call has lasted {:?}, but the title is not held", began.elapsed());
+        drop(long);
+        assert!(!held_by_pc_call(), "the call is over, the title is still held");
+        drop(short);
+    }
 
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
     /// `kernelx::Sleep` does not count that time.

@@ -885,6 +885,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
+    // the PC's reserved resource and tile mappings for it can take long where the console's
+    // placement takes no time (`pso_async::title_held`)
+    let _in_pc = super::pso_async::pc_call();
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
