@@ -141,6 +141,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
+- To isolate a rendering artifact, `XCL_TRACE_FRAME=1` logs distinct translated VS/PS hashes and
+  their render-target context. `XCL_DEBUG_SKIP_SHADERS=hash,...` suppresses draws using selected
+  VS/PS hashes (including indirect draws); bisect the logged hashes until the artifact disappears.
+  This is diagnostic only: skipped draws leave holes in the frame and are counted in `xcl.log`.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
