@@ -714,6 +714,10 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if is_ext(v) {
         return;
     }
+    // Read the setting `res_release` needs here, on the thread adopting the object: D3DMetal
+    // releases the resources of an executed list on a thread of its own, which has no Wine TEB,
+    // and reading the environment there for the first time never returns.
+    super::late_release::init();
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
 }

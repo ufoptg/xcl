@@ -92,6 +92,16 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Force the one-time read of `XCL_LATE_RELEASE` on the calling (Wine) thread.
+///
+/// D3DMetal calls `Release` on adopted resources from a native thread of its own, which has
+/// no Wine TEB.  Reading the environment there for the first time never returns.  Calling
+/// this from `real::adopt` -- on the Wine thread that creates the object -- makes sure the
+/// `OnceLock` inside `enabled()` is already set before the host's thread can reach it.
+pub fn init() {
+    let _ = enabled();
+}
+
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
