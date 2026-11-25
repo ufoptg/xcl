@@ -812,15 +812,17 @@ fn start_poller() {
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
 /// &token): the gamepad, connected – at once for a blocking enumeration, from another
 /// thread for an asynchronous one, not at all without enumeration (it never comes or goes)
-unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
+unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
     let t = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
     if !token.is_null() {
         *token = t;
     }
-    crate::xlog_info!("GameInput: device callback for kinds {kind:#x} (enumeration {enumeration})");
-    let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev) && enumeration != 0) else { return S_OK };
+    crate::xlog_info!("GameInput: device callback for kinds {kind:#x} (statuses {filter:#x}, enumeration {enumeration})");
+    // the statuses the caller asked to hear about, of the ones this gamepad has (all of them)
+    let status = STATUS & filter;
+    let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev) && enumeration != 0 && status != 0) else { return S_OK };
     if enumeration == ENUM_BLOCKING {
-        cb(t, context, device(), now_us(), STATUS, 0);
+        cb(t, context, device(), now_us(), status, 0);
     } else {
         let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Device));
         CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&entry));
@@ -830,7 +832,7 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
             if let Some(_guard) = entry.try_enter() {
                 // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
                 // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
-                unsafe { cb(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
+                unsafe { cb(t, ctx as *mut c_void, device(), now_us(), status, 0) };
             }
             CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
         });
@@ -1331,6 +1333,30 @@ mod tests {
         // Must not fire again after self-unregister.
         dispatch_reading_callbacks(GamepadState { buttons: MENU, ..Default::default() });
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
+    }
+
+    /// `statusFilter` says which of a device's statuses the caller hears about: the callback
+    /// gets the ones the device has and the filter names, and is not called for the rest.
+    #[test]
+    fn a_device_callback_reports_only_the_statuses_it_asked_for() {
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        unsafe extern "system" fn cb(_t: u64, _c: *mut c_void, _d: *mut Object, _time: u64, status: u32, _i: u32) {
+            SEEN.store(status, Ordering::SeqCst);
+        }
+        let g = input();
+        unsafe {
+            let mut token = 0u64;
+            // blocking enumeration: the callback runs before the call returns
+            assert_eq!(register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0x1, ENUM_BLOCKING, std::ptr::null_mut(), Some(cb), &mut token), S_OK);
+            assert_eq!(SEEN.load(Ordering::SeqCst), 0x1, "only the status asked for (connected)");
+            SEEN.store(0, Ordering::SeqCst);
+            register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0x2 | 0x4, ENUM_BLOCKING, std::ptr::null_mut(), Some(cb), &mut token);
+            assert_eq!(SEEN.load(Ordering::SeqCst), 0x6, "input enabled and output enabled");
+            // a status this device does not have (0x8, a wired connection): nothing to report
+            SEEN.store(0, Ordering::SeqCst);
+            assert_eq!(register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0x8, ENUM_BLOCKING, std::ptr::null_mut(), Some(cb), &mut token), S_OK);
+            assert_eq!(SEEN.load(Ordering::SeqCst), 0, "a filter the device does not match: no callback");
+        }
     }
 
     #[test]
