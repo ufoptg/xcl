@@ -89,7 +89,13 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
     pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
 }
 
-unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+/// The type of a list XCL keeps state for (`on_create`), without a call to the list; None for
+/// any other
+pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+}
+
+pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3730,13 +3736,24 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     // the states uploads into textures kept in step start from once this list has run
     if super::title_textures::any() {
-        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
-            out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
+        let t = completed_transitions(&out);
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
     }
+}
+
+/// The transitions of `barriers` (console words) that leave a resource in their `StateAfter`:
+/// a split barrier's BEGIN_ONLY (flag 1) only starts its transition – the resource is not in
+/// the new state – and the END_ONLY (flag 2) completes it, so the state is taken from there.
+fn completed_transitions(barriers: &[[u32; 8]]) -> Vec<(usize, u32, D3D12_RESOURCE_STATES)> {
+    const BEGIN_ONLY: u32 = 1;
+    barriers
+        .iter()
+        .filter(|b| b[0] == 0 && b[1] != BEGIN_ONLY)
+        .map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32)))
+        .collect()
 }
 
 /// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER: valid for buffers only
@@ -4389,6 +4406,23 @@ mod tests {
         on_release(l0 as usize);
         on_release(l1 as usize);
         on_release(l2 as usize);
+    }
+
+    /// A split barrier's BEGIN_ONLY only starts its transition: the resource is not in the new
+    /// state (it must not be read or written) until the END_ONLY completes it, so the state
+    /// uploads start from is the one the end barrier names, not the begin's.
+    #[test]
+    fn a_split_barriers_begin_is_not_a_completed_transition() {
+        let res = 0x1234_5000usize;
+        let words = |flags: u32, after: u32| [0u32, flags, res as u32, (res >> 32) as u32, 0, 0x1, after, 0];
+        let none = words(0, 0x8); // COMMON → UNORDERED_ACCESS
+        let begin = words(1, 0x8);
+        let end = words(2, 0x8);
+        let t = completed_transitions(&[none, begin, end]);
+        assert_eq!(t.len(), 2, "the begin-only barrier is not one: {t:?}");
+        assert!(t.iter().all(|&(r, sub, st)| r == res && sub == 0 && st == D3D12_RESOURCE_STATES(0x8)));
+        // a UAV barrier (type 2) is no transition at all
+        assert!(completed_transitions(&[[2, 0, 0, 0, 0, 0, 0, 0], begin]).is_empty());
     }
 
     #[test]
