@@ -22,12 +22,15 @@ use super::console_list::{self, Layout, Param};
 struct State {
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
+    /// the title's compute root signature (a PC object), retained for untranslated
+    /// `ExecuteIndirect` calls on compute or direct lists
+    rs_cmp: Option<ID3D12RootSignature>,
     /// the graphics root signature's layout and arguments
     layout_gfx: Option<Arc<Layout>>,
     args_gfx: Vec<u8>,
     /// the title's graphics root signature (a PC object), bound before a draw with an
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
-    rs_gfx: usize,
+    rs_gfx: Option<ID3D12RootSignature>,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -73,58 +76,76 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks) = with(list, |s| {
+    let (old, blocks, old_rs_cmp, old_rs_gfx) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
         s.layout = None;
         s.args.clear();
+        let old_rs_cmp = s.rs_cmp.take();
         s.layout_gfx = None;
         s.args_gfx.clear();
-        s.rs_gfx = 0;
-        (old, std::mem::take(&mut s.uma))
+        let old_rs_gfx = s.rs_gfx.take();
+        (old, std::mem::take(&mut s.uma), old_rs_cmp, old_rs_gfx)
     });
+    drop((old_rs_cmp, old_rs_gfx));
     console_list::hold_until_reset(old, blocks);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
-    with(list, |s| {
+    let (old_rs_cmp, old_rs_gfx) = with(list, |s| {
         s.pso = pso;
         s.layout = None;
         s.args.clear();
+        let old_rs_cmp = s.rs_cmp.take();
         s.layout_gfx = None;
         s.args_gfx.clear();
-        s.rs_gfx = 0;
+        let old_rs_gfx = s.rs_gfx.take();
+        (old_rs_cmp, old_rs_gfx)
     });
+    drop((old_rs_cmp, old_rs_gfx));
 }
 
 /// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, rs_cmp, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
+        (
+            s.layout.clone(),
+            s.args.clone(),
+            s.rs_cmp.clone(),
+            s.layout_gfx.clone(),
+            s.args_gfx.clone(),
+            s.rs_gfx.clone(),
+            s.pso,
+        )
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, old_rs_cmp, old_rs_gfx) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
         s.args = args;
+        let old_rs_cmp = std::mem::replace(&mut s.rs_cmp, rs_cmp);
         s.layout_gfx = layout_gfx;
         s.args_gfx = args_gfx;
-        s.rs_gfx = rs_gfx;
+        let old_rs_gfx = std::mem::replace(&mut s.rs_gfx, rs_gfx);
         s.pso = pso;
-        (old, std::mem::take(&mut s.uma))
+        (old, std::mem::take(&mut s.uma), old_rs_cmp, old_rs_gfx)
     });
+    drop((old_rs_cmp, old_rs_gfx));
     console_list::hold_until_reset(old, blocks);
 }
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
-        console_list::hold_until_reset(s.allocator, s.uma);
+    let removed = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    if let Some(s) = removed {
+        let State { allocator, uma, rs_cmp, rs_gfx, .. } = s;
+        drop((rs_cmp, rs_gfx));
+        console_list::hold_until_reset(allocator, uma);
     }
 }
 
@@ -171,14 +192,41 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
     put_in(list, false, i, offset, bytes)
 }
 
+/// Retain a real COM `ID3D12RootSignature` pointer (ignoring null or synthetic non-COM keys).
+unsafe fn retain_root_signature(rs: *mut c_void) -> Option<ID3D12RootSignature> {
+    if rs.is_null() {
+        return None;
+    }
+    let can_retain = super::real::is_adopted(rs)
+        || (crate::gpu::shader::readable(rs as usize, std::mem::size_of::<usize>()) && {
+            let vt = *(rs as *const usize);
+            vt != 0
+                && crate::gpu::shader::readable(vt, 3 * std::mem::size_of::<usize>())
+                && *(vt as *const usize).add(1) != 0
+                && *(vt as *const usize).add(2) != 0
+        });
+    can_retain.then(|| ID3D12RootSignature::from_raw_borrowed(&rs).cloned()).flatten()
+}
+
+/// Query `ID3D12CommandList::GetType` (slot 8) on an adopted command list if populated.
+unsafe fn list_type(this: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    let f = super::real::orig_fn(this, 8);
+    (f != 0).then(|| {
+        let get_type: unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE = std::mem::transmute(f);
+        get_type(this)
+    })
+}
+
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
-    with(this, |s| {
+    let retained = retain_root_signature(rs);
+    let old_rs = with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout_gfx = layout;
-        s.rs_gfx = rs as usize;
+        std::mem::replace(&mut s.rs_gfx, retained)
     });
+    drop(old_rs);
 }
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
@@ -282,10 +330,29 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         }
-        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
-            list.SetGraphicsRootSignature(r);
+        // a PC pipeline: the title's root signature, respecting the command list type and
+        // holding retained COM references across the native bind and ExecuteIndirect calls
+        let (rs_gfx, rs_cmp) = with(this, |s| (s.rs_gfx.clone(), s.rs_cmp.clone()));
+        if let Some(list) = (rs_gfx.is_some() || rs_cmp.is_some())
+            .then(|| ID3D12GraphicsCommandList::from_raw_borrowed(&this))
+            .flatten()
+        {
+            match list_type(this).unwrap_or(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                D3D12_COMMAND_LIST_TYPE_COMPUTE => {
+                    if let Some(r) = rs_cmp.as_ref() {
+                        list.SetComputeRootSignature(r);
+                    }
+                }
+                D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_BUNDLE => {
+                    if let Some(r) = rs_gfx.as_ref() {
+                        list.SetGraphicsRootSignature(r);
+                    }
+                    if let Some(r) = rs_cmp.as_ref() {
+                        list.SetComputeRootSignature(r);
+                    }
+                }
+                _ => {}
+            }
         }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
@@ -457,8 +524,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
-        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+        let rs = with(this, |s| s.rs_gfx.clone());
+        if let Some(r) = rs.as_ref() {
             list.SetGraphicsRootSignature(r);
         }
         return Some(list);
@@ -703,10 +770,13 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
-    with(this, |s| {
+    let retained = retain_root_signature(rs);
+    let old_rs = with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout = layout;
+        std::mem::replace(&mut s.rs_cmp, retained)
     });
+    drop(old_rs);
 }
 
 /// #35 SetComputeRootDescriptorTable (PC #31): the table's console address, 32 bits
@@ -1270,6 +1340,10 @@ mod tests {
             }
             let dev = dev.expect("D3D12 device");
             real::adopt(dev.as_raw(), real::Kind::Device);
+            let iq = dev.cast::<ID3D12InfoQueue>().ok();
+            if let Some(ref iq) = iq {
+                iq.ClearStoredMessages();
+            }
 
             // Build two real PC compute PSOs from the inbox dummy CS bytecode.
             let mut ser = None;
@@ -1342,6 +1416,280 @@ mod tests {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn execute_indirect_compute_list_respects_list_type_and_retains_root_signature() {
+        #[repr(C)]
+        struct FakeRs {
+            vt: *const usize,
+            refs: AtomicUsize,
+            drops: AtomicUsize,
+        }
+
+        unsafe extern "system" fn rs_qi(this: *mut c_void, _riid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT {
+            if out.is_null() {
+                return windows::Win32::Foundation::E_POINTER;
+            }
+            rs_add_ref(this);
+            *out = this;
+            windows::Win32::Foundation::S_OK
+        }
+        unsafe extern "system" fn rs_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeRs)).refs.fetch_add(1, Ordering::AcqRel) as u32 + 1
+        }
+        unsafe extern "system" fn rs_release(this: *mut c_void) -> u32 {
+            let prev = (*(this as *const FakeRs)).refs.fetch_sub(1, Ordering::AcqRel);
+            let rem = prev - 1;
+            if rem == 0 {
+                (*(this as *const FakeRs)).drops.fetch_add(1, Ordering::AcqRel);
+            }
+            rem as u32
+        }
+
+        #[repr(C)]
+        struct FakeTypedList {
+            vt: *const usize,
+            refs: AtomicUsize,
+            ty: D3D12_COMMAND_LIST_TYPE,
+            compute_rs_calls: Mutex<Vec<(usize, usize)>>,
+            gfx_rs_calls: Mutex<Vec<(usize, usize)>>,
+            ei_calls: AtomicUsize,
+        }
+
+        unsafe extern "system" fn typed_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTypedList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn typed_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeTypedList)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+        unsafe extern "system" fn typed_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            (*(this as *const FakeTypedList)).ty
+        }
+        unsafe extern "system" fn typed_set_compute_rs(this: *mut c_void, rs: *mut c_void) {
+            let refs = if rs.is_null() { 0 } else { (*(rs as *const FakeRs)).refs.load(Ordering::Acquire) };
+            (*(this as *const FakeTypedList)).compute_rs_calls.lock().unwrap().push((rs as usize, refs));
+        }
+        unsafe extern "system" fn typed_set_gfx_rs(this: *mut c_void, rs: *mut c_void) {
+            let refs = if rs.is_null() { 0 } else { (*(rs as *const FakeRs)).refs.load(Ordering::Acquire) };
+            (*(this as *const FakeTypedList)).gfx_rs_calls.lock().unwrap().push((rs as usize, refs));
+        }
+        unsafe extern "system" fn typed_ei(this: *mut c_void, _sig: usize, _max: u32, _args: usize, _args_off: u64, _count_buf: usize, _count_off: u64) {
+            (*(this as *const FakeTypedList)).ei_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let rs_vt = [rs_qi as usize, rs_add_ref as usize, rs_release as usize];
+        let rs_cmp = Box::new(FakeRs { vt: rs_vt.as_ptr(), refs: AtomicUsize::new(1), drops: AtomicUsize::new(0) });
+        let rs_gfx = Box::new(FakeRs { vt: rs_vt.as_ptr(), refs: AtomicUsize::new(1), drops: AtomicUsize::new(0) });
+        let rs_cmp_ptr = &*rs_cmp as *const FakeRs as *mut c_void;
+        let rs_gfx_ptr = &*rs_gfx as *const FakeRs as *mut c_void;
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = typed_add_ref as usize;
+        orig_vt[2] = typed_release as usize;
+        orig_vt[8] = typed_get_type as usize;
+        orig_vt[29] = typed_set_compute_rs as usize;
+        orig_vt[30] = typed_set_gfx_rs as usize;
+        orig_vt[59] = typed_ei as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let mut list = Box::new(FakeTypedList {
+            // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            ty: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            compute_rs_calls: Mutex::new(Vec::new()),
+            gfx_rs_calls: Mutex::new(Vec::new()),
+            ei_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &mut *list as *mut FakeTypedList as *mut c_void;
+
+        unsafe {
+            reset(list_ptr, 0x7600_0100, 0);
+            set_compute_root_signature(list_ptr, rs_cmp_ptr);
+            set_graphics_root_signature(list_ptr, rs_gfx_ptr);
+
+            // Caller drops its own references; bind::State must retain both until cleared/reset.
+            assert_eq!(rs_release(rs_cmp_ptr), 1, "bind::State must retain compute root signature");
+            assert_eq!(rs_release(rs_gfx_ptr), 1, "bind::State must retain graphics root signature");
+            assert_eq!(rs_cmp.drops.load(Ordering::Acquire), 0);
+            assert_eq!(rs_gfx.drops.load(Ordering::Acquire), 0);
+
+            // 1. COMPUTE list with bound compute RS (and stale rs_gfx): binds compute RS, never SetGraphicsRootSignature.
+            execute_indirect(list_ptr, 0x7600_0200, 1, 0, 0, 0, 0);
+            assert_eq!(*list.gfx_rs_calls.lock().unwrap(), Vec::<(usize, usize)>::new());
+            let cmp_calls = std::mem::take(&mut *list.compute_rs_calls.lock().unwrap());
+            assert_eq!(cmp_calls.len(), 1);
+            assert_eq!(cmp_calls[0].0, rs_cmp_ptr as usize);
+            assert!(cmp_calls[0].1 >= 1, "compute RS must stay alive during SetComputeRootSignature");
+            assert_eq!(list.ei_calls.load(Ordering::Relaxed), 1);
+
+            // 2. COMPUTE list after clearing compute RS (with stale rs_gfx still held): calls neither RS setter.
+            set_compute_root_signature(list_ptr, std::ptr::null_mut());
+            assert_eq!(rs_cmp.drops.load(Ordering::Acquire), 1, "clearing compute RS must release retained ref");
+            execute_indirect(list_ptr, 0x7600_0200, 1, 0, 0, 0, 0);
+            assert!(list.gfx_rs_calls.lock().unwrap().is_empty());
+            assert!(list.compute_rs_calls.lock().unwrap().is_empty());
+            assert_eq!(list.ei_calls.load(Ordering::Relaxed), 2);
+
+            // 3. DIRECT list binds retained graphics RS even after caller released its own ref.
+            list.ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            execute_indirect(list_ptr, 0x7600_0200, 1, 0, 0, 0, 0);
+            let gfx_calls = std::mem::take(&mut *list.gfx_rs_calls.lock().unwrap());
+            assert_eq!(gfx_calls.len(), 1);
+            assert_eq!(gfx_calls[0].0, rs_gfx_ptr as usize);
+            assert!(gfx_calls[0].1 >= 1);
+            assert_eq!(list.ei_calls.load(Ordering::Relaxed), 3);
+
+            forget(list_ptr);
+            assert_eq!(rs_gfx.drops.load(Ordering::Acquire), 1, "forget must release retained graphics RS");
+        }
+    }
+
+    #[test]
+    fn execute_indirect_on_d3d12_compute_list_with_and_without_root_signature() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        if console_list::enabled() {
+            return;
+        }
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            let iq = dev.cast::<ID3D12InfoQueue>().ok();
+            if let Some(ref iq) = iq {
+                iq.ClearStoredMessages();
+            }
+
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let rs_gfx: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature gfx");
+
+            let cs = real::dummy_cs_bytecode();
+            let mut pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&pso_desc).expect("CreateComputePipelineState");
+            std::mem::ManuallyDrop::drop(&mut pso_desc.pRootSignature);
+
+            let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: 12,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg_desc,
+                NodeMask: 0,
+            };
+            let mut cmd_sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(&sig_desc, None, &mut cmd_sig).expect("CreateCommandSignature");
+            let cmd_sig = cmd_sig.unwrap();
+
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut arg_buf: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut arg_buf)
+                .expect("CreateCommittedResource");
+            let arg_buf = arg_buf.unwrap();
+            let mut mapped = std::ptr::null_mut();
+            arg_buf.Map(0, None, Some(&mut mapped)).expect("Map");
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr(), mapped as *mut u32, 3);
+            arg_buf.Unmap(0, None);
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc");
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() })
+                .expect("compute queue");
+            let mut raw_list: *mut c_void = std::ptr::null_mut();
+            let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
+            let hr = device_x::create_command_list_pc(
+                dev.as_raw(),
+                0,
+                D3D12_COMMAND_LIST_TYPE_COMPUTE.0 as u32,
+                alloc.as_raw() as usize,
+                pso.as_raw() as usize,
+                &iid,
+                &mut raw_list,
+            );
+            assert!(hr >= 0 && !raw_list.is_null(), "create_command_list_pc failed: {hr:#x}");
+            let backing = title_list::backing(raw_list).expect("wrapped in title_list");
+            let cl = ID3D12GraphicsCommandList::from_raw_borrowed(&backing).unwrap();
+
+            // 1. With compute RS bound (and caller dropping its own ref) + stale graphics RS.
+            let rs_raw = rs.as_raw();
+            let rs_gfx_raw = rs_gfx.as_raw();
+            set_compute_root_signature(backing, rs_raw);
+            set_graphics_root_signature(backing, rs_gfx_raw);
+            drop(rs);
+            drop(rs_gfx);
+            execute_indirect(backing, cmd_sig.as_raw() as usize, 1, arg_buf.as_raw() as usize, 0, 0, 0);
+
+            // 2. Without compute RS in bind::State (while stale graphics RS is still set):
+            // must not emit SetGraphicsRootSignature onto the compute list.
+            set_compute_root_signature(backing, std::ptr::null_mut());
+            execute_indirect(backing, cmd_sig.as_raw() as usize, 1, arg_buf.as_raw() as usize, 0, 0, 0);
+
+            cl.Close().expect("compute command list Close");
+            queue.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("CreateFence");
+            queue.Signal(&fence, 1).expect("Signal");
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
+            if let Some(ref iq) = iq {
+                let n = iq.GetNumStoredMessages();
+                for i in 0..n {
+                    let mut len = 0usize;
+                    if iq.GetMessage(i, None, &mut len).is_ok() && len > 0 {
+                        let mut buf = vec![0u8; len];
+                        let msg_ptr = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                        if iq.GetMessage(i, Some(msg_ptr), &mut len).is_ok() {
+                            let msg = &*msg_ptr;
+                            assert!(
+                                msg.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                                "D3D12 debug error id={}: {}",
+                                msg.ID.0,
+                                if msg.pDescription.is_null() {
+                                    String::new()
+                                } else {
+                                    std::ffi::CStr::from_ptr(msg.pDescription as *const i8).to_string_lossy().into_owned()
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+
+            let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
+            assert_eq!(release_fn(raw_list), 0);
         }
     }
 }
