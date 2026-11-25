@@ -155,6 +155,59 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn direct_dump_requires_a_directory() {
+    let dir = TempDir::new("direct-dump-directory");
+    let shaders = dir.path().join("shaders");
+    std::fs::create_dir(&shaders).unwrap();
+
+    for args in [&["--direct", "--dump"][..], &["--direct", "--dump", "--json"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(&shaders)
+            .args(args)
+            .current_dir(dir.path())
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("expected a directory after --dump"), "{stderr}");
+    }
+    assert!(!dir.path().join("--json").exists());
+
+    let existing_file = dir.path().join("existing-file");
+    std::fs::write(&existing_file, b"keep this file").unwrap();
+    let output = run_shaders(&shaders, &["--direct", "--dump", existing_file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot create dump directory") && stderr.contains("existing-file"), "{stderr}");
+    assert_eq!(std::fs::read(&existing_file).unwrap(), b"keep this file");
+}
+
+#[test]
+fn direct_dump_reports_an_output_write_failure() {
+    let dir = TempDir::new("direct-dump-write");
+    let shaders = dir.path().join("shaders");
+    std::fs::create_dir(&shaders).unwrap();
+    std::fs::write(shaders.join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    let dump = dir.path().join("dump");
+    let args = ["--direct", "--dump", dump.to_str().unwrap()];
+
+    let output = run_shaders(&shaders, &args);
+    assert!(output.status.success(), "{output:?}");
+    let guest = std::fs::read_dir(&dump).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name().unwrap().to_string_lossy().ends_with(".guest.bin"))
+        .expect("guest program dump");
+    assert_eq!(std::fs::read(&guest).unwrap(), CODE);
+
+    std::fs::remove_file(&guest).unwrap();
+    std::fs::create_dir(&guest).unwrap();
+    let output = run_shaders(&shaders, &args);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot write") && stderr.contains(".guest.bin"), "{stderr}");
+}
+
+#[test]
 fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     let dir = TempDir::new("single");
     let file = dir.path().join("ps.bin");

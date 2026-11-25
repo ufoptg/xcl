@@ -1717,10 +1717,21 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
     let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    if let Some(d) = &dump_dir {
-        let _ = std::fs::create_dir_all(d);
-    }
+    let dump_dir = if let Some(i) = args.iter().position(|a| a == "--dump") {
+        let Some(dir) = args.get(i + 1).filter(|arg| !arg.is_empty() && !arg.starts_with("--")) else {
+            eprintln!("xcl shaders --direct: expected a directory after --dump");
+            return 2;
+        };
+        let dir = PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("xcl shaders --direct: cannot create dump directory {}: {e}", dir.display());
+            return 2;
+        }
+        Some(dir)
+    } else {
+        None
+    };
+    let dump_failed = std::sync::atomic::AtomicBool::new(false);
     let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
     // translator panics are counted, not printed (`--trace` keeps the messages)
     if !trace {
@@ -1768,8 +1779,13 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                         };
                         let time = t.elapsed();
                         let dump = |suffix: &str, bytes: &[u8]| {
-                            if let Some(d) = &dump_dir {
-                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                            let Some(d) = &dump_dir else { return };
+                            let path = d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset));
+                            if let Err(e) = std::fs::write(&path, bytes) {
+                                // A full disk may fail every write. Report the first failure.
+                                if !dump_failed.swap(true, Ordering::Relaxed) {
+                                    eprintln!("xcl shaders --direct: cannot write {}: {e}", path.display());
+                                }
                             }
                         };
                         dump("guest.bin", code);
@@ -1812,5 +1828,5 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
-    0
+    if dump_failed.into_inner() { 2 } else { 0 }
 }
