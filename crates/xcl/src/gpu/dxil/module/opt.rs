@@ -158,9 +158,7 @@ impl Module {
         }
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
         for &b in order {
-            for s in self.successors(b as usize) {
-                preds[s.0 as usize].push(b as usize);
-            }
+            self.for_each_successor(b as usize, |s| preds[s.0 as usize].push(b as usize));
         }
         let mut idom: Vec<Option<usize>> = vec![None; n];
         idom[0] = Some(0);
@@ -206,7 +204,7 @@ impl Module {
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
-        let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+        let order: Vec<u32> = self.block_order().into_iter().map(|b| b as u32).collect();
         // malformed IR (a use before its definition or of a void result) is left for the
         // writer to report, not cleaned away
         if !self.uses_well_formed(&order) {

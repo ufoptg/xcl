@@ -779,7 +779,11 @@ impl Module {
         // Blocks are written in reverse post-order of the entry's CFG (entry
         // first), so a lowering may create blocks in any order; unreachable blocks
         // are dropped. Value numbering follows that order.
-        let (order, pos) = self.block_layout();
+        let order = self.block_order();
+        let mut pos = vec![None; self.blocks.len()];
+        for (k, &b) in order.iter().enumerate() {
+            pos[b] = Some(k as u32);
+        }
 
         // Global variables nothing references (e.g. an exchange array the code never
         // needed) are left out: the validator rejects unused internal declarations.
@@ -1025,53 +1029,52 @@ impl Module {
     }
 
     /// Successor blocks of block `b` (from its terminator, if any).
-    fn successors(&self, b: usize) -> Vec<Block> {
+    fn for_each_successor(&self, b: usize, mut visit: impl FnMut(Block)) {
         match self.blocks[b].last().map(|&i| &self.insts[i as usize].op) {
-            Some(Op::Br(t)) => vec![*t],
-            Some(Op::CondBr(_, t, f)) => vec![*t, *f],
-            Some(Op::Switch(_, d, cases)) => std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect(),
-            _ => Vec::new(),
+            Some(Op::Br(t)) => visit(*t),
+            Some(Op::CondBr(_, t, f)) => {
+                visit(*t);
+                visit(*f);
+            }
+            Some(Op::Switch(_, d, cases)) => {
+                visit(*d);
+                cases.iter().for_each(|c| visit(c.1));
+            }
+            _ => {}
         }
     }
 
-    /// The written block order (reverse post-order from the entry block, which
-    /// keeps the creation order where that is already a valid layout) and each
-    /// block's position in it (`None`: unreachable, not written).
-    fn block_layout(&self) -> (Vec<usize>, Vec<Option<u32>>) {
+    /// Reverse post-order from the entry block, omitting unreachable blocks.
+    fn block_order(&self) -> Vec<usize> {
         let n = self.blocks.len();
         let mut seen = vec![false; n];
         let mut post = Vec::with_capacity(n);
-        // Iterative DFS; successors pushed so that earlier-created ones are visited
-        // last, which makes the reverse post-order prefer creation order.
-        let mut stack: Vec<(usize, Vec<Block>)> = vec![(0, {
-            let mut s = self.successors(0);
-            s.sort_by_key(|b| std::cmp::Reverse(b.0));
-            s
-        })];
+        let mut stack = Vec::new();
+        let mut pending = Vec::new();
+        // Each DFS frame owns the tail added to the shared successor buffer.
+        // Sorting that tail preserves the original traversal order.
+        let enter = |b, stack: &mut Vec<(usize, usize)>, pending: &mut Vec<Block>| {
+            let start = pending.len();
+            self.for_each_successor(b, |s| pending.push(s));
+            pending[start..].sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
+            stack.push((b, start));
+        };
+        enter(0, &mut stack, &mut pending);
         seen[0] = true;
-        while let Some((b, succ)) = stack.last_mut() {
-            match succ.pop() {
-                Some(t) => {
-                    let t = t.0 as usize;
-                    if t < n && !seen[t] {
-                        seen[t] = true;
-                        let mut s = self.successors(t);
-                        s.sort_by_key(|b| std::cmp::Reverse(b.0));
-                        stack.push((t, s));
-                    }
-                }
-                None => {
-                    post.push(*b);
-                    stack.pop();
-                }
+        while let Some(&(b, start)) = stack.last() {
+            if pending.len() == start {
+                post.push(b);
+                stack.pop();
+                continue;
+            }
+            let t = pending.pop().unwrap().0 as usize;
+            if t < n && !seen[t] {
+                seen[t] = true;
+                enter(t, &mut stack, &mut pending);
             }
         }
         post.reverse();
-        let mut pos = vec![None; n];
-        for (k, &b) in post.iter().enumerate() {
-            pos[b] = Some(k as u32);
-        }
-        (post, pos)
+        post
     }
 
     /// Replaces every use of `old` by `new` in the entry's instructions and in
