@@ -1112,3 +1112,160 @@ fn dx_op_attrs_match_dxc() {
     }
     assert!(n > 50, "only {n} declarations found");
 }
+
+// ------------------------------------------------- one-op probes (AMD triage)
+//
+// Same ops as `integer_ops_match_cpu` and `uaddc_and_usubb_match_cpu`, one
+// `dx.op` helper per kernel, so a GPU-side failure names the exact op. On an
+// AMD wave64 card (RX 7900 XT, Mesa, vkd3d-proton) every probe passes except
+// `uaddc`, `usubb`, and `udiv_rem`: those abort the GPU run with a driver-side
+// fault and no DXIL validation error (xcl-dev/xcl#1426 thread, 2026-11-25).
+// A second input vector without zeros (`uvals2`) keeps div/rem unambiguous.
+
+/// Shared harness: one kernel body, two input slots, run, compare slot 0..n.
+fn probe(inputs: Vec<Vec<u32>>, build: impl Fn(&mut K, Value, Value) -> Vec<Value>, want: impl Fn(u32, u32) -> Vec<u32>) {
+    let mut k = kernel();
+    let (a, b) = (k.input(0), k.input(1));
+    let outs = build(&mut k, a, b);
+    let n = outs.len();
+    for (i, v) in outs.into_iter().enumerate() {
+        k.out(i as u32, v);
+    }
+    let c = k.finish([32, 1, 1]);
+    let Some(r) = gpu(&c, &mem_of(&inputs), &[], &[]) else { return };
+    for l in 0..32 {
+        let got = (0..n).map(|i| outv(&r, i)[l]).collect::<Vec<_>>();
+        assert_eq!(got, want(UVALS[l], inputs[1][l]).as_slice(), "lane {l}: a={:#x} b={:#x}", UVALS[l], inputs[1][l]);
+    }
+}
+
+fn two_inputs() -> Vec<Vec<u32>> {
+    vec![UVALS.to_vec(), uvals2()]
+}
+
+/// width/offset fields packed in `b` exactly like `integer_ops_match_cpu`.
+fn wo(b: u32) -> (u32, u32) {
+    (b & 31, (b >> 5) & 31)
+}
+
+#[test]
+fn probe_bfrev_match_cpu() {
+    probe(vec![UVALS.to_vec(), UVALS.to_vec()], |k, a, _| vec![k.s.bfrev(a)], |a, _| vec![a.reverse_bits()]);
+}
+
+#[test]
+fn probe_countbits_match_cpu() {
+    probe(vec![UVALS.to_vec(), UVALS.to_vec()], |k, a, _| vec![k.s.bit_count(BitCount::Countbits, a)], |a, _| vec![a.count_ones()]);
+}
+
+#[test]
+fn probe_firstbitlo_match_cpu() {
+    probe(vec![UVALS.to_vec(), UVALS.to_vec()], |k, a, _| vec![k.s.bit_count(BitCount::FirstbitLo, a)], |a, _| vec![if a == 0 { u32::MAX } else { a.trailing_zeros() }]);
+}
+
+#[test]
+fn probe_firstbithi_match_cpu() {
+    probe(vec![UVALS.to_vec(), UVALS.to_vec()], |k, a, _| vec![k.s.bit_count(BitCount::FirstbitHi, a)], |a, _| vec![if a == 0 { u32::MAX } else { a.leading_zeros() }]);
+}
+
+#[test]
+fn probe_firstbitshi_match_cpu() {
+    probe(vec![UVALS.to_vec(), UVALS.to_vec()], |k, a, _| vec![k.s.bit_count(BitCount::FirstbitSHi, a)], |a, _| {
+        let s = if (a as i32) < 0 { !a } else { a };
+        vec![if s == 0 { u32::MAX } else { s.leading_zeros() }]
+    });
+}
+
+#[test]
+fn probe_imax_umin_match_cpu() {
+    probe(two_inputs(), |k, a, b| vec![k.s.binary(Binary::IMax, a, b), k.s.binary(Binary::IMin, a, b), k.s.binary(Binary::UMax, a, b), k.s.binary(Binary::UMin, a, b)], |a, b| {
+        vec![(a as i32).max(b as i32) as u32, (a as i32).min(b as i32) as u32, a.max(b), a.min(b)]
+    });
+}
+
+#[test]
+fn probe_imad_umad_match_cpu() {
+    probe(two_inputs(), |k, a, b| vec![k.s.tertiary(Tertiary::IMad, a, b, a), k.s.tertiary(Tertiary::UMad, a, b, b)], |a, b| {
+        vec![a.wrapping_mul(b).wrapping_add(a), a.wrapping_mul(b).wrapping_add(b)]
+    });
+}
+
+#[test]
+fn probe_bfe_bfi_match_cpu() {
+    let bfe = |w: u32, o: u32, v: u32, signed: bool| -> u32 {
+        if w == 0 {
+            0
+        } else if w + o < 32 {
+            let s = v << (32 - w - o);
+            if signed { ((s as i32) >> (32 - w)) as u32 } else { s >> (32 - w) }
+        } else if signed {
+            ((v as i32) >> o) as u32
+        } else {
+            v >> o
+        }
+    };
+    probe(two_inputs(), |k, a, b| {
+        let m31 = k.s.m.i32c(31);
+        let w = k.s.m.bin(BinOp::And, b, m31);
+        let five = k.s.m.i32c(5);
+        let sh = k.s.m.bin(BinOp::LShr, b, five);
+        let o = k.s.m.bin(BinOp::And, sh, m31);
+        vec![k.s.tertiary(Tertiary::Ibfe, w, o, a), k.s.tertiary(Tertiary::Ubfe, w, o, a), k.s.bfi(w, o, a, b)]
+    }, |a, b| {
+        let (w, o) = wo(b);
+        let m = (((1u64 << w) - 1) as u32) << o;
+        vec![bfe(w, o, a, true), bfe(w, o, a, false), ((a << o) & m) | (b & !m)]
+    });
+}
+
+#[test]
+fn probe_umul_wide_match_cpu() {
+    probe(two_inputs(), |k, a, b| {
+        let (hi, lo) = k.s.umul_wide(a, b);
+        vec![hi, lo]
+    }, |a, b| {
+        let m = a as u64 * b as u64;
+        vec![(m >> 32) as u32, m as u32]
+    });
+}
+
+#[test]
+fn probe_imul_wide_match_cpu() {
+    probe(two_inputs(), |k, a, b| {
+        let (hi, lo) = k.s.imul_wide(a, b);
+        vec![hi, lo]
+    }, |a, b| {
+        let m = (a as i32 as i64 * b as i32 as i64) as u64;
+        vec![(m >> 32) as u32, m as u32]
+    });
+}
+
+#[test]
+fn probe_udiv_rem_match_cpu() {
+    probe(two_inputs(), |k, a, b| {
+        let (q, r) = k.s.udiv_rem(a, b);
+        vec![q, r]
+    }, |a, b| vec![a.checked_div(b).unwrap_or(u32::MAX), a.checked_rem(b).unwrap_or(u32::MAX)]);
+}
+
+#[test]
+fn probe_uaddc_match_cpu() {
+    probe(two_inputs(), |k, a, b| {
+        let (sum, carry) = k.s.uaddc(a, b);
+        vec![sum, carry]
+    }, |a, b| {
+        let (s, c) = a.overflowing_add(b);
+        vec![s, c as u32]
+    });
+}
+
+#[test]
+fn probe_usubb_match_cpu() {
+    probe(two_inputs(), |k, a, b| {
+        let (diff, borrow) = k.s.usubb(a, b);
+        vec![diff, borrow]
+    }, |a, b| {
+        let (d, w) = a.overflowing_sub(b);
+        vec![d, w as u32]
+    });
+}
