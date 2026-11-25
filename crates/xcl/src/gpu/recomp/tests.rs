@@ -2346,7 +2346,7 @@ fn gpu_cube_array_slices() {
             }
         }
     }
-    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false }];
+    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false, mips: 1 }];
     let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -2418,10 +2418,10 @@ fn gpu_images_sample_load_store_atomic() {
         }
     }
     let tex = vec![
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true, mips: 1 },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true, mips: 1 },
     ];
     let samp = vec![
         TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
@@ -2444,6 +2444,210 @@ fn gpu_images_sample_load_store_atomic() {
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
+}
+
+/// `image_gather4_l` / `_l_o` read the 2x2 footprint of the mip the S# and the LOD name, not mip 0:
+/// level = floor(LOD + S# bias, clamped to the S# MIN_LOD..MAX_LOD, + 0.5) (ties go up), 0 with MIP_FILTER
+/// none, clamped to the view's mips. Every mip and texel holds its own value, the offsets are negative /
+/// far out, and the S# address modes (wrap, mirror, clamp, mirror once, borders) apply per texel. Both the
+/// HLSL and the direct DXIL backend run it, whatever `XCL_DIRECT_DXIL` says.
+#[test]
+fn gpu_gather4_explicit_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // T# 2D in s[16:23] (SRSRC 4), T# 2D array in s[24:31] (SRSRC 6), S# linear clamp in s[32:35] (SSAMP 8)
+    code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_L_O", &[("VDATA", 30), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 40), ("VADDR", 8), ("SRSRC", 6), ("SSAMP", 8), ("DMASK", 0x1), ("DIM", 5)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    // 8 x 8, 4 mips; the red channel of texel (x, y) of mip m of layer a = 5000 a + 1000 m + 10 y + x
+    let data = |layers: u32| {
+        let mut d = Vec::new();
+        for a in 0..layers {
+            for m in 0..4u32 {
+                let size = 8 >> m;
+                for y in 0..size {
+                    for x in 0..size {
+                        for v in [(5000 * a + 1000 * m + 10 * y + x) as f32, 0.0, 0.0, 1.0] {
+                            d.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        d
+    };
+    let tex = [
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 8, height: 8, depth: 1, texel_bytes: 16, data: data(1), uav: false, mips: 4 },
+        TestTexture { dim: TexDim::D2Array, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 8, height: 8, depth: 2, texel_bytes: 16, data: data(2), uav: false, mips: 4 },
+    ];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 77, 13));
+    // none of these lands on a texel boundary (coord * size - 0.5 is never an integer at 8, 4 or 2 texels)
+    let us = [0.0f32, 0.3, 0.7, 1.0, 0.99, 0.02, 0.45, 0.83];
+    let vs = [1.0f32, 0.0, 0.7, 0.3, 0.02, 0.99, 0.45, 0.83];
+    let offs = [(-1i32, 0i32), (0, -1), (1, 1), (-2, -3), (3, 2), (0, 0), (-1, -1), (7, -5)];
+    // 0; the ties 0.5 -> 1 and 2.5 -> 3; 1; 0.6 -> 1; 2; past the last mip (3); negative (0)
+    let lods = [0.0f32, 0.5, 1.0, 0.6, 2.0, 2.5, 5.0, -1.0];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (c, lod) = (l % 8, lods[l / 8 % 8]);
+        r[0] = f(us[c]);
+        r[1] = f(vs[c]);
+        r[2] = f(lod);
+        r[4] = ((offs[c].0 & 0x3F) | ((offs[c].1 & 0x3F) << 8)) as u32;
+        r[5] = f(us[c]);
+        r[6] = f(vs[c]);
+        r[7] = f(lod);
+        r[8] = f(us[c]);
+        r[9] = f(vs[c]);
+        r[10] = f((l % 2) as f32);
+        r[11] = f(lod);
+    }
+    // S# cases: [word 0 (addressing), word 1 (MIN_LOD / MAX_LOD), word 2 (bias, MIP_FILTER), word 3 (border)]
+    let (full, point) = (0xFFFu32 << 12, 1u32 << 26);
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let cases: [(&str, [u32; 4]); 14] = [
+        ("clamp, point mip", [clamp, full, point, 0]),
+        ("linear mip gathers like point", [clamp, full, 2 << 26, 0]),
+        ("MAX_LOD 1", [clamp, 0x100 << 12, point, 0]),
+        ("MIN_LOD 2", [clamp, 0x200 | full, point, 0]),
+        ("MIP_FILTER none", [clamp, full, 0, 0]),
+        ("bias +1", [clamp, full, point | 256, 0]),
+        ("bias -1", [clamp, full, point | (-256i32 as u32 & 0x3FFF), 0]),
+        ("wrap", [0, full, point, 0]),
+        ("mirror", [1 | 1 << 3 | 1 << 6, full, point, 0]),
+        ("mirror once", [3 | 3 << 3 | 3 << 6, full, point, 0]),
+        ("wrap x, mirror y", [1 << 3, full, point, 0]),
+        ("clamp border, white", [6 | 6 << 3 | 6 << 6, full, point, 2 << 30]),
+        ("clamp half border, black", [4 | 4 << 3 | 4 << 6, full, point, 1 << 30]),
+        ("mirror-once border x, half border y, white", [7 | 5 << 3 | 7 << 6, full, point, 2 << 30]),
+    ];
+    // Gather order (x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y) of the footprint at the S# level
+    let gather = |sh: [u32; 4], layer: u32, u: f32, v: f32, lod: f32, off: (i32, i32)| -> [f32; 4] {
+        let k = |x: u32| x as f32 / 256.0;
+        let bias = (((sh[2] << 18) as i32) >> 18) as f32 / 256.0;
+        let l = (lod + bias).max(k(sh[1] & 0xFFF)).min(k(sh[1] >> 12 & 0xFFF));
+        let m = if sh[2] >> 26 & 3 == 0 { 0 } else { ((l + 0.5).floor() as u32).min(3) };
+        let size = 8 >> m;
+        let (px, py) = ((u * size as f32 - 0.5).floor() as i32 + off.0, (v * size as f32 - 0.5).floor() as i32 + off.1);
+        // texel index under an address mode, None: the border colour
+        let addr = |i: i32, mode: u32| -> Option<i32> {
+            let (n, once) = (size, if i < 0 { -i - 1 } else { i });
+            match mode {
+                0 => Some(i.rem_euclid(n)),
+                1 => Some(i.rem_euclid(2 * n)).map(|r| if r < n { r } else { 2 * n - 1 - r }),
+                2 => Some(i.clamp(0, n - 1)),
+                3 => Some(once.min(n - 1)),
+                4 | 6 => (0..n).contains(&i).then_some(i),
+                _ => (once < n).then_some(once),
+            }
+        };
+        let border = if sh[3] >> 30 == 2 { 1.0 } else { 0.0 };
+        let at = |x: i32, y: i32| match (addr(x, sh[0] & 7), addr(y, sh[0] >> 3 & 7)) {
+            (Some(x), Some(y)) => (5000 * layer + 1000 * m) as f32 + (10 * y + x) as f32,
+            _ => border,
+        };
+        [at(px, py + 1), at(px + 1, py + 1), at(px + 1, py), at(px, py)]
+    };
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let hlsl = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let k = runner::direct_kernel_full(&code, true).unwrap();
+    for (case, sharp) in cases {
+        st.sgpr[32..36].copy_from_slice(&sharp);
+        let hlsl = runner::run_with_statics(&hlsl, &st, &[], &tex, &samp, &t.static_samplers).unwrap();
+        let direct = runner::run_with_statics(&k.dxil, &st, &[], &tex, &samp, &k.static_samplers).unwrap();
+        for (backend, r) in [("hlsl", hlsl), ("direct dxil", direct)] {
+            for l in 0..64 {
+                let (c, lod) = (l % 8, lods[l / 8 % 8]);
+                let v = &r.vgpr[l];
+                let got = |b: usize| [0, 1, 2, 3].map(|i| f32::from_bits(v[b + i]));
+                let what = format!("{backend} [{case}] lane {l} (uv {}, {}; lod {lod}; offset {:?})", us[c], vs[c], offs[c]);
+                assert_eq!(got(20), gather(sharp, 0, us[c], vs[c], lod, (0, 0)), "gather4_l {what}");
+                assert_eq!(got(30), gather(sharp, 0, us[c], vs[c], lod, offs[c]), "gather4_l_o {what}");
+                assert_eq!(got(40), gather(sharp, (l % 2) as u32, us[c], vs[c], lod, (0, 0)), "gather4_l 2D array {what}");
+            }
+        }
+    }
+}
+
+/// `image_gather4_l` in a pixel shader, through the host sampler of the S#: its MinLOD / MaxLOD / bias and
+/// the SRV's clamp must not move the footprint to another mip. An 8 x 8, 4-mip texture (texel x of mip m
+/// holds 100 m + x), point x / y, clamp: (a) LOD 1 with a point mip filter reads mip 1, (b) LOD 2 with
+/// MAX_LOD 1 reads mip 1, (c) LOD 1 with MIP_FILTER none reads mip 0.
+#[test]
+fn gpu_ps_image_gather4_l_s_sharp_level() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    let mut data = Vec::new();
+    for m in 0..4u32 {
+        let n = 8 >> m;
+        for _y in 0..n {
+            for x in 0..n {
+                data.extend_from_slice(&[(100 * m + x) as f32; 4].map(f32::to_le_bytes).concat());
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 8,
+        Height: 8,
+        DepthOrArraySize: 1,
+        MipLevels: 4,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    // (case, LOD inline constant: 242 = 1.0, 244 = 2.0, S# word 1, S# word 2, level)
+    for (case, lod, w1, w2, level) in [
+        ("(a) LOD 1, full range, point mip", 242, 0xFFFu32 << 12, 1u32 << 26, 1u32),
+        ("(b) LOD 2, MAX_LOD 1", 244, 0x100 << 12, 1 << 26, 1),
+        ("(c) LOD 1, MIP_FILTER none", 242, 0xFFF << 12, 0, 0),
+    ] {
+        let ps = prog(&[
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 255), ("VSRC1", 2)], Some((1.0f32 / 16.0).to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 3)], Some((1.0f32 / 16.0).to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", lod)], None),
+            ("IMAGE_GATHER4_L", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let tex = runner::ViewTexture { res, srv, data: data.clone(), row_bytes: 8 * 16 };
+        let s_sharp = [clamp, w1, w2, 0];
+        let mut sgprs = vec![0u32; 32];
+        sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+        sgprs[24..28].copy_from_slice(&s_sharp);
+        let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
+        let n = 8 >> level;
+        let wrong = (0..256)
+            .filter(|&i| {
+                let left = (((i % 16) as f32 + 0.5) / 16.0 * n as f32 - 0.5).floor() as i32;
+                let t = |c: i32| (100 * level as i32 + c.clamp(0, n - 1)) as f32;
+                px[i] != [t(left), t(left + 1), t(left + 1), t(left)]
+            })
+            .count();
+        assert_eq!(wrong, 0, "{case}: pixels off the level-{level} footprint, e.g. {:?}", px[7]);
+    }
 }
 
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
@@ -2495,7 +2699,7 @@ fn gpu_static_samplers_from_constants_in_code() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
     for l in 0..64 {
         let v = &r.vgpr[l];
@@ -2536,7 +2740,7 @@ fn gpu_images_a16_d16() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -3123,7 +3327,7 @@ fn gpu_image_sample_offset() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false, mips: 1 }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -3946,11 +4150,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 
@@ -7592,6 +7809,38 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Structured code past `STRUCTURED_BYTES_PER_CODE_BYTE` is translated in the `pc` form (#1307).
+/// n conditional forward jumps whose targets all come after them, in the same order, keep up to
+/// n skip flags pending, and every guard lists them: 200 cross the bound, 50 do not. This checks
+/// the switch only. Here the `pc` form keeps the same stretch under one `pc` guard and is no
+/// smaller; the gain is on programs whose `pc` form is split into blocks, such as the retail
+/// one of #1307 (148 MB -> 14 MB).
+#[test]
+fn oversized_structured_code_falls_back_to_pc_blocks() {
+    let crossing = |n: usize| {
+        let i = |name: &str, e: &str, f: &[(&str, u64)]| encode(name, e, f, None).unwrap();
+        let mut code: Vec<u8> = Vec::new();
+        let mut at = Vec::new();
+        for k in 0..n as u64 {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + k % 16)]));
+            at.push(code.len());
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        }
+        for a in at {
+            let d = ((code.len() - a) / 4 - 1) as u16;
+            code[a..a + 2].copy_from_slice(&d.to_le_bytes());
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl.contains("pc ==")
+    };
+    assert!(!crossing(50), "50 crossing jumps: structured");
+    assert!(crossing(200), "200 crossing jumps: past the bound, pc blocks");
 }
 
 /// Random nests of loops with `continue` / `break` of any loop around them – backward jumps out of
