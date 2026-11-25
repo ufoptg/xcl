@@ -417,6 +417,37 @@ pub fn pool_bytes() -> (usize, usize) {
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
 /// every page it touches; `init` commits them once the windows exist.
 static EARLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Ranges committed on the CPU in sparse windows whose VRAM tiles are mapped lazily on first
+/// non-zero CPU write (`alloc_lazy`) or GPU write target registration, avoiding eager VRAM
+/// allocation for untouched pages or GPU-owned render targets placed inside large title heaps.
+static LAZY_RANGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+static LAZY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn in_lazy_range(lazy: &BTreeMap<usize, usize>, a: usize) -> bool {
+    lazy.range(..=a).next_back().is_some_and(|(_, &e)| a < e)
+}
+
+fn lazy_overlaps_tile(lazy: &BTreeMap<usize, usize>, t: usize) -> bool {
+    lazy.range(..t.saturating_add(TILE)).next_back().is_some_and(|(_, &e)| e > t)
+}
+
+fn lazy_tile_holes(lazy: &BTreeMap<usize, usize>, t: usize) -> u16 {
+    let mut holes = 0u16;
+    for k in 0..PAGES_PER_TILE {
+        if !in_lazy_range(lazy, t + k * PAGE) {
+            holes |= 1u16 << k;
+        }
+    }
+    holes
+}
+
+fn page_has_nonzero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    if chunks.any(|c| u64::from_ne_bytes(c.try_into().unwrap()) != 0) {
+        return true;
+    }
+    chunks.remainder().iter().any(|&b| b != 0)
+}
 
 /// The pages `[a, a + n)` touches, as `[start, end)`.
 fn page_span(a: usize, n: usize) -> (usize, usize) {
@@ -575,6 +606,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             drop(old_queue);
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
             }
@@ -1182,6 +1214,56 @@ impl State {
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
+/// 4 GiB window boundary when `size <= 4 GiB`). Commits CPU pages immediately but defers
+/// mapping 64 KiB VRAM tiles until the CPU writes non-zero data (or `place_buffer` pins them).
+pub unsafe fn alloc_lazy(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    let (start, end) = page_span(addr, rounded);
+    early_add(&mut LAZY_RANGES.lock().unwrap(), start, end);
+    LAZY_ACTIVE.store(true, Ordering::Release);
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.runs = None;
+    }
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    Some((addr, rounded))
+}
+
+/// Ensure any lazily-allocated sparse tiles overlapping `[a, a + n)` are backed by VRAM
+/// (called when the GPU is about to write directly to a buffer UAV or memory-op target).
+pub unsafe fn ensure_lazy_mapped(a: usize, n: usize) {
+    if n == 0 || !LAZY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if s.window_index(a).is_none() {
+        return;
+    }
+    let lazy = LAZY_RANGES.lock().unwrap();
+    if lazy.is_empty() {
+        return;
+    }
+    let first = a & !(TILE - 1);
+    let end = a.saturating_add(n);
+    let mut t = first;
+    while t < end {
+        if !s.mapped.contains_key(&t) && lazy_overlaps_tile(&lazy, t) {
+            let holes = lazy_tile_holes(&lazy, t);
+            s.ensure_mapped(t, TILE, |_| holes);
+        }
+        match t.checked_add(TILE) {
+            Some(next) => t = next,
+            None => break,
+        }
+    }
+}
+
+/// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
@@ -1231,13 +1313,138 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
     QUEUE.lock().unwrap().clone()
 }
 
+struct RbJob {
+    fence: ID3D12Fence,
+    value: u64,
+    ranges: Vec<(usize, usize)>,
+    done: Option<std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>,
+}
+
+// SAFETY: ID3D12Fence is a free-threaded COM object; ranges and Condvar are Send.
+unsafe impl Send for RbJob {}
+
+struct RbQueueState {
+    fence: ID3D12Fence,
+    value: u64,
+    tx: std::sync::mpsc::Sender<RbJob>,
+}
+
+unsafe impl Send for RbQueueState {}
+
+struct QueueWait(ID3D12Fence, u64);
+
+// SAFETY: ID3D12Fence is a free-threaded COM object.
+unsafe impl Send for QueueWait {}
+
+static RB_QUEUES: Mutex<Option<FxHashMap<usize, RbQueueState>>> = Mutex::new(None);
+static QUEUE_WAITS: Mutex<Option<FxHashMap<usize, Vec<QueueWait>>>> = Mutex::new(None);
+
+/// Record an active GPU `queue.Wait(&fence, value)` on `queue` so `readback_after_execute`
+/// knows when `queue` is blocked on an unsatisfied fence and must dispatch asynchronously.
+pub unsafe fn note_queue_wait(queue: usize, fence: ID3D12Fence, value: u64) {
+    if value == 0 || fence.GetCompletedValue() >= value {
+        return;
+    }
+    let mut g = QUEUE_WAITS.lock().unwrap();
+    let v = g.get_or_insert_with(FxHashMap::default).entry(queue).or_default();
+    v.retain(|w| w.0.GetCompletedValue() < w.1);
+    v.push(QueueWait(fence, value));
+}
+
+unsafe fn queue_has_unsatisfied_wait(queue: usize) -> bool {
+    let mut g = QUEUE_WAITS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return false };
+    let Some(v) = m.get_mut(&queue) else { return false };
+    v.retain(|w| w.0.GetCompletedValue() < w.1);
+    if v.is_empty() {
+        m.remove(&queue);
+        return false;
+    }
+    true
+}
+
+/// Drop per-queue readback and wait-tracking state when a title command queue is released.
+pub fn forget_queue(queue: usize) {
+    if let Some(m) = QUEUE_WAITS.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
+    if let Some(m) = RB_QUEUES.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
+}
+
+unsafe fn wait_fence_ms(fence: &ID3D12Fence, target: u64, event: HANDLE, timeout_ms: u32) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = windows::Win32::System::Threading::ResetEvent(event);
+    if fence.SetEventOnCompletion(target, event).is_err() {
+        return fence.GetCompletedValue() >= target;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    while fence.GetCompletedValue() < target {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
+        windows::Win32::System::Threading::WaitForSingleObject(event, ms);
+    }
+    true
+}
+
+fn spawn_rb_worker(queue_id: usize) -> std::sync::mpsc::Sender<RbJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<RbJob>();
+    let name = format!("xcl-sparse-rb-{queue_id:x}");
+    let spawned = std::thread::Builder::new().name(name).spawn(move || unsafe {
+        let Ok(event) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else {
+            return;
+        };
+        for job in rx {
+            // Wait for the title queue outside `STATE` and without stalling `s.queue`:
+            // a queue may carry a wait-before-signal `Wait64BitValueX` whose producer has not
+            // been submitted yet on the caller's thread.
+            if wait_fence_ms(&job.fence, job.value, event, 5000) {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    s.readback_ranges(&job.ranges);
+                }
+            } else {
+                static LATE: AtomicU64 = AtomicU64::new(0);
+                let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                if k.is_power_of_two() {
+                    crate::xlog_warn!(
+                        "sparse: async readback for queue {queue_id:#x} timed out after 5000 ms (fence at {}, wanted {})",
+                        job.fence.GetCompletedValue(),
+                        job.value
+                    );
+                }
+            }
+            if let Some(done) = job.done {
+                *done.0.lock().unwrap() = true;
+                done.1.notify_all();
+            }
+        }
+        let _ = CloseHandle(event);
+    });
+    if let Err(e) = spawned {
+        crate::xlog_error!("sparse: failed to spawn readback thread for queue {queue_id:#x}: {e}");
+    }
+    tx
+}
+
+/// Schedule a readback of GPU-written sparse ranges after `queue` finishes its submission.
+/// Always waits on `queue`'s fence outside `STATE.lock()` and without stalling
+/// `sparse::State::queue`. When `queue` is blocked on an unsatisfied `queue.Wait`
+/// (wait-before-signal `Wait64BitValueX` whose producer is submitted later on this thread),
+/// returns immediately while the per-queue worker finishes asynchronously; otherwise waits for
+/// the worker so CPU reads immediately after a GPU fence wait see the updated bytes.
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && u.is_sparse(a)).collect();
     if filtered.is_empty() {
         return;
     }
@@ -1252,12 +1459,38 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    let qid = queue.as_raw() as usize;
+    let stalled = queue_has_unsatisfied_wait(qid);
+    let done = (!stalled).then(|| std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+    let (tx, job) = {
+        let mut g = RB_QUEUES.lock().unwrap();
+        let m = g.get_or_insert_with(FxHashMap::default);
+        let entry = match m.entry(qid) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let mut dev: Option<ID3D12Device> = None;
+                if queue.GetDevice(&mut dev).is_err() {
+                    return;
+                }
+                let Some(dev) = dev else { return };
+                let Ok(fence) = super::real::create_raw_fence(&dev) else { return };
+                let tx = spawn_rb_worker(qid);
+                v.insert(RbQueueState { fence, value: 0, tx })
+            }
+        };
+        entry.value += 1;
+        if queue.Signal(&entry.fence, entry.value).is_err() {
+            return;
+        }
+        (entry.tx.clone(), RbJob { fence: entry.fence.clone(), value: entry.value, ranges: merged, done: done.clone() })
+    };
+    if tx.send(job).is_err() {
+        return;
     }
-    s.readback_ranges(&merged);
+    if let Some(done) = done {
+        let (lk, cv) = &*done;
+        let _ = cv.wait_timeout_while(lk.lock().unwrap(), std::time::Duration::from_millis(5500), |&mut finished| !finished);
+    }
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1328,13 +1561,29 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    let (start, end) = page_span(a, n);
+    let lazy_changed = {
+        let mut lazy = LAZY_RANGES.lock().unwrap();
+        let before = lazy.len();
+        let had = lazy.range(..end).next_back().is_some_and(|(_, &e)| e > start);
+        if had {
+            early_remove(&mut lazy, start, end);
+        }
+        had || lazy.len() != before
+    };
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
-        let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
+        if lazy_changed {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
         return;
     };
     s.decommit_range(a, n);
+    if lazy_changed {
+        s.runs = None;
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl State {
@@ -1429,13 +1678,17 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = s.mapped.keys().map(|&t| (t, t + TILE)).collect();
+        {
+            let lazy = LAZY_RANGES.lock().unwrap();
+            spans.extend(lazy.iter().map(|(&a, &b)| (a, b)));
+        }
+        spans.sort_unstable();
         let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
+        for (a, b) in spans {
             match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => runs.push((a, b)),
             }
         }
         s.runs = Some(runs);
@@ -1466,12 +1719,14 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let mut zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
+    let lazy = LAZY_RANGES.lock().unwrap();
+    let has_lazy = !lazy.is_empty();
     let mut i = 0;
     while i < dirty.len() {
         let a = dirty[i];
@@ -1481,24 +1736,59 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             n += page;
             i += 1;
         }
-        // only what has video memory (committed tiles of a sparse window)
+        // only what has video memory (committed tiles of a sparse window), lazily mapping tiles
+        // in `LAZY_RANGES` on the first non-zero CPU write
         let mut x = a;
         while x < a + n {
             let t = x & !(TILE - 1);
             let end = (t + TILE).min(a + n);
-            if let Some(entry) = s.mapped.get_mut(&t) {
+            let mut just_mapped = false;
+            if !s.mapped.contains_key(&t) && has_lazy && lazy_overlaps_tile(&lazy, t) {
                 let mut pg = x & !(PAGE - 1);
+                let mut any_nz = false;
                 while pg < end {
-                    let idx = (pg - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                    if in_lazy_range(&lazy, pg) && page_has_nonzero(std::slice::from_raw_parts(pg as *const u8, PAGE)) {
+                        any_nz = true;
+                        break;
                     }
                     pg += PAGE;
+                }
+                if any_nz {
+                    let holes = lazy_tile_holes(&lazy, t);
+                    s.ensure_mapped(t, TILE, |_| holes);
+                    just_mapped = true;
+                    if let Some(entry) = s.mapped.get_mut(&t) {
+                        for idx in 0..PAGES_PER_TILE {
+                            if entry.holes & (1u16 << idx) == 0 {
+                                let pg = t + idx * PAGE;
+                                let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                                scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                            }
+                        }
+                    }
+                }
+            }
+            if !just_mapped {
+                if let Some(entry) = s.mapped.get_mut(&t) {
+                    let mut pg = x & !(PAGE - 1);
+                    while pg < end {
+                        let idx = (pg - t) / PAGE;
+                        if entry.holes & (1u16 << idx) == 0 {
+                            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                            scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                        }
+                        pg += PAGE;
+                    }
                 }
             }
             x = end;
         }
+    }
+    drop(lazy);
+    // Any recycled pool tiles mapped lazily above must be zeroed BEFORE `dirty_runs` uploads
+    // their non-zero chunks (keep the `sent` hashes `scan_page` just computed).
+    if !s.to_zero.is_empty() {
+        zero_runs.extend(s.to_zero.drain(..));
     }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
@@ -2206,6 +2496,27 @@ mod tests {
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
     }
 
+    #[test]
+    fn lazy_range_helpers_track_tile_overlap_holes_and_nonzero_pages() {
+        let base = 0x5_0000_0000usize;
+        let mut lazy = BTreeMap::new();
+        // Partially cover tile 0 (pages 4..8) and fully cover tile 2.
+        early_add(&mut lazy, base + 4 * PAGE, base + 8 * PAGE);
+        early_add(&mut lazy, base + 2 * TILE, base + 3 * TILE);
+
+        assert!(lazy_overlaps_tile(&lazy, base));
+        assert!(!lazy_overlaps_tile(&lazy, base + TILE));
+        assert!(lazy_overlaps_tile(&lazy, base + 2 * TILE));
+        assert_eq!(lazy_tile_holes(&lazy, base), 0xFFFF & !(0b1111u16 << 4));
+        assert_eq!(lazy_tile_holes(&lazy, base + TILE), 0xFFFF);
+        assert_eq!(lazy_tile_holes(&lazy, base + 2 * TILE), 0);
+
+        let mut page = vec![0u8; PAGE];
+        assert!(!page_has_nonzero(&page));
+        page[PAGE - 1] = 1;
+        assert!(page_has_nonzero(&page));
+    }
+
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
     /// reverse, before the device exists (`cargo test --release -p xcl --lib --
     /// --ignored --exact hle::d3d12x::sparse::tests::early_commit_timing --nocapture`,
@@ -2230,6 +2541,61 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// `readback_after_execute` must return immediately when `queue` is blocked on an unsignaled
+    /// GPU fence (wait-before-signal `Wait64BitValueX`) rather than deadlocking the submitter
+    /// thread and `sparse::State::queue` for 5 seconds, and complete synchronously once no
+    /// unsatisfied `queue.Wait` remains.
+    #[test]
+    fn readback_after_execute_does_not_block_on_stalled_queue() {
+        unsafe {
+            if super::super::real::init().is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let Some(dev) = STATE.lock().unwrap().as_ref().map(|s| s.dev.clone()) else {
+                crate::gpu::recomp::runner::skip_test("no sparse state");
+                return;
+            };
+            let Some((va, _len)) = alloc(TILE, TILE) else {
+                crate::gpu::recomp::runner::skip_test("no sparse UMA");
+                return;
+            };
+            assert!(crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)), "allocated VA must be sparse");
+
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() })
+                .expect("compute queue");
+            let gate = super::super::real::create_raw_fence(&dev).expect("gate fence");
+            queue.Wait(&gate, 1).expect("queue.Wait");
+            note_queue_wait(queue.as_raw() as usize, gate.clone(), 1);
+            assert!(queue_has_unsatisfied_wait(queue.as_raw() as usize));
+
+            let started = std::time::Instant::now();
+            readback_after_execute(&queue, &[(va, 64)]);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "readback_after_execute blocked submitter thread on stalled queue ({:?})",
+                started.elapsed()
+            );
+            assert!(STATE.try_lock().is_ok(), "STATE must not remain locked while stalled queue waits");
+
+            // Release the stalled queue so the async readback worker drains cleanly, then verify
+            // an unstalled submit completes synchronously without error.
+            gate.Signal(1).expect("gate.Signal");
+            assert!(!queue_has_unsatisfied_wait(queue.as_raw() as usize));
+            let done = super::super::real::create_raw_fence(&dev).expect("done fence");
+            queue.Signal(&done, 1).expect("queue.Signal");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while done.GetCompletedValue() < 1 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(done.GetCompletedValue() >= 1, "queue did not drain after gate signaled");
+            readback_after_execute(&queue, &[(va, 64)]);
+            forget_queue(queue.as_raw() as usize);
+            assert!(free(va), "free sparse test allocation");
         }
     }
 }

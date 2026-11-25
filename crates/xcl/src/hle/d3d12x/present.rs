@@ -570,7 +570,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let fence: ID3D12Fence = super::real::create_raw_fence(dev).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,

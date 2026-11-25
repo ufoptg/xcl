@@ -89,7 +89,13 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
     pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
 }
 
-unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+/// The type of a list XCL keeps state for (`on_create`), without a call to the list; None for
+/// any other
+pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+}
+
+pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -601,6 +607,7 @@ impl ListState {
             last.1 = last.1.max(end);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+            unsafe { super::sparse::ensure_lazy_mapped(va as usize, size as usize) };
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1483,7 +1490,7 @@ unsafe fn ensure_cell_fence(va: u64, dev: &ID3D12Device, dev_raw: usize) -> Opti
             }
         }
     }
-    let created: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let created: ID3D12Fence = real::create_raw_fence(&dev).ok()?;
     let mut g = SYNC_GRAPH.lock().unwrap();
     let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
     if cell.non_monotonic {
@@ -1812,6 +1819,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    super::sparse::note_queue_wait(q_raw, fence.clone(), w.value);
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -2126,7 +2134,7 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
         if let std::collections::hash_map::Entry::Vacant(entry) = cache.fences.entry(key) {
             let mut dev: Option<ID3D12Device> = None;
             q.GetDevice(&mut dev).ok()?;
-            entry.insert((dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?, 0));
+            entry.insert((real::create_raw_fence(&dev?).ok()?, 0));
         }
         let (fence, value) = cache.fences.get_mut(&key)?;
         let next = *value + 1;
@@ -2484,6 +2492,8 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+            let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
         });
         real::preserve_vtable(spare, ext_spare);
@@ -2976,7 +2986,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    {
+        let _list_guard = real::UnadoptGuard::new(this);
+        exec(q_raw, 1, one.as_ptr());
+    }
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3029,6 +3042,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
     real::preserve_vtable(target, ext_closed);
@@ -3605,6 +3620,8 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(resolved as *mut c_void);
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
     });
     real::preserve_vtable(this, ext);
@@ -6140,7 +6157,10 @@ mod tests {
                 execute_with_waits_on(q_comp.as_raw(), &segs_c, |chunk| {
                     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
                     let exec: ExecFn = std::mem::transmute(*(*(q_comp.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-                    exec(q_comp.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    {
+                        let _guards: Vec<_> = chunk.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                        exec(q_comp.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    }
                     signal_write64_fences(q_comp.as_raw(), chunk);
                     if chunk.contains(&pc_c0) {
                         cell_a.store(frame, Ordering::Release);
@@ -6153,7 +6173,10 @@ mod tests {
                 execute_with_waits_on(q_dir.as_raw(), &one_d, |chunk| {
                     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
                     let exec: ExecFn = std::mem::transmute(*(*(q_dir.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-                    exec(q_dir.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    {
+                        let _guards: Vec<_> = chunk.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                        exec(q_dir.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    }
                     signal_write64_fences(q_dir.as_raw(), chunk);
                     cell_b.store(frame, Ordering::Release);
                 });

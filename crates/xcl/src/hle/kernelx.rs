@@ -318,6 +318,13 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }
+            if crate::util::under_wine() {
+                let rounded = size.max(1).div_ceil(align) * align;
+                if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc_lazy(rounded, align) {
+                    trace_mem("VirtualAlloc (graphics, sparse VRAM lazy fallback)", 0, rounded, t as u64, p, q);
+                    return q as *mut c_void;
+                }
+            }
         }
     }
     // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB

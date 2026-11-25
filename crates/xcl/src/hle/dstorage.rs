@@ -944,6 +944,9 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        if crate::util::under_wine() {
+            crate::hle::d3d12x::title_textures::mark_dirty_range(r.destination as usize, n);
+        }
     }
     Ok(())
 }
