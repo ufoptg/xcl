@@ -90,35 +90,62 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
 
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-        return;
-    }
-    if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 4 * words.len() {
-        return;
+    let bytes = 4 * words.len();
+    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+            return;
+        }
+        if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + bytes {
+            return;
+        }
     }
     for (i, &w) in words.iter().enumerate() {
         (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
     }
 }
 
-/// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
-unsafe fn write_u64_now(va: usize, value: u64) {
+/// Whether `[va, va + 8)` is 8-byte aligned, committed, and writable without `PAGE_GUARD`.
+unsafe fn u64_writable_now(va: usize) -> bool {
+    if va == 0 || !va.is_multiple_of(8) {
+        return false;
+    }
+    let Some(end) = va.checked_add(8) else { return false };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
+        return true;
+    }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
-    let Some(end) = va.checked_add(8) else { return };
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-        return;
+        return false;
     }
-    if m.Protect & PAGE_GUARD != 0 || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize).saturating_add(m.RegionSize) < end {
-        return;
+    m.Protect & PAGE_GUARD == 0
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+}
+
+/// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
+unsafe fn write_u64_now(va: usize, value: u64) {
+    if u64_writable_now(va) {
+        (*(va as *const AtomicU64)).store(value, Ordering::Release);
     }
-    (*(va as *const AtomicU64)).store(value, Ordering::Release);
+}
+
+/// Advance an 8-byte aligned 64-bit value at `va` to at least `value` (`fetch_max`), if the memory
+/// is still committed and writable. Best-effort check before the atomic write (same TOCTOU
+/// trade-off as `write_u64_now`: a concurrent title decommit between check and store is unguarded).
+pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
+    if u64_writable_now(va) {
+        (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+    }
 }
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
     crate::hle::kernelx::lazy::ensure(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

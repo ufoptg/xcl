@@ -90,7 +90,7 @@ test counts by hand.
 - Commit game data, game dumps, console SDK headers or binaries, keys, or anything for getting
   around DRM.
 - Port code from WinDurango (LGPL-3.0, reference only) or add a dependency that is not
-  GPL-2.0-compatible.
+  GPL-3.0-compatible.
 - Edit generated files (`*_spec.rs`, generated tables) by hand: change the generator in `scripts/` and
   rerun it.
 - Rewrite `HANDOFF.md` or `docs/specs/` as part of a feature change.

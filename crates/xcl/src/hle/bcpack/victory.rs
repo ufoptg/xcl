@@ -1,8 +1,7 @@
 //! BCPack: lossless packing of BC1-BC7 block streams, as the console's
 //! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
 //! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23
-//! (https://github.com/Marvisak/VIctory, GPL-3.0; used here under GPL-2.0-only with its
-//! author's permission, see THIRD_PARTY.md).
+//! (https://github.com/Marvisak/VIctory, GPL-3.0, see THIRD_PARTY.md).
 //!
 //! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
 //! each lane is a run of fragments (header byte, length, payload) coded with

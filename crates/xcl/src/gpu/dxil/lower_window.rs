@@ -3,8 +3,7 @@
 //! `xcl_m*` accessors with `Options::heap_windows` (`recomp::emit::mem_accessors`).
 
 use super::lower::{Lw, VAR_WIN};
-use super::module::{Pred, Value};
-use super::shader::RawUav;
+use super::module::{CastOp, Pred, Value};
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -26,11 +25,29 @@ impl Lw {
         self.mems.len() > 1
     }
 
-    /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`).
+    /// The high dword of the UMA base (`IO_UMA_BASE_HI` of the io buffer, `xcl_uma_base`),
+    /// hoisted to the entry block so multi-window shaders load it once rather than on every
+    /// memory operation.
     fn uma_base(&mut self) -> Value {
+        if let Some(v) = self.uma_base_val {
+            return v;
+        }
         let io = self.init.io.expect("io");
         let off = self.c(crate::gpu::recomp::IO_UMA_BASE_HI as u32 * 4);
-        self.s.raw_load(io, off, 1)[0]
+        let cur = self.cur();
+        let entry = self.init.entry;
+        let v = if cur == entry {
+            self.s.raw_load(io, off, 1)[0]
+        } else {
+            let prev = self.s.m.set_insert_before_term(true);
+            self.s.m.set_block(entry);
+            let v = self.s.raw_load(io, off, 1)[0];
+            self.s.m.set_block(cur);
+            self.s.m.set_insert_before_term(prev);
+            v
+        };
+        self.uma_base_val = Some(v);
+        v
     }
 
     /// Selects the window of an access whose 64-bit effective address is `hi:lo` plus
@@ -42,21 +59,81 @@ impl Lw {
         if !self.windowed() {
             return;
         }
-        let mut ea = self.pack64(lo, hi);
-        for &t in adds {
-            let x = match t {
-                Ea::U(v) => self.zext64(v),
-                Ea::K(k) => self.c64(k as u64),
-                Ea::S(v) => self.sext64(v),
-                Ea::Mul(a, b) => {
-                    let (a, b) = (self.zext64(a), self.zext64(b));
-                    self.mul(a, b)
+        let non_zero = |t: &Ea| match *t {
+            Ea::K(0) => false,
+            Ea::U(v) | Ea::S(v) => self.s.m.const_u64(v) != Some(0),
+            Ea::Mul(a, b) => self.s.m.const_u64(a) != Some(0) && self.s.m.const_u64(b) != Some(0),
+            Ea::K(_) => true,
+        };
+        let terms: Vec<Ea> = adds.iter().copied().filter(non_zero).collect();
+        let (mut lo, mut hi) = (lo, hi);
+        let uadd = |lw: &mut Self, lo: &mut Value, hi: &mut Value, add_lo: Value, add_hi: Option<Value>| {
+            if let Some(ah) = add_hi {
+                *hi = lw.add(*hi, ah);
+            }
+            if lw.s.m.const_u64(*lo) == Some(0) {
+                *lo = add_lo;
+            } else {
+                let sum = lw.add(*lo, add_lo);
+                let carry = lw.cmp(Pred::ULt, sum, *lo);
+                *lo = sum;
+                let i32 = lw.s.m.i32();
+                let c32 = lw.s.m.cast(CastOp::ZExt, carry, i32);
+                *hi = lw.add(*hi, c32);
+            }
+        };
+        for (idx, t) in terms.iter().copied().enumerate() {
+            let has_more = idx + 1 < terms.len();
+            match t {
+                Ea::K(k) => {
+                    let kv = self.c(k);
+                    uadd(self, &mut lo, &mut hi, kv, None);
                 }
-            };
-            ea = self.add(ea, x);
+                Ea::U(v) => uadd(self, &mut lo, &mut hi, v, None),
+                Ea::S(v) => match self.s.m.const_u64(v) {
+                    Some(k) if (k as i32) < 0 => {
+                        let neg_k = (k as u32).wrapping_neg();
+                        if self.s.m.const_u64(lo) == Some(0) {
+                            lo = v;
+                            hi = self.addc(hi, u32::MAX);
+                        } else {
+                            let borrow = self.cmpc(Pred::ULt, lo, neg_k);
+                            if has_more {
+                                lo = self.add(lo, v);
+                            }
+                            let i32 = self.s.m.i32();
+                            let b32 = self.s.m.cast(CastOp::ZExt, borrow, i32);
+                            hi = self.sub(hi, b32);
+                        }
+                    }
+                    Some(_) => uadd(self, &mut lo, &mut hi, v, None),
+                    None => {
+                        let sign = self.ashrc(v, 31);
+                        uadd(self, &mut lo, &mut hi, v, Some(sign));
+                    }
+                },
+                Ea::Mul(a, b) => match (self.s.m.const_u64(a), self.s.m.const_u64(b)) {
+                    (Some(1), _) => uadd(self, &mut lo, &mut hi, b, None),
+                    (_, Some(1)) => uadd(self, &mut lo, &mut hi, a, None),
+                    (Some(ka), Some(kb)) => {
+                        let prod = (ka as u32 as u64) * (kb as u32 as u64);
+                        let (plo, phi) = (prod as u32, (prod >> 32) as u32);
+                        if phi != 0 {
+                            hi = self.addc(hi, phi);
+                        }
+                        if plo != 0 {
+                            let plov = self.c(plo);
+                            uadd(self, &mut lo, &mut hi, plov, None);
+                        }
+                    }
+                    _ => {
+                        let (phi, plo) = self.s.umul_wide(a, b);
+                        uadd(self, &mut lo, &mut hi, plo, Some(phi));
+                    }
+                },
+            }
         }
-        let (_, h) = self.unpack64(ea);
-        self.window_hi(h, write);
+        self.window_hi(hi, write);
     }
 
     /// `window_at` of a high dword already computed (`window_read` / `window_write`).
@@ -127,48 +204,5 @@ impl Lw {
             _ => (self.sreg(saddr), self.sreg(saddr + 1)),
         };
         self.window_at(hi, lo, &[Ea::U(l4), off], write);
-    }
-
-    /// `with_mem` with the windows in the descriptor heap (`Options::heap_windows`): window
-    /// `w` is the raw UAV `ResourceDescriptorHeap[NonUniformResourceIndex(MEM_HEAP_BASE + w)]`
-    /// (`globallycoherent` where the root windows are); a `w` outside the windows does what
-    /// the HLSL accessor does (reads 0, stores and atomics dropped).
-    pub(super) fn with_heap_mem(
-        &mut self,
-        coherent: bool,
-        f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>,
-    ) -> Option<Value> {
-        let windows = self.mems.len() as u32;
-        let w = self.rd(VAR_WIN);
-        let (tl, th) = (self.tmp_var(), self.tmp_var());
-        let z = self.c(0);
-        self.wr(tl, z);
-        self.wr(th, z);
-        let mut kind = 0u8; // 0 none, 1 i32, 2 i64
-        let inside = self.cmpc(Pred::ULt, w, windows);
-        let _ = self.guarded(inside, &mut |lw| {
-            let i = lw.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = lw.s.heap_raw_buffer_uav(i, coherent);
-            if let Some(v) = f(lw, m) {
-                if lw.s.m.type_of(v) == lw.s.m.i64() {
-                    let (l, h) = lw.unpack64(v);
-                    lw.wr(tl, l);
-                    lw.wr(th, h);
-                    kind = 2;
-                } else {
-                    lw.wr(tl, v);
-                    kind = 1;
-                }
-            }
-            Ok(())
-        });
-        match kind {
-            0 => None,
-            1 => Some(self.rd(tl)),
-            _ => {
-                let (l, h) = (self.rd(tl), self.rd(th));
-                Some(self.pack64(l, h))
-            }
-        }
     }
 }

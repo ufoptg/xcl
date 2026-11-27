@@ -24,11 +24,245 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use super::gameinput::{GamepadState, LEFT_SHOULDER, LEFT_STICK, RIGHT_SHOULDER, RIGHT_STICK, X, Y};
+use super::gameinput::{
+    GamepadState, A, B, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT, DPAD_UP, LEFT_SHOULDER, LEFT_STICK, MENU,
+    RIGHT_SHOULDER, RIGHT_STICK, VIEW, X, Y,
+};
 
 // ---------------------------------------------------------------------------------------
 // the mapping (pure, tested)
 // ---------------------------------------------------------------------------------------
+
+/// Host inputs use Windows virtual keys. Physical variants preserve the built-in
+/// layout's positions on non-QWERTY keyboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(i32)]
+enum InputKey {
+    MouseLeft = 0x1,
+    MouseRight = 0x2,
+    MouseMiddle = 0x4,
+    MouseX1 = 0x5,
+    MouseX2 = 0x6,
+    Backspace = 0x8,
+    Tab = 0x9,
+    Enter = 0xd,
+    Escape = 0x1b,
+    Space = 0x20,
+    Left = 0x25,
+    Up = 0x26,
+    Right = 0x27,
+    Down = 0x28,
+    Insert = 0x2d,
+    Delete = 0x2e,
+    LeftShift = 0xa0,
+    RightShift = 0xa1,
+    LeftCtrl = 0xa2,
+    RightCtrl = 0xa3,
+    LeftAlt = 0xa4,
+    RightAlt = 0xa5,
+    Comma = 0xbc,
+    Period = 0xbe,
+    A = 0x41,
+    B = 0x42,
+    C = 0x43,
+    D = 0x44,
+    E = 0x45,
+    F = 0x46,
+    G = 0x47,
+    H = 0x48,
+    I = 0x49,
+    J = 0x4a,
+    K = 0x4b,
+    L = 0x4c,
+    M = 0x4d,
+    N = 0x4e,
+    O = 0x4f,
+    P = 0x50,
+    Q = 0x51,
+    R = 0x52,
+    S = 0x53,
+    T = 0x54,
+    U = 0x55,
+    V = 0x56,
+    W = 0x57,
+    X = 0x58,
+    Y = 0x59,
+    Z = 0x5a,
+    Digit0 = 0x30,
+    Num0 = 0x60,
+    Digit1 = 0x31,
+    Num1 = 0x61,
+    Digit2 = 0x32,
+    Num2 = 0x62,
+    Digit3 = 0x33,
+    Num3 = 0x63,
+    Digit4 = 0x34,
+    Num4 = 0x64,
+    Digit5 = 0x35,
+    Num5 = 0x65,
+    Digit6 = 0x36,
+    Num6 = 0x66,
+    Digit7 = 0x37,
+    Num7 = 0x67,
+    Digit8 = 0x38,
+    Num8 = 0x68,
+    Digit9 = 0x39,
+    Num9 = 0x69,
+    F1 = 0x70,
+    F2 = 0x71,
+    F3 = 0x72,
+    F4 = 0x73,
+    F5 = 0x74,
+    F6 = 0x75,
+    F7 = 0x76,
+    F8 = 0x77,
+    F9 = 0x78,
+    F10 = 0x79,
+    F11 = 0x7a,
+    F12 = 0x7b,
+    PhysicalQ = 0x1051,
+    PhysicalW = 0x1157,
+    PhysicalE = 0x1245,
+    PhysicalA = 0x1e41,
+    PhysicalS = 0x1f53,
+    PhysicalD = 0x2044,
+}
+
+impl InputKey {
+    fn virtual_key(self, layout: *mut c_void) -> i32 {
+        let code = self as i32;
+        if code > 0xFF {
+            scancode_to_vk((code >> 8) as u32, code & 0xFF, layout)
+        } else {
+            code
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+enum WheelButton {
+    Unbound = 0,
+    A = A,
+    B = B,
+    X = X,
+    Y = Y,
+    DpadUp = DPAD_UP,
+    DpadDown = DPAD_DOWN,
+    DpadLeft = DPAD_LEFT,
+    DpadRight = DPAD_RIGHT,
+    View = VIEW,
+    Menu = MENU,
+    LeftBumper = LEFT_SHOULDER,
+    RightBumper = RIGHT_SHOULDER,
+    LeftStick = LEFT_STICK,
+    RightStick = RIGHT_STICK,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct InputProfile {
+    move_up: Vec<InputKey>,
+    move_left: Vec<InputKey>,
+    move_down: Vec<InputKey>,
+    move_right: Vec<InputKey>,
+    a: Vec<InputKey>,
+    b: Vec<InputKey>,
+    x: Vec<InputKey>,
+    y: Vec<InputKey>,
+    dpad_up: Vec<InputKey>,
+    dpad_down: Vec<InputKey>,
+    dpad_left: Vec<InputKey>,
+    dpad_right: Vec<InputKey>,
+    view: Vec<InputKey>,
+    menu: Vec<InputKey>,
+    left_bumper: Vec<InputKey>,
+    right_bumper: Vec<InputKey>,
+    left_stick: Vec<InputKey>,
+    right_stick: Vec<InputKey>,
+    left_trigger: Vec<InputKey>,
+    right_trigger: Vec<InputKey>,
+    wheel_up: WheelButton,
+    wheel_down: WheelButton,
+}
+
+impl Default for InputProfile {
+    fn default() -> Self {
+        use InputKey::*;
+        Self {
+            move_up: vec![PhysicalW],
+            move_left: vec![PhysicalA],
+            move_down: vec![PhysicalS],
+            move_right: vec![PhysicalD],
+            a: vec![Space, Enter],
+            b: vec![Escape, Backspace],
+            x: vec![PhysicalQ],
+            y: vec![PhysicalE],
+            dpad_up: vec![Up],
+            dpad_down: vec![Down],
+            dpad_left: vec![Left],
+            dpad_right: vec![Right],
+            view: vec![Tab],
+            menu: vec![P],
+            left_bumper: vec![],
+            right_bumper: vec![],
+            left_stick: vec![LeftShift],
+            right_stick: vec![LeftCtrl, MouseMiddle],
+            left_trigger: vec![MouseRight],
+            right_trigger: vec![MouseLeft],
+            wheel_up: WheelButton::RightBumper,
+            wheel_down: WheelButton::LeftBumper,
+        }
+    }
+}
+
+impl InputProfile {
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn navigation_buttons(&self, held: impl Fn(InputKey) -> bool) -> u32 {
+        Self::buttons([
+            (&self.a, A),
+            (&self.b, B),
+            (&self.dpad_up, DPAD_UP),
+            (&self.dpad_down, DPAD_DOWN),
+            (&self.dpad_left, DPAD_LEFT),
+            (&self.dpad_right, DPAD_RIGHT),
+            (&self.view, VIEW),
+            (&self.menu, MENU),
+        ], held)
+    }
+
+    fn buttons<const N: usize>(bindings: [(&[InputKey], u32); N], held: impl Fn(InputKey) -> bool) -> u32 {
+        bindings.into_iter().filter(|(keys, _)| keys.iter().copied().any(&held)).fold(0, |mask, (_, bit)| mask | bit)
+    }
+
+    fn apply_keys(&self, s: &mut GamepadState, held: impl Fn(InputKey) -> bool) {
+        let down = |keys: &[InputKey]| keys.iter().copied().any(&held);
+        let (lx, ly) = stick_from_keys(down(&self.move_up), down(&self.move_left), down(&self.move_down), down(&self.move_right));
+        if (lx != 0.0 || ly != 0.0) && lx * lx + ly * ly >= s.left_x * s.left_x + s.left_y * s.left_y {
+            s.left_x = lx;
+            s.left_y = ly;
+        }
+        s.buttons |= Self::buttons([
+            (&self.x, X),
+            (&self.y, Y),
+            (&self.left_bumper, LEFT_SHOULDER),
+            (&self.right_bumper, RIGHT_SHOULDER),
+            (&self.left_stick, LEFT_STICK),
+            (&self.right_stick, RIGHT_STICK),
+        ], &held);
+        if down(&self.left_trigger) {
+            s.left_trigger = 1.0;
+        }
+        if down(&self.right_trigger) {
+            s.right_trigger = 1.0;
+        }
+    }
+}
 
 /// The left stick from the movement keys: full deflection, diagonals on the unit circle.
 pub fn stick_from_keys(up: bool, left: bool, down: bool, right: bool) -> (f32, f32) {
@@ -99,7 +333,7 @@ impl Wheel {
     }
 
     /// The bumper held now, `dt` seconds after the last call.
-    pub fn step(&mut self, dt: f32) -> u32 {
+    pub fn step(&mut self, dt: f32, up: u32, down: u32) -> u32 {
         if let Some((b, t)) = self.current.as_mut() {
             *t += (dt.max(0.0) * 1e6).round() as u64;
             if *t < NOTCH_HOLD_US {
@@ -113,7 +347,7 @@ impl Wheel {
         if self.pending == 0 {
             return 0;
         }
-        let b = if self.pending > 0 { RIGHT_SHOULDER } else { LEFT_SHOULDER };
+        let b = if self.pending > 0 { up } else { down };
         self.pending -= self.pending.signum();
         self.current = Some((b, 0));
         b
@@ -198,11 +432,17 @@ const MAPVK_VSC_TO_VK_EX: u32 = 3;
 
 /// Physical AT Set 1 keyboard scancodes for the left-hand cluster, paired with their
 /// QWERTY virtual-key fallbacks if `MapVirtualKeyExW` returns 0.
+#[cfg(test)]
 const SC_Q: (u32, i32) = (0x10, 0x51);
+#[cfg(test)]
 const SC_W: (u32, i32) = (0x11, 0x57);
+#[cfg(test)]
 const SC_E: (u32, i32) = (0x12, 0x45);
+#[cfg(test)]
 const SC_A: (u32, i32) = (0x1E, 0x41);
+#[cfg(test)]
 const SC_S: (u32, i32) = (0x1F, 0x53);
+#[cfg(test)]
 const SC_D: (u32, i32) = (0x20, 0x44);
 
 /// the XCL window (raw input goes there; the cursor is held in it)
@@ -387,6 +627,12 @@ pub(crate) fn scancode_to_vk(scancode: u32, fallback_vk: i32, layout: *mut c_voi
     }
 }
 
+/// Buttons traditionally available before the XCL rendering window is attached.
+pub(crate) fn navigation_buttons(hwnd: *mut c_void) -> u32 {
+    let layout = keyboard_layout_for_window(hwnd);
+    crate::state::config().input_profile.navigation_buttons(|input| key(input.virtual_key(layout)))
+}
+
 /// The keyboard and the mouse on top of `s` (the real controller), while the XCL window
 /// has the focus.
 pub fn apply(s: &mut GamepadState) {
@@ -403,38 +649,16 @@ pub fn apply(s: &mut GamepadState) {
         return;
     }
     let layout = keyboard_layout_for_window(hwnd as *mut c_void);
-    let sc_key = |(sc, fb): (u32, i32)| key(scancode_to_vk(sc, fb, layout));
-    // movement keys: physical WASD cluster -> left stick (a real stick moved further wins; so does it for the mouse)
-    let (lx, ly) = stick_from_keys(sc_key(SC_W), sc_key(SC_A), sc_key(SC_S), sc_key(SC_D));
-    if (lx != 0.0 || ly != 0.0) && lx * lx + ly * ly >= s.left_x * s.left_x + s.left_y * s.left_y {
-        s.left_x = lx;
-        s.left_y = ly;
-    }
-    // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
-    const VK_KEYS: [(i32, u32); 3] = [
-        (0xA0, LEFT_STICK),  // Left Shift
-        (0xA2, RIGHT_STICK), // Left Ctrl
-        (0x04, RIGHT_STICK), // middle mouse button
-    ];
-    const SC_KEYS: [((u32, i32), u32); 2] = [
-        (SC_E, Y), // physical E
-        (SC_Q, X), // physical Q
-    ];
-    s.buttons |= VK_KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
-    s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
-    if key(0x01) {
-        s.right_trigger = 1.0;
-    }
-    if key(0x02) {
-        s.left_trigger = 1.0;
-    }
+    let config = crate::state::config();
+    let profile = &config.input_profile;
+    profile.apply_keys(s, |input| key(input.virtual_key(layout)));
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
     m.velocity.update(DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed), dt);
-    let (rx, ry) = stick_from_mouse(m.velocity.x, m.velocity.y, crate::state::config().mouse_sensitivity);
+    let (rx, ry) = stick_from_mouse(m.velocity.x, m.velocity.y, config.mouse_sensitivity);
     if (rx != 0.0 || ry != 0.0) && rx * rx + ry * ry >= s.right_x * s.right_x + s.right_y * s.right_y {
         s.right_x = rx;
         s.right_y = ry;
@@ -443,12 +667,81 @@ pub fn apply(s: &mut GamepadState) {
     let notches = m.wheel_rest / 120;
     m.wheel_rest -= notches * 120;
     m.wheel.notches(notches);
-    s.buttons |= m.wheel.step(dt.min(0.1));
+    s.buttons |= m.wheel.step(dt.min(0.1), profile.wheel_up as u32, profile.wheel_down as u32);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_profile_preserves_keyboard_and_mouse_bindings() {
+        use InputKey::{Backspace, Down, Enter, Escape, Left, LeftCtrl, LeftShift, MouseLeft, MouseMiddle,
+            MouseRight, PhysicalA, PhysicalD, PhysicalE, PhysicalQ, PhysicalS, PhysicalW, Right, Space, Tab, Up};
+        let profile = InputProfile::default();
+        for (key, expected) in [
+            (Space, A), (Enter, A), (Escape, B), (Backspace, B), (Up, DPAD_UP),
+            (Down, DPAD_DOWN), (Left, DPAD_LEFT), (Right, DPAD_RIGHT), (Tab, VIEW), (InputKey::P, MENU),
+        ] {
+            assert_eq!(profile.navigation_buttons(|input| input == key), expected);
+        }
+        for (key, expected) in [(PhysicalQ, X), (PhysicalE, Y), (LeftShift, LEFT_STICK),
+            (LeftCtrl, RIGHT_STICK), (MouseMiddle, RIGHT_STICK)] {
+            let mut state = GamepadState::default();
+            profile.apply_keys(&mut state, |input| input == key);
+            assert_eq!(state.buttons, expected);
+        }
+        for (key, expected) in [(PhysicalW, (0.0, 1.0)), (PhysicalA, (-1.0, 0.0)),
+            (PhysicalS, (0.0, -1.0)), (PhysicalD, (1.0, 0.0))] {
+            let mut state = GamepadState::default();
+            profile.apply_keys(&mut state, |input| input == key);
+            assert_eq!((state.left_x, state.left_y), expected);
+        }
+        let mut state = GamepadState::default();
+        profile.apply_keys(&mut state, |input| input == MouseLeft);
+        assert_eq!((state.left_trigger, state.right_trigger), (0.0, 1.0));
+        profile.apply_keys(&mut state, |input| input == MouseRight);
+        assert_eq!((state.left_trigger, state.right_trigger), (1.0, 1.0));
+        assert_eq!(profile.wheel_up as u32, RIGHT_SHOULDER);
+        assert_eq!(profile.wheel_down as u32, LEFT_SHOULDER);
+    }
+
+    #[test]
+    fn profile_inherits_defaults_and_can_replace_or_clear_bindings() {
+        let legacy: crate::config::Config = toml::from_str("mouse_sensitivity = 2.0").unwrap();
+        assert!(legacy.input_profile.is_default());
+        let config: crate::config::Config = toml::from_str(r#"
+            [input_profile]
+            move_up = ["up"]
+            dpad_up = []
+            a = ["num0"]
+            right_trigger = ["mouse_right"]
+            left_trigger = ["mouse_left"]
+            wheel_up = "y"
+            wheel_down = "unbound"
+        "#).unwrap();
+        let p = &config.input_profile;
+        let mut state = GamepadState { buttons: MENU, left_trigger: 0.25, ..Default::default() };
+        p.apply_keys(&mut state, |key| matches!(key, InputKey::Up | InputKey::MouseRight));
+        assert_eq!(state, GamepadState {
+            buttons: MENU, left_y: 1.0, left_trigger: 0.25, right_trigger: 1.0, ..Default::default()
+        });
+        assert_eq!(p.navigation_buttons(|key| matches!(key, InputKey::Up | InputKey::Space)), 0);
+        assert_eq!(p.navigation_buttons(|key| key == InputKey::Num0), A);
+        assert_eq!(p.navigation_buttons(|key| key == InputKey::Escape), B);
+        let mut wheel = Wheel::default();
+        wheel.notches(1);
+        assert_eq!(wheel.step(0.01, p.wheel_up as u32, p.wheel_down as u32), Y);
+        let mut wheel = Wheel::default();
+        wheel.notches(-1);
+        assert_eq!(wheel.step(0.01, p.wheel_up as u32, p.wheel_down as u32), 0);
+
+        let boot_json = serde_json::to_string(&config).unwrap();
+        let host_config: crate::config::Config = serde_json::from_str(&boot_json).unwrap();
+        assert_eq!(host_config.input_profile, *p);
+        assert!(toml::from_str::<crate::config::Config>("[input_profile]\na = [\"typo\"]").is_err());
+        assert!(toml::from_str::<crate::config::Config>("[input_profile]\nunknown = []").is_err());
+    }
 
     #[test]
     fn movement_keys_make_a_unit_stick() {
@@ -498,7 +791,7 @@ mod tests {
         let mut presses = Vec::new();
         let mut last = 0;
         for _ in 0..100 {
-            let b = w.step(0.01);
+            let b = w.step(0.01, RIGHT_SHOULDER, LEFT_SHOULDER);
             if b != 0 && b != last {
                 presses.push(b);
             }
@@ -506,7 +799,7 @@ mod tests {
         }
         assert_eq!(presses, vec![RIGHT_SHOULDER]);
         w.notches(-2);
-        let held: Vec<u32> = (0..30).map(|_| w.step(0.01)).collect();
+        let held: Vec<u32> = (0..30).map(|_| w.step(0.01, RIGHT_SHOULDER, LEFT_SHOULDER)).collect();
         // held for NOTCH_HOLD, released for NOTCH_GAP, then the second press
         assert_eq!(held.iter().filter(|&&b| b == LEFT_SHOULDER).count(), 10);
         assert!(held[..5].iter().all(|&b| b == LEFT_SHOULDER) && held[5..10].iter().all(|&b| b == 0));
@@ -563,7 +856,7 @@ mod tests {
             }
             let mut w = Wheel::default();
             w.notches(3);
-            assert_eq!(w.step(0.01), RIGHT_SHOULDER);
+            assert_eq!(w.step(0.01, RIGHT_SHOULDER, LEFT_SHOULDER), RIGHT_SHOULDER);
             *g = Some(Mouse {
                 last: Instant::now(),
                 velocity: v,
@@ -587,7 +880,7 @@ mod tests {
         assert_eq!(m.velocity, Velocity::default());
         assert_eq!(m.wheel_rest, 0);
         for _ in 0..20 {
-            assert_eq!(m.wheel.step(0.01), 0, "stale wheel notches must not fire after refocusing");
+            assert_eq!(m.wheel.step(0.01, RIGHT_SHOULDER, LEFT_SHOULDER), 0, "stale wheel notches must not fire after refocusing");
         }
     }
 }

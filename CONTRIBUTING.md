@@ -155,9 +155,10 @@ and pure renames need no test.
 
 ## Licence and provenance
 
-XCL is **GPL-2.0-only**.
+XCL is **GPL-3.0-or-later**.
 
-- Dependencies must be GPL-2.0-compatible (no Apache-2.0-only, no GPL-3.0). New dependencies need a
+- Dependencies must be GPL-3.0-compatible (no GPL-2.0-only, no proprietary licences); the list
+  is in `THIRD_PARTY.md`. New dependencies need a
   reason in the PR description; avoid them for a few lines of code.
 - Code ported or adapted from another project needs a provenance note in the file (project, URL,
   licence) and an entry in `THIRD_PARTY.md` when it is new.

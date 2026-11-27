@@ -85,6 +85,10 @@ unsafe fn wait_for_submission(
 
 fn init() -> Result<Gpu, String> {
     unsafe {
+        if crate::state::config().d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+            // The debug layer must be enabled before this runner creates a device.
+            let _ = crate::gpu::agility::enable_debug_layer();
+        }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
@@ -130,12 +134,28 @@ fn root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignat
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexDim {
+    D1Array,
     D2,
     D2Array,
     D3,
     Cube,
     /// Typed buffer (test only): `width` elements of `format`, `height` = `depth` = 1.
     Buffer,
+    /// Multisampled 2D texture with this many samples (SRV only). `data` holds every
+    /// sample: texel (x, y) sample s at `((y · width + x) · samples + s) · texel_bytes`;
+    /// `format` needs 32-bit channels (the samples are written by a per-sample draw).
+    D2Ms(u32),
+    /// Multisampled 2D array (`depth` slices, laid out as `D2Ms` slice after slice).
+    D2MsArray(u32),
+}
+
+impl TexDim {
+    fn samples(self) -> Option<u32> {
+        match self {
+            TexDim::D2Ms(n) | TexDim::D2MsArray(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
 /// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1.
@@ -161,6 +181,8 @@ pub struct TestSampler {
 
 struct Bound {
     _heaps: [ID3D12DescriptorHeap; 2],
+    /// what the multisampled-texture fill draws use (alive until the list ran)
+    _msaa: Vec<MsaaFill>,
     textures: Vec<(ID3D12Resource, Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, u64)>,
     _upload: Option<ID3D12Resource>,
 }
@@ -208,9 +230,30 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     let mut descs = Vec::new();
     let mut total = 0u64;
     let mut plans = Vec::new();
+    let mut msaa_plans = Vec::new();
     for t in textures {
+        if let Some(n) = t.dim.samples() {
+            // the samples go through a raw buffer read by the fill draw (+16: Load4 at the end)
+            let size = t.data.len() as u64 + 16;
+            msaa_plans.push(total);
+            total = (total + size + 511) & !511;
+            descs.push(D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: t.width as u64,
+                Height: t.height,
+                DepthOrArraySize: t.depth as u16,
+                MipLevels: 1,
+                Format: t.format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: n, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            });
+            plans.push(Vec::new());
+            continue;
+        }
         let (dim, depth_or_array) = match t.dim {
             TexDim::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
+            TexDim::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
             _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
         };
         let rd = if t.dim == TexDim::Buffer {
@@ -249,7 +292,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     if let Some(up) = &upload {
         let mut p = std::ptr::null_mut();
         up.Map(0, None, Some(&mut p)).map_err(e)?;
-        for (t, fps) in textures.iter().zip(&plans) {
+        let mut mk = 0;
+        for t in textures.iter().filter(|t| t.dim.samples().is_some()) {
+            std::ptr::copy_nonoverlapping(t.data.as_ptr(), (p as *mut u8).add(msaa_plans[mk] as usize), t.data.len());
+            mk += 1;
+        }
+        for (t, fps) in textures.iter().zip(&plans).filter(|(t, _)| t.dim.samples().is_none()) {
             let row = (t.width * t.texel_bytes) as usize;
             let slices = t.depth as usize;
             for z in 0..slices {
@@ -265,7 +313,25 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         }
         up.Unmap(0, None);
     }
+    let mut msaa = Vec::new();
+    let mut mk = 0;
     for (i, ((t, rd), fps)) in textures.iter().zip(&descs).zip(&plans).enumerate() {
+        if t.dim.samples().is_some() {
+            assert!(!t.uav, "multisampled test textures are SRVs");
+            let f = msaa_fill(dev, list, t, rd, upload.as_ref().unwrap(), msaa_plans[mk])?;
+            mk += 1;
+            let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: t.format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+            if let TexDim::D2MsArray(_) = t.dim {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                sv.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 0, ArraySize: t.depth };
+            } else {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            }
+            dev.CreateShaderResourceView(&f.tex, Some(&sv), at(&heap, 2 * i, inc));
+            out.push((f.tex.clone(), Vec::new(), 0));
+            msaa.push(f);
+            continue;
+        }
         let mut r: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .map_err(e)?;
@@ -287,6 +353,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: t.format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
         let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: t.format, ..Default::default() };
         match t.dim {
+            TexDim::D1Array => {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                sv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
+                uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                uv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
+            }
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
@@ -311,6 +383,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
                 uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }
+            TexDim::D2Ms(_) | TexDim::D2MsArray(_) => unreachable!(),
             TexDim::Buffer => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
                 sv.Anonymous.Buffer = D3D12_BUFFER_SRV { NumElements: t.width, ..Default::default() };
@@ -318,9 +391,9 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.Anonymous.Buffer = D3D12_BUFFER_UAV { NumElements: t.width, ..Default::default() };
             }
         }
-        if !t.uav {
-            dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
-        }
+        // a UAV texture has its SRV too, as D3D12.X gives a console image UAV a companion SRV
+        // (RDNA images have no SRV / UAV distinction: the shader may read the slot)
+        dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
         if t.uav {
             dev.CreateUnorderedAccessView(&r, None::<&ID3D12Resource>, Some(&uv), at(&heap, 2 * i + 1, inc));
         }
@@ -331,7 +404,97 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         out.push((r, rfps, readable));
     }
     list.SetDescriptorHeaps(&[Some(heap.clone()), Some(sheap.clone())]);
-    Ok(Bound { _heaps: [heap, sheap], textures: out, _upload: upload })
+    Ok(Bound { _heaps: [heap, sheap], _msaa: msaa, textures: out, _upload: upload })
+}
+
+struct MsaaFill {
+    tex: ID3D12Resource,
+    _data: ID3D12Resource,
+    _pso: ID3D12PipelineState,
+    _rs: ID3D12RootSignature,
+    _rtv: ID3D12DescriptorHeap,
+}
+
+/// Write every sample of a multisampled test texture: a full-screen draw per slice whose
+/// pixel shader runs per sample (`SV_SampleIndex`) and returns the sample's bits from u0.
+/// Leaves `list` with another pipeline and root signature bound.
+unsafe fn msaa_fill(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t: &TestTexture, rd: &D3D12_RESOURCE_DESC, upload: &ID3D12Resource, at: u64) -> Result<MsaaFill, String> {
+    let n = t.dim.samples().unwrap();
+    assert!(t.texel_bytes % 4 == 0 && t.texel_bytes <= 16, "multisampled test textures need 32-bit channels");
+    let ty = match t.format {
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32G32_FLOAT | DXGI_FORMAT_R32G32B32A32_FLOAT => "float4",
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32B32A32_UINT => "uint4",
+        DXGI_FORMAT_R32_SINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R32G32B32A32_SINT => "int4",
+        _ => return Err(format!("multisampled test texture format {:?}", t.format)),
+    };
+    // u0: the samples of this slice
+    let src = format!(
+        "RWByteAddressBuffer D : register(u0);\n\
+         float4 vs(uint id : SV_VertexID) : SV_Position {{ float2 p = float2((id << 1) & 2, id & 2); return float4(p * float2(2, -2) + float2(-1, 1), 0, 1); }}\n\
+         {ty} ps(float4 pos : SV_Position, uint s : SV_SampleIndex) : SV_Target {{\n\
+           uint2 xy = uint2(pos.xy);\n\
+           uint i = ((xy.y * {w}u + xy.x) * {n}u + s) * {b}u;\n\
+           uint4 v = D.Load4(i);\n\
+           uint k = {b}u / 4u; v = uint4(v.x, k > 1u ? v.y : 0u, k > 2u ? v.z : 0u, k > 3u ? v.w : 0u);\n\
+           return ({ty})({conv}(v));\n\
+         }}\n",
+        w = t.width,
+        b = t.texel_bytes,
+        conv = if ty == "float4" { "asfloat" } else { "" },
+    );
+    let vs = super::dxc::compile(&src, "vs", "vs_6_6", &[])?;
+    let ps = super::dxc::compile(&src, "ps", "ps_6_6", &[])?;
+    let rs = root_signature(dev, false)?;
+    let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: transmute_copy(&rs),
+        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+        SampleMask: u32::MAX,
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: n, Quality: 0 },
+        ..Default::default()
+    };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = true.into();
+    pd.RTVFormats[0] = t.format;
+    let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState (MSAA fill): {x}"))?;
+    let mut r: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut r)
+        .map_err(|x| format!("MSAA texture: {x}"))?;
+    let tex = r.ok_or("texture")?;
+    let size = t.data.len() as u64 + 16;
+    let data = buffer(dev, size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+    list.CopyBufferRegion(&data, 0, upload, at, size);
+    list.ResourceBarrier(&[transition(&data, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+    let rtv_heap: ID3D12DescriptorHeap = dev
+        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: t.depth.max(1), ..Default::default() })
+        .map_err(e)?;
+    let rinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+    list.SetPipelineState(&pso);
+    list.SetGraphicsRootSignature(&rs);
+    list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: t.width as f32, Height: t.height as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+    list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: t.width as i32, bottom: t.height as i32 }]);
+    let slice_bytes = (t.width * t.height * n * t.texel_bytes) as u64;
+    for z in 0..t.depth.max(1) {
+        let h = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr + z as usize * rinc };
+        let mut rv = D3D12_RENDER_TARGET_VIEW_DESC { Format: t.format, ..Default::default() };
+        if let TexDim::D2MsArray(_) = t.dim {
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+            rv.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_RTV { FirstArraySlice: z, ArraySize: 1 };
+        } else {
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        }
+        dev.CreateRenderTargetView(&tex, Some(&rv), h);
+        list.OMSetRenderTargets(1, Some(&h), false, None);
+        list.SetGraphicsRootUnorderedAccessView(0, data.GetGPUVirtualAddress() + z as u64 * slice_bytes);
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+    list.ResourceBarrier(&[transition(&tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+    Ok(MsaaFill { tex, _data: data, _pso: pso, _rs: rs, _rtv: rtv_heap })
 }
 
 fn buffer(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, uav: bool) -> Result<ID3D12Resource, String> {
@@ -537,6 +700,8 @@ pub fn run_with_statics(
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let bound = bind_resources(dev, &list, textures, samplers)?;
+        // multisampled test textures were filled by draws
+        list.SetPipelineState(&pso);
         list.SetComputeRootSignature(&rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1363,16 +1528,17 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
         // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
+        let win_count = arena.windows.len().clamp(crate::gpu::uma::MAX_WINDOWS, crate::gpu::uma::MAX_HEAP_WINDOWS);
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
@@ -1451,7 +1617,41 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_split(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], mem: &[u32],
+) -> Result<Vec<u32>, String> {
+    dispatch_split_by(chain, groups, mem, u64::MAX)
+}
+
+/// `dispatch_split`, at most `most` groups at once (`pso::dispatch_slabs`).
+#[cfg(test)]
+pub(crate) fn dispatch_split_by(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], mem: &[u32], most: u64,
+) -> Result<Vec<u32>, String> {
+    dispatch_split_samples(chain, groups, &[], mem, most, 1, false).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_split_samples(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], sgprs: &[u32], mem: &[u32],
+    most: u64, reps: usize, timed: bool,
+) -> Result<(Vec<u32>, Vec<f64>), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
+    let pieces: Vec<ID3D12PipelineState> = chain.pieces.iter().map(|dxil| unsafe {
+        gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            ..Default::default()
+        }).map_err(e)
+    }).collect::<Result<_,_>>()?;
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, groups, sgprs, mem, reps, timed,
+                  Some((&pieces, chain.dwords_per_group, most)))
 }
 
 /// `dispatch` run `reps` times in one command list (a UAV barrier between them, memory not
@@ -1468,7 +1668,59 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true).map(|(_, t)| t)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None).map(|(_, t)| t)
+}
+
+#[cfg(test)]
+pub(crate) fn profile_buffer_forms(
+    whole: &[u8], chains: [&crate::gpu::dxil::kernel::DispatchChain; 2], groups: [u32; 3],
+    sgprs: &[u32], mem: &[u32], expected: &[u32], budget: u64,
+) -> Result<(), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
+    let blob = std::env::var_os("XCL_SAMPLE_REPLAY_WHOLE_PSO").map(std::fs::read).transpose().map_err(|err| err.to_string())?;
+    let build = |code: &[u8], signature: &ID3D12RootSignature, cache: Option<&[u8]>| unsafe {
+        gpu.dev.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(signature),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            CachedPSO: cache.map(|bytes| D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len(),
+            }).unwrap_or_default(),
+            ..Default::default()
+        }).map_err(e)
+    };
+    let base = build(whole, &gpu.rs, blob.as_deref())?;
+    let alternative = std::env::var_os("XCL_SAMPLE_ALTERNATE_WHOLE").map(|path| {
+        let dxil = std::fs::read(path).map_err(|err| err.to_string())?;
+        build(&dxil, &gpu.rs, None)
+    }).transpose()?;
+    let count = if alternative.is_some() { 1 } else { 2 };
+    let pieces: Vec<Vec<_>> = chains[..count].iter().map(|c| c.pieces.iter().map(|p| build(p, &rs, None)).collect::<Result<_,_>>()).collect::<Result<_,_>>()?;
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for round in 0..12 {
+        for pass in 0..3 {
+            let variant = (round / 2 + if round % 2 == 0 { pass } else { 2 - pass }) % 3;
+            let whole = match variant { 0 => Some(&base), 2 => alternative.as_ref(), _ => None };
+            let (pso, signature, chain) = if let Some(pso) = whole { (pso, &gpu.rs, None) } else {
+                let i = variant - 1;
+                let words = chains[i].dwords_per_group;
+                let most = (budget / (u64::from(words) * 4)).max(1);
+                (&pieces[i][0], &rs, Some((pieces[i].as_slice(), words, most)))
+            };
+            let (out, times) = dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, pso, signature,
+                groups, sgprs, mem, 12, true, chain)?;
+            if out != expected { return Err(format!("replay readback differs for form {variant}")); }
+            if round >= 3 { samples[variant].extend_from_slice(&times[2..]); }
+        }
+    }
+    for (i, row) in samples.iter_mut().enumerate() {
+        row.sort_by(f64::total_cmp);
+        let mid = row.len() / 2;
+        println!("FORM_TIME form={i} groups={groups:?} budget={budget} n={} median_us={:.3} p90_us={:.3}",
+            row.len(), 500.0 * (row[mid-1]+row[mid]), row[row.len()*9/10]*1000.0);
+    }
+    Ok(())
 }
 
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
@@ -1478,7 +1730,7 @@ pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12Roo
     unsafe {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
+        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
     }
 }
 
@@ -1495,6 +1747,7 @@ fn dispatch_with(
     mem: &[u32],
     reps: usize,
     timed: bool,
+    chain: Option<(&[ID3D12PipelineState], u32, u64)>,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
@@ -1526,16 +1779,17 @@ fn dispatch_with(
         // A PSO built by the backend's hook uses the runtime's window count: with heap windows
         // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
         // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        let win_count = crate::gpu::uma::MAX_HEAP_WINDOWS;
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-        for k in 0..4usize {
+        for k in 0..win_count {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
@@ -1544,7 +1798,14 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        for k in 0..4 {
+            list.SetComputeRootUnorderedAccessView(2 + k as u32, mem_buf.GetGPUVirtualAddress());
+        }
+        let scratch = chain.map(|(_, words, most)| {
+            let first = super::pso::dispatch_slabs(groups, most)[0].1;
+            let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));
+            buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
+        }).transpose()?;
         // `reps` dispatches, each between two timestamps when `timed`
         let stamps = 2 * reps as u32;
         let queries = if timed {
@@ -1563,7 +1824,11 @@ fn dispatch_with(
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
             }
-            list.Dispatch(groups[0], groups[1], groups[2]);
+            if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
+                super::pso::record_dispatch_chain(&list, groups, most, scratch, k > 0, pieces);
+            } else {
+                list.Dispatch(groups[0], groups[1], groups[2]);
+            }
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
             }

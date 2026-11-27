@@ -79,10 +79,10 @@ unsafe impl Send for NullObj {}
 
 static CREATED: AtomicU64 = AtomicU64::new(0);
 
+static TABLES: Mutex<Vec<(Kind, usize)>> = Mutex::new(Vec::new());
+
 fn vtable(kind: Kind) -> *const usize {
-    static TABLES: OnceLock<Mutex<Vec<(Kind, usize)>>> = OnceLock::new();
-    let t = TABLES.get_or_init(|| Mutex::new(Vec::new()));
-    let mut g = t.lock().unwrap();
+    let mut g = TABLES.lock().unwrap();
     if let Some(&(_, p)) = g.iter().find(|(k, _)| *k == kind) {
         return p as *const usize;
     }
@@ -264,14 +264,28 @@ unsafe extern "system" fn Ret_Zero(_t: *mut NullObj) -> usize {
     0
 }
 unsafe extern "system" fn Ret_Void(_t: *mut NullObj) {}
-/// Methods returning a 16-byte struct via hidden pointer (MSVC member-function ABI).
-unsafe extern "system" fn Hidden_ZeroDesc16(_t: *mut NullObj, ret: *mut u8) -> *mut u8 {
+/// The object and the return buffer of a method that returns a struct through a hidden pointer,
+/// called the C++ way (this, buffer) or the C way (buffer, this) as a retail game calls device
+/// #26 (`real::this_first`): the object is the one whose first word is a vtable made here.
+unsafe fn this_and_ret(a: *mut c_void, b: *mut c_void) -> (*mut NullObj, *mut u8) {
+    // (unaligned: the buffer of a 20-byte struct is aligned to 4)
+    let ours = |p: *mut c_void| !p.is_null() && TABLES.lock().unwrap().iter().any(|&(_, v)| v == (p as *const usize).read_unaligned());
+    if ours(b) && !ours(a) {
+        (b as *mut NullObj, a as *mut u8)
+    } else {
+        (a as *mut NullObj, b as *mut u8)
+    }
+}
+/// Methods returning a 16-byte struct via hidden pointer.
+unsafe extern "system" fn Hidden_ZeroDesc16(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 16);
     }
     ret
 }
-unsafe extern "system" fn Hidden_ZeroDesc40(_t: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Hidden_ZeroDesc40(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 40);
     }
@@ -464,7 +478,8 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
     S_OK
 }
 
-unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret: *mut u64, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+unsafe extern "system" fn Device_GetResourceAllocationInfo(a: *mut c_void, b: *mut c_void, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+    let ret = this_and_ret(a, b).1 as *mut u64;
     let mut total = 0usize;
     for i in 0..n as usize {
         total += (approx_size(descs.add(i * 56)) + 0xFFFF) & !0xFFFF;
@@ -475,7 +490,8 @@ unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret
     }
     ret
 }
-unsafe extern "system" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: *mut u8, _m: u32, ty: u32) -> *mut u8 {
+unsafe extern "system" fn Device_GetCustomHeapProperties(a: *mut c_void, b: *mut c_void, _m: u32, ty: u32) -> *mut u8 {
+    let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 20);
         *(ret as *mut u32) = 4; // CUSTOM
@@ -554,7 +570,8 @@ unsafe extern "system" fn Device_CreateQueryHeap(_t: *mut NullObj, _d: *const c_
 unsafe extern "system" fn Device_CreateCommandSignature(_t: *mut NullObj, _d: *const c_void, _rs: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandSignature)
 }
-unsafe extern "system" fn Device_GetAdapterLuid(_t: *mut NullObj, ret: *mut u64) -> *mut u64 {
+unsafe extern "system" fn Device_GetAdapterLuid(a: *mut c_void, b: *mut c_void) -> *mut u64 {
+    let ret = this_and_ret(a, b).1 as *mut u64;
     if !ret.is_null() {
         *ret = 0x5843_4C00;
     }
@@ -613,7 +630,8 @@ unsafe extern "system" fn Fence_Signal(this: *mut NullObj, value: u64) -> HRESUL
     (*this).value.store(value, Ordering::Release);
     S_OK
 }
-unsafe extern "system" fn Heap_GetDesc16(this: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Heap_GetDesc16(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 16);
     }
@@ -640,7 +658,8 @@ unsafe extern "system" fn Resource_Map(this: *mut NullObj, _sub: u32, _range: *c
         S_OK
     }
 }
-unsafe extern "system" fn Resource_GetDesc(this: *mut NullObj, ret: *mut u8) -> *mut u8 {
+unsafe extern "system" fn Resource_GetDesc(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 56);
     }
@@ -752,6 +771,54 @@ pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRES
 mod tests {
     use super::*;
 
+    /// The stream subobject table pinned to the PC headers: type numbers from the `windows`
+    /// crate, payload sizes from the header structs themselves.
+    #[test]
+    fn the_stream_subobject_table_matches_the_pc_headers() {
+        use windows::Win32::Graphics::Direct3D12 as d;
+        let sb = std::mem::size_of::<d::D3D12_SHADER_BYTECODE>();
+        let cases: &[(u32, (usize, usize))] = &[
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32, (std::mem::size_of::<*mut c_void>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT.0 as u32, (std::mem::size_of::<d::D3D12_STREAM_OUTPUT_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND.0 as u32, (std::mem::size_of::<d::D3D12_BLEND_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32, (std::mem::size_of::<d::D3D12_INPUT_LAYOUT_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC.0 as u32, (8, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS.0 as u32, (std::mem::size_of::<d::D3D12_RT_FORMAT_ARRAY>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT.0 as u32, (std::mem::size_of::<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK.0 as u32, (4, 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32, (std::mem::size_of::<d::D3D12_CACHED_PIPELINE_STATE>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS.0 as u32, (std::mem::size_of::<d::D3D12_PIPELINE_STATE_FLAGS>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC1>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING.0 as u32, (std::mem::size_of::<d::D3D12_VIEW_INSTANCING_DESC>(), 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, (sb, 8)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2.0 as u32, (std::mem::size_of::<d::D3D12_DEPTH_STENCIL_DESC2>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC1>(), 4)),
+            (d::D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2.0 as u32, (std::mem::size_of::<d::D3D12_RASTERIZER_DESC2>(), 4)),
+        ];
+        for (ty, want) in cases {
+            assert_eq!(subobject_payload(*ty), Some(*want), "subobject {ty}");
+        }
+    }
+
+    /// The PC has no subobject 23; the console's mesh numbering puts AS there and mesh at 24
+    /// (the PC's AS), which `real.rs` takes as the mesh program of a mesh-only pipeline.
+    #[test]
+    fn subobject_23_is_unknown() {
+        assert_eq!(subobject_payload(23), None);
+    }
+
     type Fn4 = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
 
     unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
@@ -815,6 +882,39 @@ mod tests {
             let unknown: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(dev, 200));
             assert_eq!(unknown(dev), 0);
             assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
+        }
+    }
+
+    /// A retail game calls the device's struct-returning methods the C way (return buffer,
+    /// object): the result goes to the buffer and the object keeps its vtable pointer (#26's 20
+    /// bytes were written over the device, and its next call jumped through them).
+    #[test]
+    fn struct_returning_methods_take_the_buffer_first_or_second() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let vtbl = *(dev as *const usize);
+            let heap_properties: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> *mut c_void = std::mem::transmute(slot(dev, 26));
+            // the C way's buffer 4 past a multiple of 8, where a 20-byte struct's can be
+            let mut store = [!0u64; 4];
+            let c = (store.as_mut_ptr() as *mut u32).add(1) as *mut [u32; 5];
+            let mut cpp = [!0u32; 5];
+            assert_eq!(heap_properties(c as *mut c_void, dev, 1, 2), c as *mut c_void);
+            assert_eq!(*(dev as *const usize), vtbl, "the device's vtable pointer");
+            heap_properties(dev, cpp.as_mut_ptr() as *mut c_void, 1, 2);
+            assert_eq!((*c, (*c)[0]), (cpp, 4));
+            // one that reads its object: resource #10 GetDesc
+            let mut desc = [0u8; 56];
+            desc[0] = 1; // BUFFER
+            desc[16..24].copy_from_slice(&4096u64.to_le_bytes());
+            let create_res: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 27));
+            let mut r = std::ptr::null_mut();
+            assert_eq!(create_res(dev, std::ptr::null(), 0, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut r), S_OK);
+            let get_desc: unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(slot(r, 10));
+            let mut got = [!0u8; 56];
+            get_desc(got.as_mut_ptr() as *mut c_void, r);
+            assert_eq!(got, desc);
         }
     }
 

@@ -2,15 +2,34 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>] [-StartupTimeoutSeconds 120]
+#
+# The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
+# (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
+# -Title prints the given label instead. Use the same one for the main and the PR run.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
+    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Title,
+    [string]$OutDir,
+    # Additional time for launcher work such as shader preparation before the guest timer starts.
+    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
+
+if ($PSBoundParameters.ContainsKey('Title')) {
+    $Title = $Title.Trim()
+    # control, format and line/paragraph separator characters would split the line for pr_check.py
+    if (-not $Title -or $Title -match '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}`]') { throw '-Title must be one line of text without backticks' }
+} else {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $digest = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes((Split-Path $Game -Leaf).Trim()))
+    $sha.Dispose()
+    $Title = -join ($digest[0..3] | ForEach-Object { $_.ToString('x2') })
+}
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
@@ -21,8 +40,13 @@ $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates C
 # environment block on Windows PowerShell 5.1 when PATH is present twice with
 # different casing (which is possible on Windows).
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $Xcl
-$psi.Arguments = 'run "' + $Game + '"'
+if ($Xcl -match '\.(cmd|bat)$') {
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = '/c ""' + $Xcl + '" run "' + $Game + '""'
+} else {
+    $psi.FileName = $Xcl
+    $psi.Arguments = 'run "' + $Game + '"'
+}
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.RedirectStandardOutput = $true
@@ -37,7 +61,7 @@ $env:XCL_ACTIVITY = '1'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
-if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
+if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
     if (-not $p.HasExited) { $p.Kill() }
     $timedOut = $true
 }
@@ -68,12 +92,42 @@ if (Test-Path $report) {
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
+if ($OutDir) {
+    if (-not (Test-Path $OutDir)) {
+        $null = New-Item -ItemType Directory -Path $OutDir -Force
+    }
+    Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir 'xcl.log') -Force
+    $destReport = Join-Path $OutDir 'report.json'
+    if (Test-Path $report) {
+        Copy-Item -LiteralPath $report -Destination $destReport -Force
+    } elseif (Test-Path $destReport) {
+        Remove-Item -LiteralPath $destReport -Force
+    }
+    $manifest = [ordered]@{
+        commit         = $commit
+        dirty          = $dirty
+        gpu            = $gpu
+        title          = $Title
+        seconds        = $Seconds
+        startup_timeout_seconds = $StartupTimeoutSeconds
+        exit           = $code
+        frames         = $frames
+        presents       = $lastPresents
+        peak_commit_mb = $peak
+        removals       = $removals
+        crashes        = $crashes
+        input_schedule = $env:XCL_PRESS_AT
+        data_root      = $env:XCL_DATA_ROOT
+    }
+    $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutDir 'manifest.json') -Encoding utf8
+}
+
 @"
 ``````
 xcl-smoke v1
 commit: $commit$(if ($dirty) { ' (uncommitted changes)' })
 gpu: $gpu
-title: $(Split-Path $Game -Leaf)
+title: $Title
 seconds: $Seconds
 exit: $code
 frames shown: $frames

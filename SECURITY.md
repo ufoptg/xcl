@@ -32,5 +32,5 @@ Bugs that only crash the game, or need online services XCL doesn't provide, are 
 
 ## No warranty
 
-XCL is GPL-2.0 and comes with no warranty (see `LICENSE`). Reports are handled when someone has
+XCL is GPL-3.0-or-later and comes with no warranty (see `LICENSE`). Reports are handled when someone has
 time; there is no fixed response time.

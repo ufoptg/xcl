@@ -392,7 +392,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
         };
         for (j, p) in f.programs.iter().enumerate() {
             let code = &f.data[p.offset..p.offset + p.len];
-            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
+            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), ..Default::default() };
             let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
             let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };

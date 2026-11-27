@@ -2,7 +2,7 @@
 //!
 //! Ported from FFmpeg `libavcodec/wmaprodata.h` (LGPL-2.1+, Copyright (c) 2007-2009
 //! Baptiste Coudurier, Benjamin Larsson, Ulion, Sascha Sommer), adapted to Rust for XCL
-//! (GPL-2.0-only) on 2026-11-21.
+//! on 2026-11-21.
 
 /// Critical frequencies (Hz) dividing the spectrum into scale factor bands.
 pub const CRITICAL_FREQ: [u16; 28] = [

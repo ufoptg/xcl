@@ -29,6 +29,9 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
+/// slots; the recompiler's `xcl_iw{srsrc}`)
+pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -72,14 +75,50 @@ pub struct Init {
     pub vgpr_base: Option<Value>,
     pub entry: Block,
     pub touched: BTreeSet<u32>,
+    /// the compact form: each register's local variable, and the block that loads them now
+    pub slots: HashMap<u32, Value>,
+    pub mem: Option<Block>,
 }
 
 impl Init {
     pub fn load(&mut self, s: &mut Shader, var: u32) -> Value {
+        let Some(b) = self.mem else { return self.first(s, var) };
+        let p = self.slot(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(true);
+        s.m.set_block(b);
+        let v = s.m.load(p, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        v
+    }
+
+    /// The local variable of `var`, made in the entry block with the register's first value.
+    pub fn slot(&mut self, s: &mut Shader, var: u32) -> Value {
+        if let Some(&p) = self.slots.get(&var) {
+            return p;
+        }
+        let v = self.first(s, var);
+        let cur = s.m.current_block();
+        let before = s.m.set_insert_before_term(false);
+        s.m.set_block(self.entry);
+        let i32 = s.m.i32();
+        let p = s.m.alloca(i32, 4);
+        s.m.store(p, v, 4);
+        s.m.set_block(cur);
+        s.m.set_insert_before_term(before);
+        self.slots.insert(var, p);
+        p
+    }
+
+    fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
+        if var == super::lower_round::VAR_F32_MODE {
+            return s.m.i32c(super::lower_round::MODE_INIT);
+        }
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -151,8 +190,17 @@ pub struct Lw {
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// cached decoded format descriptors hoisted to `d3`'s defining block
+    pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
+    /// cached single-component format decode parameters hoisted to `d3`'s defining block
+    pub fmt_comp1_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtComp1>,
+    /// cached `IO_UMA_BASE_HI` loaded once in the entry block for multi-window address math
+    pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
+    /// the `s_load_dword*` being lowered repeats an earlier one (`reload`): set by the
+    /// translator's loop for that instruction
+    pub reload: Option<super::reload::Reload>,
     /// the lane's scratch array (an alloca in the entry block)
     pub scratch: Option<Value>,
     /// MIMG instructions (pc) whose S# is built from constants in the code: the HLSL
@@ -161,7 +209,13 @@ pub struct Lw {
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
+    /// the program writes a non-default MODE[1:0]: rounding f32 instructions round by
+    /// `lower_round::VAR_F32_MODE` (`lower_round`)
+    pub f32_rm: bool,
+    pub track_frexp_denorm: bool,
     pub has_f64_round_op: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
+    pub img_writes: Vec<u64>,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
@@ -188,6 +242,8 @@ pub struct Lw {
     pub partner: Partner,
     /// mesh mode: the record slots
     pub mesh: Option<MeshCtx>,
+    /// geometry mode (ES+GS)
+    pub geom: Option<super::lower_geom::GeomCtx>,
     /// VS / PS entry
     pub gfx: Option<super::lower_gfx::GfxCtx>,
     /// a wave32 program in 64-lane hardware: this hardware half is the upper one (i1)
@@ -204,6 +260,10 @@ pub struct Lw {
     /// When set, the wave-wide mask cross-lane instructions see (DPP source lanes,
     /// readfirstlane, ds_swizzle / bpermute) instead of the SSA EXEC.
     pub mask_override: Option<(Value, Value)>,
+    /// split form: a mask an instruction writes is built from this half's ballot alone, as
+    /// when it is never read whole. Set by a caller that reads back only each lane's own bit
+    /// (the per-lane form's bridge), so no exchange meets the other half.
+    pub local_masks: bool,
 }
 
 impl Lw {
@@ -852,7 +912,8 @@ impl Lw {
         // split form: a mask only ever read lane by lane (or going nowhere, or 0 anyway)
         // needs only this half's word (`recomp::x64_masks`, the HLSL `xcl_x_ballot_local`)
         let local = self.split
-            && (self.s.m.const_u64(cond) == Some(0)
+            && (self.local_masks
+                || self.s.m.const_u64(cond) == Some(0)
                 || match *dst {
                     Dst::S(n) => n < 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
                     Dst::Null => true,
@@ -891,6 +952,12 @@ impl Lw {
         self.dpp_enable = None;
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
+        }
+        if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
+            return Ok(());
+        }
+        if name == "s_denorm_mode" && (self.f32_rm || self.track_frexp_denorm) {
+            return self.denorm_mode(Self::fv(d, "SIMM16") as u32);
         }
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
@@ -955,7 +1022,10 @@ impl Lw {
             "s_round_mode" => {
                 let simm = Self::fv(d, "SIMM16") as u16;
                 let (sp, dp) = ((simm & 3) as u32, ((simm >> 2) & 3) as u32);
-                if sp != 0 {
+                if self.f32_rm {
+                    let v = self.c(sp);
+                    self.mode_write(v, 3);
+                } else if sp != 0 {
                     return err(d, "non-default f32 round mode");
                 }
                 if dp != 0 && self.has_f64_round_op {
@@ -977,6 +1047,22 @@ impl Lw {
     fn setreg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let simm = Self::fv(d, "SIMM16") as u16;
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
+        if self.f32_rm || self.track_frexp_denorm {
+            // the mirrored MODE bits (single-precision round / denormal modes)
+            let (id, offset, width) = decode_hwreg(simm);
+            if id == 1 {
+                let wmask = (if width == 32 { u32::MAX } else { (1u32 << width) - 1 }) << offset;
+                let src = if name == "s_setreg_imm32_b32" {
+                    let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
+                    self.c(imm)
+                } else {
+                    let sd = Self::field(d, "SDST");
+                    self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?
+                };
+                let v = self.shlc(src, offset);
+                self.mode_write(v, wmask);
+            }
+        }
         if sp_mask == 0 && dp_mask == 0 {
             return Ok(());
         }
@@ -984,7 +1070,7 @@ impl Lw {
             let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
             let sp = hwreg_imm_field(imm, off, 0, sp_mask);
             let dp = hwreg_imm_field(imm, off, 2, dp_mask);
-            if sp != 0 {
+            if sp != 0 && !self.f32_rm {
                 return err(d, "non-default f32 round mode");
             }
             if dp_mask != 0 && dp != 0 && self.has_f64_round_op {
@@ -1002,23 +1088,22 @@ impl Lw {
             }
             return Ok(());
         }
-        if sp_mask != 0 {
+        if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
-        if self.has_f64_round_op {
+        if dp_mask != 0 && self.has_f64_round_op {
             return err(d, "dynamic f64 round mode");
         }
-        if self.dyn_rm {
+        if dp_mask != 0 && self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
-            let sh = 2 - off;
             let v = match dp_mask {
                 3 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     self.andc(x, 3)
                 }
                 1 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     let bit = self.andc(x, 1);
                     let cur = self.rd(VAR_FP16_RM);
                     let keep = self.andc(cur, 2);
@@ -1147,14 +1232,6 @@ impl Lw {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
-            // a b32 source is one register (m0, a 32-bit constant): no 64-bit pair to read
-            let s0 = if name.ends_with("_b32") {
-                let lo = self.read(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
-                (lo, self.c(0))
-            } else {
-                self.read64(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?
-            };
-            let (el, eh) = (self.sreg(126), self.sreg(127));
             let opn = base.split('_').nth(1).unwrap_or("").to_string();
             let op = |s: &mut Self, a: Value, e: Value| -> Option<Value> {
                 Some(match opn.as_str() {
@@ -1192,15 +1269,21 @@ impl Lw {
                     _ => return None,
                 })
             };
-            let t0 = op(self, s0.0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
-            let t1 = op(self, s0.1, eh).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
             let wrexec = name.contains("wrexec");
             if !self.wave64 || name.ends_with("_b32") {
+                // a b32 or wave32 source is one register (m0, a 32-bit constant): no 64-bit pair or EXEC_HI
+                let s0 = self.read(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
+                let el = self.sreg(126);
+                let t0 = op(self, s0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
                 self.wr(126, t0);
                 let c = self.nz(t0);
                 self.set_scc(c);
                 self.write32(&dst, if wrexec { t0 } else { el });
             } else {
+                let s0 = self.read64(d, ins[0], false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let t0 = op(self, s0.0, el).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
+                let t1 = op(self, s0.1, eh).ok_or_else(|| format!("{}: saveexec", rdna2::format(d)))?;
                 self.wr(126, t0);
                 self.wr(127, t1);
                 let o = self.or(t0, t1);
@@ -1345,20 +1428,18 @@ impl Lw {
                 let sc = self.scc();
                 let t0 = self.add(a, b);
                 let t = self.add(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(a6, b6);
-                let x = self.add(x, s6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let c0 = self.cmp(Pred::ULt, t0, a);
+                let c1 = self.cmp(Pred::ULt, t, t0);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_subb_u32" => {
                 let sc = self.scc();
                 let t0 = self.sub(a, b);
                 let t = self.sub(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(b6, s6);
-                let c = self.cmp(Pred::UGt, x, a6);
+                let c0 = self.cmp(Pred::ULt, a, b);
+                let c1 = self.cmp(Pred::ULt, t0, sc);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_add_i32" => {
@@ -1384,15 +1465,13 @@ impl Lw {
             "s_lshr_b32" => (self.lshr(a, b), Scc::Nz),
             "s_ashr_i32" => (self.ashr(a, b), Scc::Nz),
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
-                let k = name.as_bytes()[6] - b'0';
-                let s = self.shlc(a, k as u32);
+                let k = (name.as_bytes()[6] - b'0') as u32;
+                let s = self.shlc(a, k);
                 let t = self.add(s, b);
-                let (a6, b6) = (self.zext64(a), self.zext64(b));
-                let kk = self.c64(k as u64);
-                let x = self.bin(BinOp::Shl, a6, kk);
-                let x = self.add(x, b6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let hi = self.lshrc(a, 32 - k);
+                let c0 = self.nz(hi);
+                let c1 = self.cmp(Pred::ULt, t, b);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_bfm_b32" => (self.bfm(a, b), Scc::No),
@@ -1939,7 +2018,7 @@ pub fn is_f16_rounded_op(name: &str) -> bool {
         name,
         "v_interp_p2_f16" | "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_pk_add_f16" | "v_pk_mul_f16" | "v_pk_fma_f16"
             | "v_pk_fmac_f16" | "v_pk_min_f16" | "v_pk_max_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_min_f16"
-            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_fmac_f16"
+            | "v_max_f16" | "v_fma_f16" | "v_med3_f16" | "v_min3_f16" | "v_max3_f16" | "v_frexp_mant_f16" | "v_mad_f16" | "v_div_fixup_f16" | "v_fmac_f16"
             | "v_fmamk_f16" | "v_fmaak_f16" | "v_ldexp_f16" | "v_rcp_f16" | "v_rsq_f16" | "v_sqrt_f16" | "v_log_f16" | "v_exp_f16"
             | "v_sin_f16" | "v_cos_f16" | "v_fract_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_cvt_f16_u16"
             | "v_cvt_f16_i16"
@@ -1996,4 +2075,122 @@ fn fold_bin(op: BinOp, x: u64, y: u64, w: u32) -> Option<u64> {
         BinOp::URem if y != 0 => x % y,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod saveexec_tests {
+    use std::collections::BTreeSet;
+
+    use super::Lw;
+    use crate::gpu::dxil::kernel::{self, Entry, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner;
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn touched_for(code: &[u8], wave64: bool) -> BTreeSet<u32> {
+        let insts = [rdna2::decode(code, 0).expect("decode saveexec/wrexec")];
+        let leaders: BTreeSet<u64> = [0].into_iter().collect();
+        let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&insts, &leaders, ko, &Entry::Kernel);
+        lw.inst(&insts[0]).expect("lower single saveexec/wrexec");
+        lw.init.touched
+    }
+
+    /// Wave32 and `_b32` saveexec / wrexec forms must read a single 32-bit source (allowing
+    /// 32-bit-only encodings such as `m0` and avoiding bogus `s[n+1]` reads) and must not touch
+    /// `EXEC_HI` (s127), matching HLSL #191.
+    #[test]
+    fn direct_wave32_and_b32_saveexec_skip_read64_and_exec_hi() {
+        let ko32 = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let ko64 = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        // Wave32 S_AND_SAVEEXEC_B64 with 32-bit-only M0 (SSRC0 = 124) must translate & validate.
+        let m0_code = asm(&[("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 124)])]);
+        let m0_dxil = kernel::translate(&m0_code, ko32).expect("wave32 S_AND_SAVEEXEC_B64 s0, m0");
+        if validate::validator_supported() {
+            validate::validate(&m0_dxil).expect("validate wave32 m0 saveexec");
+        }
+
+        // Wave32 _b64, wave32 wrexec _b64, and wave64 _b32 must touch neither s11 nor EXEC_HI (127).
+        for (inst, wave64) in [
+            ("S_AND_SAVEEXEC_B64", false),
+            ("S_ANDN2_WREXEC_B64", false),
+            ("S_AND_SAVEEXEC_B32", false),
+            ("S_AND_SAVEEXEC_B32", true),
+            ("S_ANDN1_WREXEC_B32", true),
+        ] {
+            let code = asm(&[(inst, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)])]);
+            let touched = touched_for(&code, wave64);
+            assert!(touched.contains(&10) && touched.contains(&126), "{inst} wave64={wave64} touched={touched:?}");
+            assert!(!touched.contains(&11), "{inst} wave64={wave64} must not read bogus s11: {touched:?}");
+            assert!(!touched.contains(&127), "{inst} wave64={wave64} must not touch EXEC_HI (s127): {touched:?}");
+        }
+
+        // Disassembly check: wave32 S_AND_SAVEEXEC_B64 s0, s10 emits only one `and i32` (EXEC_LO).
+        let s10_code = asm(&[("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)])]);
+        let s10_dxil = kernel::translate(&s10_code, ko32).expect("wave32 S_AND_SAVEEXEC_B64 s0, s10");
+        if validate::validator_supported() {
+            validate::validate(&s10_dxil).expect("validate wave32 s10 saveexec");
+            let dis = validate::disassemble(&s10_dxil).expect("disassemble wave32 s10 saveexec");
+            let ands = dis.lines().filter(|l| l.contains(" = and i32 ")).count();
+            assert_eq!(ands, 1, "wave32 saveexec should only AND EXEC_LO (got {ands}):\n{dis}");
+        }
+
+        // Control: wave64 S_AND_SAVEEXEC_B64 still reads s10:s11 and updates EXEC_LO + EXEC_HI.
+        let touched64 = touched_for(&s10_code, true);
+        assert!(
+            touched64.contains(&10) && touched64.contains(&11) && touched64.contains(&126) && touched64.contains(&127),
+            "wave64 S_AND_SAVEEXEC_B64 must touch s10, s11, EXEC_LO, EXEC_HI: {touched64:?}"
+        );
+        let dxil64 = kernel::translate(&s10_code, ko64).expect("wave64 S_AND_SAVEEXEC_B64 s0, s10");
+        if validate::validator_supported() {
+            validate::validate(&dxil64).expect("validate wave64 s10 saveexec");
+        }
+    }
+
+    /// Wave32 Direct DXIL GPU execution of `S_AND_SAVEEXEC_B64` (with `m0`), `S_OR_SAVEEXEC_B32`,
+    /// and `S_ANDN2_WREXEC_B64`, checking EXEC_LO / SCC / destination SGPRs and confirming high
+    /// halves (`s1`, `s5`) and `EXEC_HI` (`s127`) remain unmodified.
+    #[test]
+    fn gpu_direct_wave32_saveexec_and_wrexec() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        let code = asm(&[
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 124)]),
+            ("S_OR_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 10)]),
+            ("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 12)]),
+        ]);
+        let dxil = kernel::translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
+        let mut st = runner::KernelState::default();
+        st.sgpr[1] = 0x1111_2222;
+        st.sgpr[5] = 0x3333_4444;
+        st.sgpr[126] = 0xFFFF_00FF;
+        st.sgpr[127] = 0xCAFE_BABE;
+        st.sgpr[124] = 0x0F0F_FFFF;
+        st.sgpr[10] = 0x00F0_0000;
+        st.sgpr[11] = 0xDEAD_BEEF;
+        st.sgpr[12] = 0xF0FF_FF00;
+        st.sgpr[13] = 0x5555_6666;
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run");
+        assert_eq!(r.sgpr[0], 0xFFFF_00FF, "s0 saves initial EXEC_LO");
+        assert_eq!(r.sgpr[1], 0x1111_2222, "s1 high half must remain untouched in wave32");
+        assert_eq!(r.sgpr[2], 0x0F0F_00FF, "s2 saves EXEC_LO after M0 AND");
+        assert_eq!(r.sgpr[4], 0xF000_FF00, "s4 receives new EXEC_LO from wrexec");
+        assert_eq!(r.sgpr[5], 0x3333_4444, "s5 high half must remain untouched in wave32");
+        assert_eq!(r.sgpr[126], 0xF000_FF00, "final EXEC_LO");
+        assert_eq!(r.sgpr[127], 0xCAFE_BABE, "EXEC_HI must remain untouched in wave32");
+        assert_eq!(r.scc, 1, "SCC = (final EXEC_LO != 0)");
+    }
 }
